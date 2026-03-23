@@ -12,10 +12,10 @@ fn main() {
         }
     };
 
-    println!("Source is {:?}", config.source);
+    println!("== SOURCE ==\n{:#?}", config.source);
 
-    // if let Err(err) = driver::run::run(config) {
-    //     eprintln!("{}", err);
-    //     std::process::exit(1);
-    // }
+    if let Err(err) = driver::run::run(config) {
+        eprintln!("{}", err);
+        std::process::exit(1);
+    }
 }
