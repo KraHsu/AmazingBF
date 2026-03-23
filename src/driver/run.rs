@@ -1,22 +1,34 @@
-use crate::driver::config::DriverConfig;
+use crate::driver::config::{DriverConfig, RunMode};
 use crate::frontend::lexer::lex;
 use crate::frontend::parser::parse;
+use crate::interp::engine::Interpreter;
 use crate::ir::lower::lower;
 use crate::ir::optimize::optimize;
+use crate::runtime::host::NullHost;
+use crate::runtime::io::StdIo;
 
 /// from src to HIR
 pub fn run(config: DriverConfig) -> Result<(), String> {
     let tokens = lex(&config.source);
-    println!("== TOKENS ==\n{:#?}", tokens);
-
     let ast = parse(&tokens).map_err(|e| format!("parse error: {:?}", e))?;
-    println!("== AST ==\n{:#?}", ast);
+    let program = optimize(lower(&ast));
 
-    let program = lower(&ast);
-    println!("== HIR (before optimize) ==\n{:#?}", program);
+    match config.mode {
+        RunMode::DumpIr => {
+            println!("== TOKENS ==\n{:#?}", tokens);
+            println!("== AST ==\n{:#?}", ast);
+            println!("== HIR ==\n{:#?}", program);
+        }
+        RunMode::Interpret => {
+            let io = StdIo::new();
+            let host = NullHost::new();
+            let mut interp = Interpreter::new(30_000, io, host);
 
-    let program = optimize(program);
-    println!("== HIR (after optimize) ==\n{:#?}", program);
+            interp
+                .run(&program)
+                .map_err(|e| format!("runtime error: {:?}", e))?;
+        }
+    }
 
     Ok(())
 }

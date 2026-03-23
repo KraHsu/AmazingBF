@@ -1,7 +1,9 @@
 mod cli;
 mod driver;
 mod frontend;
+mod interp;
 mod ir;
+mod runtime;
 
 fn main() {
     let config = match cli::parse_cli() {
