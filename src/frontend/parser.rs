@@ -1,10 +1,15 @@
 use crate::frontend::ast::AstNode;
 use crate::frontend::lexer::Token;
 
-#[derive(Debug)]
+use thiserror::Error;
+
+#[derive(Debug, Error)]
 pub enum ParseError {
-    UnexpectedLoopEnd,
-    UnclosedLoop,
+    #[error("unexpected loop end ']' at position {pos}")]
+    UnexpectedLoopEnd { pos: usize },
+
+    #[error("unclosed loop '[' starting at position {pos}")]
+    UnclosedLoop { pos: usize },
 }
 
 /// parse token list to ast
@@ -13,7 +18,7 @@ pub fn parse(tokens: &[Token]) -> Result<Vec<AstNode>, ParseError> {
     let ast = parse_block(tokens, &mut pos, false)?;
 
     if pos != tokens.len() {
-        return Err(ParseError::UnexpectedLoopEnd);
+        return Err(ParseError::UnexpectedLoopEnd { pos: pos });
     }
 
     Ok(ast)
@@ -50,7 +55,7 @@ fn parse_block(
                     *pos += 1; // consume ']'
                     return Ok(nodes);
                 } else {
-                    return Err(ParseError::UnexpectedLoopEnd);
+                    return Err(ParseError::UnexpectedLoopEnd { pos: *pos });
                 }
             }
         }
@@ -59,7 +64,7 @@ fn parse_block(
     }
 
     if in_loop {
-        Err(ParseError::UnclosedLoop)
+        Err(ParseError::UnclosedLoop { pos: *pos })
     } else {
         Ok(nodes)
     }

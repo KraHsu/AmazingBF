@@ -3,19 +3,18 @@ use crate::runtime::host::HostRuntime;
 use crate::runtime::io::{IoError, RuntimeIo};
 use crate::runtime::tape::{Tape, TapeError};
 
-#[derive(Debug)]
-pub enum RuntimeError {
-    Tape(String),
-    Io(String),
-    Host(String),
-}
+use thiserror::Error;
 
-impl From<TapeError> for RuntimeError {
-    fn from(err: TapeError) -> Self {
-        match err {
-            TapeError::PointerUnderflow => RuntimeError::Tape("pointer underflow".to_string()),
-        }
-    }
+#[derive(Debug, Error)]
+pub enum RuntimeError {
+    #[error("tape error: {0}")]
+    Tape(#[from] TapeError),
+
+    #[error("io error: {0}")]
+    Io(String),
+
+    #[error("host error: {0}")]
+    Host(String),
 }
 
 impl From<IoError> for RuntimeError {

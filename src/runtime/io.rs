@@ -1,8 +1,11 @@
 use std::io::{Read, Write};
+use thiserror::Error;
 
-#[derive(Debug)]
+#[derive(Debug, Error)]
 pub enum IoError {
+    #[error("read error: {0}")]
     ReadError(String),
+    #[error("write error: {0}")]
     WriteError(String),
 }
 

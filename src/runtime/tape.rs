@@ -1,3 +1,5 @@
+use thiserror::Error;
+
 /// The memory tape for runtime.
 ///
 /// Current implementation details:
@@ -11,9 +13,10 @@ pub struct Tape {
     ptr: usize,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Error)]
 pub enum TapeError {
-    PointerUnderflow,
+    #[error("pointer underflow at {pos}")]
+    PointerUnderflow { pos: isize },
 }
 
 impl Tape {
@@ -54,7 +57,7 @@ impl Tape {
     pub fn move_ptr(&mut self, delta: isize) -> Result<(), TapeError> {
         let next = self.ptr as isize + delta;
         if next < 0 {
-            return Err(TapeError::PointerUnderflow);
+            return Err(TapeError::PointerUnderflow { pos: next });
         }
 
         self.ptr = next as usize;

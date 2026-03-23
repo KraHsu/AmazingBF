@@ -6,11 +6,12 @@ use crate::ir::lower::lower;
 use crate::ir::optimize::optimize;
 use crate::runtime::host::NullHost;
 use crate::runtime::io::StdIo;
+use anyhow::Result;
 
 /// from src to HIR
-pub fn run(config: DriverConfig) -> Result<(), String> {
+pub fn run(config: DriverConfig) -> Result<()> {
     let tokens = lex(&config.source);
-    let ast = parse(&tokens).map_err(|e| format!("parse error: {:?}", e))?;
+    let ast = parse(&tokens)?;
     let program = optimize(lower(&ast));
 
     match config.mode {
@@ -24,9 +25,7 @@ pub fn run(config: DriverConfig) -> Result<(), String> {
             let host = NullHost::new();
             let mut interp = Interpreter::new(30_000, io, host);
 
-            interp
-                .run(&program)
-                .map_err(|e| format!("runtime error: {:?}", e))?;
+            interp.run(&program)?;
         }
     }
 

@@ -4,3 +4,6 @@ version = "0.1.0-beta"
 edition = "2024"
 
 [dependencies]
+anyhow = "1.0.102"
+inkwell = { git = "https://github.com/TheDan64/inkwell", branch = "master", version = "0.8.0", features = ["llvm22-1"] }
+thiserror = "2.0.18"
