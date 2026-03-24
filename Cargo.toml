@@ -5,5 +5,19 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.102"
-inkwell = { git = "https://github.com/TheDan64/inkwell", branch = "master", version = "0.8.0", features = ["llvm22-1"] }
 thiserror = "2.0.18"
+
+# LLVM 18 对应的 inkwell
+inkwell_llvm18 = { package = "inkwell", version = "0.8.0", optional = true, default-features = false, features = [
+    "llvm18-1",
+] }
+
+# LLVM 22 对应的 inkwell
+inkwell_llvm22 = { package = "inkwell", git = "https://github.com/TheDan64/inkwell", branch = "master", optional = true, default-features = false, features = [
+    "llvm22-1",
+] }
+
+[features]
+default = []
+llvm18 = ["dep:inkwell_llvm18"]
+llvm22 = ["dep:inkwell_llvm22"]
