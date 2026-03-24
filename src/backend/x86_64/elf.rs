@@ -9,8 +9,7 @@ pub fn build_elf_executable(encoded: &EncodedProgram) -> Vec<u8> {
     let text_off = (ELF64_EHDR_SIZE + ELF64_PHDR_SIZE) as u64;
     let entry = BASE_VADDR + text_off;
 
-    let tape = vec![0u8; encoded.tape_size];
-    let file_size = text_off as usize + encoded.text.len() + tape.len();
+    let file_size = text_off as usize + encoded.text.len();
     let file_size_u64 = file_size as u64;
 
     let mut out = Vec::with_capacity(file_size);
@@ -76,10 +75,6 @@ pub fn build_elf_executable(encoded: &EncodedProgram) -> Vec<u8> {
 
     // === text ===
     out.extend_from_slice(&encoded.text);
-
-    // === tape ===
-    out.extend_from_slice(&tape);
-
     out
 }
 

@@ -6,12 +6,6 @@ use crate::backend::asm::{AsmInst, AsmLabel, AsmProgram, Reg64};
 pub struct EncodedProgram {
     /// machine code output
     pub text: Vec<u8>,
-
-    /// label for tape
-    pub tape_label: AsmLabel,
-
-    /// tape size in byte
-    pub tape_size: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -125,15 +119,61 @@ pub fn encode_program(program: &AsmProgram) -> EncodedProgram {
         encode_inst(&mut buf, inst);
     }
 
-    EncodedProgram {
-        text: buf.finish(),
-        tape_label: program.tape_label,
-        tape_size: program.tape_size,
+    EncodedProgram { text: buf.finish() }
+}
+
+fn reg_num(reg: Reg64) -> u8 {
+    match reg {
+        Reg64::Rax => 0,
+        Reg64::Rcx => 1,
+        Reg64::Rdx => 2,
+        Reg64::Rsi => 6,
+        Reg64::Rdi => 7,
+        Reg64::R8 => 8,
+        Reg64::R9 => 9,
+        Reg64::R10 => 10,
+        Reg64::R11 => 11,
+        Reg64::R12 => 12,
+        Reg64::R13 => 13,
+        Reg64::R14 => 14,
+        Reg64::R15 => 15,
     }
 }
 
-/// from asm to machine code
-/// code xian ren ???
+fn emit_rex_w(buf: &mut CodeBuffer, r: u8, x: u8, b: u8) {
+    let rex = 0x48 | ((r & 1) << 2) | ((x & 1) << 1) | (b & 1);
+    buf.emit_u8(rex);
+}
+
+fn emit_modrm_reg_reg(buf: &mut CodeBuffer, reg_field: Reg64, rm_field: Reg64) {
+    let reg = reg_num(reg_field);
+    let rm = reg_num(rm_field);
+    emit_rex_w(buf, reg >> 3, 0, rm >> 3);
+    buf.emit_u8(0b11_000_000 | ((reg & 7) << 3) | (rm & 7));
+}
+
+fn emit_reg_imm32(buf: &mut CodeBuffer, subcode: u8, reg: Reg64, imm: i32) {
+    let rm = reg_num(reg);
+    emit_rex_w(buf, 0, 0, rm >> 3);
+    buf.emit_u8(0x81);
+    buf.emit_u8(0b11_000_000 | ((subcode & 7) << 3) | (rm & 7));
+    buf.emit_i32(imm);
+}
+
+fn emit_shift_right_imm8(buf: &mut CodeBuffer, reg: Reg64, imm: u8) {
+    let rm = reg_num(reg);
+    emit_rex_w(buf, 0, 0, rm >> 3);
+    buf.emit_u8(0xC1);
+    buf.emit_u8(0b11_000_000 | (5 << 3) | (rm & 7));
+    buf.emit_u8(imm);
+}
+
+fn emit_jcc_rel32(buf: &mut CodeBuffer, cc: u8, label: AsmLabel) {
+    buf.emit_u8(0x0F);
+    buf.emit_u8(cc);
+    buf.emit_rel32_fixup(label);
+}
+
 fn encode_inst(buf: &mut CodeBuffer, inst: &AsmInst) {
     match inst {
         AsmInst::Label(label) => {
@@ -158,125 +198,102 @@ fn encode_inst(buf: &mut CodeBuffer, inst: &AsmInst) {
 
         AsmInst::MovRegImm64(reg, imm) => {
             // mov r64, imm64
-            match reg {
-                Reg64::Rax => {
-                    buf.emit_u8(0x48);
-                    buf.emit_u8(0xB8);
-                }
-                Reg64::Rdi => {
-                    buf.emit_u8(0x48);
-                    buf.emit_u8(0xBF);
-                }
-                Reg64::Rsi => {
-                    buf.emit_u8(0x48);
-                    buf.emit_u8(0xBE);
-                }
-                Reg64::Rdx => {
-                    buf.emit_u8(0x48);
-                    buf.emit_u8(0xBA);
-                }
-                Reg64::R13 => {
-                    buf.emit_u8(0x49);
-                    buf.emit_u8(0xBD);
-                }
-            }
+            let code = reg_num(*reg);
+            emit_rex_w(buf, 0, 0, code >> 3);
+            buf.emit_u8(0xB8 + (code & 7));
             buf.emit_i64(*imm);
         }
 
         AsmInst::MovRegReg(dst, src) => {
             // mov dst, src
-            //
-            // only support:
-            //   mov rsi, r13
-            match (*dst, *src) {
-                (Reg64::Rsi, Reg64::R13) => {
-                    buf.emit_u8(0x4C);
-                    buf.emit_u8(0x89);
-                    buf.emit_u8(0xEE);
-                }
-                _ => panic!("MovRegReg unsupported pair: {:?} <- {:?}", dst, src),
-            }
+            emit_rex_w(buf, reg_num(*src) >> 3, 0, reg_num(*dst) >> 3);
+            buf.emit_u8(0x89);
+            buf.emit_u8(0b11_000_000 | ((reg_num(*src) & 7) << 3) | (reg_num(*dst) & 7));
         }
 
         AsmInst::AddRegImm32(reg, imm) => {
             // add r64, imm32
-            //
-            // only support:
-            //   add r13, imm32
-            match reg {
-                Reg64::R13 => {
-                    buf.emit_u8(0x49);
-                    buf.emit_u8(0x81);
-                    buf.emit_u8(0xC5);
-                    buf.emit_i32(*imm);
-                }
-                _ => panic!("AddRegImm32 unsupported register: {:?}", reg),
-            }
+            emit_reg_imm32(buf, 0, *reg, *imm);
         }
+
+        AsmInst::AddRegReg(dst, src) => {
+            emit_rex_w(buf, reg_num(*src) >> 3, 0, reg_num(*dst) >> 3);
+            buf.emit_u8(0x01);
+            buf.emit_u8(0b11_000_000 | ((reg_num(*src) & 7) << 3) | (reg_num(*dst) & 7));
+        }
+
+        AsmInst::SubRegReg(dst, src) => {
+            emit_rex_w(buf, reg_num(*src) >> 3, 0, reg_num(*dst) >> 3);
+            buf.emit_u8(0x29);
+            buf.emit_u8(0b11_000_000 | ((reg_num(*src) & 7) << 3) | (reg_num(*dst) & 7));
+        }
+
+        AsmInst::CmpRegReg(lhs, rhs) => {
+            emit_rex_w(buf, reg_num(*rhs) >> 3, 0, reg_num(*lhs) >> 3);
+            buf.emit_u8(0x39);
+            buf.emit_u8(0b11_000_000 | ((reg_num(*rhs) & 7) << 3) | (reg_num(*lhs) & 7));
+        }
+
+        AsmInst::CmpRegImm32(reg, imm) => emit_reg_imm32(buf, 7, *reg, *imm),
+
+        AsmInst::ShrRegImm8(reg, imm) => emit_shift_right_imm8(buf, *reg, *imm),
 
         AsmInst::AddMem8Imm8(reg, imm) => {
             // add byte ptr [r/m64], imm8
-            // 
-            // only support:
-            //   add byte ptr [r13 + 0], imm8
-            match reg {
-                Reg64::R13 => {
-                    buf.emit_u8(0x41);
-                    buf.emit_u8(0x80);
-                    buf.emit_u8(0x45);
-                    buf.emit_u8(0x00);
-                    buf.emit_u8(*imm as u8);
-                }
-                _ => panic!("AddMem8Imm8 unsupported register: {:?}", reg),
-            }
+            let rm = reg_num(*reg);
+            emit_rex_w(buf, 0, 0, rm >> 3);
+            buf.emit_u8(0x80);
+            buf.emit_u8(0b01_000_000 | (rm & 7));
+            buf.emit_u8(0x00);
+            buf.emit_u8(*imm as u8);
         }
 
         AsmInst::MovMem8Imm8(reg, imm) => {
             // mov byte ptr [r/m64], imm8
-            //
-            // only support:
-            //   mov byte ptr [r13 + 0], imm8
-            match reg {
-                Reg64::R13 => {
-                    buf.emit_u8(0x41);
-                    buf.emit_u8(0xC6);
-                    buf.emit_u8(0x45);
-                    buf.emit_u8(0x00);
-                    buf.emit_u8(*imm);
-                }
-                _ => panic!("MovMem8Imm8 unsupported register: {:?}", reg),
-            }
+            let rm = reg_num(*reg);
+            emit_rex_w(buf, 0, 0, rm >> 3);
+            buf.emit_u8(0xC6);
+            buf.emit_u8(0b01_000_000 | (rm & 7));
+            buf.emit_u8(0x00);
+            buf.emit_u8(*imm);
         }
 
         AsmInst::CmpMem8Imm8(reg, imm) => {
             // cmp byte ptr [r/m64], imm8
-            //
-            // only support:
-            //   cmp byte ptr [r13 + 0], imm8
-            match reg {
-                Reg64::R13 => {
-                    buf.emit_u8(0x41);
-                    buf.emit_u8(0x80);
-                    buf.emit_u8(0x7D);
-                    buf.emit_u8(0x00);
-                    buf.emit_u8(*imm);
-                }
-                _ => panic!("CmpMem8Imm8 unsupported register: {:?}", reg),
-            }
+            let rm = reg_num(*reg);
+            emit_rex_w(buf, 0, 0, rm >> 3);
+            buf.emit_u8(0x80);
+            buf.emit_u8(0b01_111_000 | (rm & 7));
+            buf.emit_u8(0x00);
+            buf.emit_u8(*imm);
         }
 
-        AsmInst::Jz(label) => {
-            // 0F 84 rel32
-            buf.emit_u8(0x0F);
-            buf.emit_u8(0x84);
+        // 0F 84 rel32
+        AsmInst::Jz(label) => emit_jcc_rel32(buf, 0x84, *label),
+        // 0F 85 rel32
+        AsmInst::Jnz(label) => emit_jcc_rel32(buf, 0x85, *label),
+        AsmInst::Jb(label) => emit_jcc_rel32(buf, 0x82, *label),
+        AsmInst::Jae(label) => emit_jcc_rel32(buf, 0x83, *label),
+        AsmInst::Jl(label) => emit_jcc_rel32(buf, 0x8C, *label),
+        AsmInst::Jge(label) => emit_jcc_rel32(buf, 0x8D, *label),
+
+        AsmInst::Jmp(label) => {
+            buf.emit_u8(0xE9);
             buf.emit_rel32_fixup(*label);
         }
 
-        AsmInst::Jnz(label) => {
-            // 0F 85 rel32
-            buf.emit_u8(0x0F);
-            buf.emit_u8(0x85);
+        AsmInst::Call(label) => {
+            buf.emit_u8(0xE8);
             buf.emit_rel32_fixup(*label);
+        }
+
+        AsmInst::Ret => buf.emit_u8(0xC3),
+
+        AsmInst::Cld => buf.emit_u8(0xFC),
+
+        AsmInst::RepMovsb => {
+            buf.emit_u8(0xF3);
+            buf.emit_u8(0xA4);
         }
 
         AsmInst::Syscall => {
