@@ -7,6 +7,7 @@ pub struct DriverConfig {
 #[derive(Debug, Clone, Copy)]
 pub enum RunMode {
     /// output fontend and IR
-    DumpIr,
+    Dump,
     Interpret,
+    ToElf,
 }
