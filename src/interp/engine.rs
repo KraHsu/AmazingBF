@@ -1,4 +1,4 @@
-use crate::ir::hir::{HirInst, Program};
+use crate::ir::hir::{HirInst, HirProgram};
 use crate::runtime::host::HostRuntime;
 use crate::runtime::io::{IoError, RuntimeIo};
 use crate::runtime::tape::{Tape, TapeError};
@@ -47,7 +47,7 @@ impl<I: RuntimeIo, H: HostRuntime> Interpreter<I, H> {
         }
     }
 
-    pub fn run(&mut self, program: &Program) -> Result<(), RuntimeError> {
+    pub fn run(&mut self, program: &HirProgram) -> Result<(), RuntimeError> {
         self.exec_block(&program.insts)
     }
 

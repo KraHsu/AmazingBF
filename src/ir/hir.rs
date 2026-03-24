@@ -22,6 +22,6 @@ pub enum HirInst {
 }
 
 #[derive(Debug, Clone)]
-pub struct Program {
+pub struct HirProgram {
     pub insts: Vec<HirInst>,
 }

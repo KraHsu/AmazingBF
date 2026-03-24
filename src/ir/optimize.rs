@@ -1,8 +1,8 @@
-use crate::ir::hir::{HirInst, Program};
+use crate::ir::hir::{HirInst, HirProgram};
 
 /// simple optimization
-pub fn optimize(program: Program) -> Program {
-    Program {
+pub fn optimize(program: HirProgram) -> HirProgram {
+    HirProgram {
         insts: optimize_block(program.insts),
     }
 }
