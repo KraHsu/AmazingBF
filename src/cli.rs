@@ -16,7 +16,7 @@ struct Args {
     output: PathBuf,
 
     /// Verbose level (-v, -vv, -vvv)
-    #[arg(short, long, action = ArgAction::Count)]
+    #[arg(short, long, action = ArgAction::Count, group = "log_level")]
     verbose: u8,
 
     /// Quiet log
@@ -24,7 +24,7 @@ struct Args {
     quiet: bool,
 
     /// Run mode
-    #[arg(short, long, value_enum, default_value_t = RunMode::Interpret, group = "log_level")]
+    #[arg(short, long, value_enum, default_value_t = RunMode::Interpret)]
     mode: RunMode,
 }
 
