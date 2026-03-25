@@ -1,6 +1,6 @@
 [package]
 name = "AmazingBF"
-version = "0.1.0-beta"
+version = "0.1.0-alpha"
 edition = "2024"
 
 [dependencies]
