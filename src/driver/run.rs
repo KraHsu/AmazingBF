@@ -38,10 +38,10 @@ pub fn run(config: DriverConfig) -> Result<()> {
         }
         RunMode::ToElf => {
             let elf = compile_lir_to_elf(&lir);
-            fs::write("a.out", &elf)?;
-            let mut perms = fs::metadata("a.out")?.permissions();
+            fs::write(&config.output, &elf)?;
+            let mut perms = fs::metadata(&config.output)?.permissions();
             perms.set_mode(0o755);
-            fs::set_permissions("a.out", perms)?;
+            fs::set_permissions(&config.output, perms)?;
         }
     }
 

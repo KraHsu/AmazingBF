@@ -9,7 +9,7 @@ pub struct DriverConfig {
     pub output: PathBuf,
 }
 
-#[derive(Debug, Clone, Copy, ValueEnum)]
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
 pub enum RunMode {
     /// output fontend and IR
     Dump,
