@@ -1,29 +1,52 @@
 use crate::driver::config::{DriverConfig, RunMode};
 
-/// print IR:
-/// cargo run -- dump "+++++>---[->+<]."
-///
-/// interpreter:
-/// cargo run -- run "++++++++[>++++++++<-]>+."
-pub fn parse_cli() -> Result<DriverConfig, String> {
-    let mut args = std::env::args();
-    let _exe = args.next();
+use anyhow::Result;
+use clap::Parser;
+use std::path::PathBuf;
 
-    let usage =
-        "usage:\n  cargo run -- dump \"BF_CODE\"\n  cargo run -- run  \"BF_CODE\"\n  cargo run -- elf \"BF_CODE\"".to_string();
+#[derive(Parser, Debug)]
+#[command(version, about = "A simple bf compiler & interpreter.")]
+struct Args {
+    /// input file
+    #[arg(short, long)]
+    input: PathBuf,
 
-    let mode_str = args.next().ok_or_else(|| usage.clone())?;
+    /// output file
+    #[arg(short, long, default_value = "a.out")]
+    output: PathBuf,
 
-    let source = args.next().ok_or_else(|| usage.clone())?;
+    /// Verbose mode
+    #[arg(short, long)]
+    verbose: bool,
 
-    let mode = match mode_str.as_str() {
-        "dump" => RunMode::Dump,
-        "run" => RunMode::Interpret,
-        "elf" => RunMode::ToElf,
-        other => {
-            return Err(format!("unknown mode: {}\n{}", other, usage.clone()));
-        }
-    };
+    /// Run mode
+    #[arg(short, long, value_enum, default_value_t = RunMode::Interpret)]
+    mode: RunMode,
+}
 
-    Ok(DriverConfig { source, mode })
+#[derive(Debug, Clone)]
+pub struct AppConfig {
+    pub driver_cfg: DriverConfig,
+    pub verbose: bool,
+}
+
+pub fn parse_cli() -> Result<AppConfig> {
+    let args = Args::parse();
+
+    let input_file = args.input;
+
+    let source = std::fs::read_to_string(input_file)?;
+
+    let mode = args.mode;
+
+    let output = args.output;
+
+    Ok(AppConfig {
+        driver_cfg: DriverConfig {
+            source,
+            mode,
+            output,
+        },
+        verbose: args.verbose,
+    })
 }
