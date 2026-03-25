@@ -24,3 +24,7 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 default = []
 llvm18 = ["dep:inkwell_llvm18"]
 llvm22 = ["dep:inkwell_llvm22"]
+
+[dev-dependencies]
+assert_cmd = "2.2.0"
+predicates = "3.1.4"
