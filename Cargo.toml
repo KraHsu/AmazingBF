@@ -17,6 +17,8 @@ inkwell_llvm22 = { package = "inkwell", git = "https://github.com/TheDan64/inkwe
     "llvm22-1",
 ] }
 clap = { version = "4.6.0", features = ["derive"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 
 [features]
 default = []
