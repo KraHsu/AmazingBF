@@ -8,7 +8,7 @@ use std::path::PathBuf;
 #[command(version, about = "A simple bf compiler & interpreter.")]
 struct Args {
     /// input file
-    #[arg(short, long)]
+    #[arg(index = 1)]
     input: PathBuf,
 
     /// output file
