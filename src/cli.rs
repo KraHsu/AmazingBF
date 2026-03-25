@@ -1,7 +1,7 @@
 use crate::driver::config::{DriverConfig, RunMode};
 
 use anyhow::Result;
-use clap::{ArgAction, Parser};
+use clap::{ArgAction, Parser, error::ErrorKind};
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
@@ -41,26 +41,40 @@ pub struct AppConfig {
 }
 
 pub fn parse_cli() -> Result<AppConfig> {
-    let args = Args::parse();
+    let quiet_requested = std::env::args_os().any(|arg| arg == "-q" || arg == "--quiet");
 
-    let input_file = args.input;
+    let args = match Args::try_parse() {
+        Ok(args) => args,
+        Err(err) => {
+            if !quiet_requested {
+                err.print()?;
+            }
 
-    let source = std::fs::read_to_string(input_file)?;
+            match err.kind() {
+                ErrorKind::DisplayHelp | ErrorKind::DisplayVersion => {
+                    std::process::exit(0);
+                }
+                _ => {
+                    std::process::exit(2);
+                }
+            }
+        }
+    };
 
-    let mode = args.mode;
-
-    let output = args.output;
+    let source = std::fs::read_to_string(&args.input)?;
 
     if args.verbose > 3 {
-        eprintln!("verbose level must be at most 3");
+        if !args.quiet {
+            eprintln!("verbose level must be at most 3");
+        }
         std::process::exit(1);
     }
 
     Ok(AppConfig {
         driver_cfg: DriverConfig {
             source,
-            mode,
-            output,
+            mode: args.mode,
+            output: args.output,
         },
         log_level: if args.quiet { 0 } else { args.verbose + 1 },
     })
