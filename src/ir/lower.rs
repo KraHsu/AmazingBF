@@ -40,7 +40,7 @@ fn lower_to_hir_block(ast: &[AstNode]) -> Vec<HirInst> {
 /// - GetByte    -> GetByte
 /// - Loop(body) -> explicit labels and jumps
 pub fn lower_to_lir(hir: &HirProgram) -> LirProgram {
-    let mut labels = LabelGen::default();
+    let mut labels = LabelGen::new();
 
     LirProgram {
         insts: lower_to_lir_block(&hir.insts, &mut labels),
