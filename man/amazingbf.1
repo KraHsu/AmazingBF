@@ -1,0 +1,71 @@
+.TH AMAZINGBF 1
+.SH NAME
+AmazingBF \- Brainfuck compiler and interpreter (HIR interpreter, x86_64 ELF backend)
+.SH SYNOPSIS
+.B AmazingBF
+.RI [ options ]
+.I FILE
+.SH DESCRIPTION
+AmazingBF compiles or interprets Brainfuck source.
+The pipeline is lexer → parser → AST → optimized HIR → LIR, then either HIR interpretation or native code generation for Linux x86_64.
+.PP
+If
+.I FILE
+is
+.BR \- ,
+source is read from standard input.
+.SH OPTIONS
+.TP
+.BR \-m ", " \-\-mode " " \fIMODE\fR
+Run mode:
+.B dump
+(run pipeline, log sizes only),
+.B interpret
+(default), or
+.B compile
+(emit ELF and write
+.BR \&.asm / \&.lst
+listings beside the output path).
+.TP
+.BR \-o ", " \-\-output " " \fIPATH\fR
+Output ELF path for compile mode (default:
+.BR a.out ).
+.TP
+.BR \-v ", " \-\-verbose
+Increase log verbosity (repeat up to three times for \-vvv).
+.TP
+.BR \-q ", " \-\-quiet
+Quiet logging.
+.TP
+.BR \-h ", " \-\-help
+Print help (also shown when no
+.I FILE
+is given).
+.TP
+.BR \-V ", " \-\-version
+Print version.
+.SH EXAMPLES
+.nf
+AmazingBF tests/cases/1.bf
+AmazingBF \-m compile \-o ./hello_bf tests/cases/1.bf
+./hello_bf
+cat prog.bf | AmazingBF \-
+.fi
+.SH ENVIRONMENT
+.TP
+.B RUST_LOG
+Overrides tracing filter (e.g. \fCRUST_LOG=debug\fR).
+.TP
+.B AMAZINGBF_LOG_FORMAT
+Set to
+.B json
+for JSON logs.
+.TP
+.B AMAZINGBF_LOG_JSON
+If set to
+.BR 1 ,
+enables JSON log format (compatibility switch).
+.SH SEE ALSO
+Project README and
+.B cargo run \-\- \-\-help
+for the full CLI text.

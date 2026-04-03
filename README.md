@@ -31,7 +31,7 @@ cargo build
 ### 解释执行
 
 ```bash
-cargo run -- tests/cases/1.bf
+cargo run -- tests/cases/1.bf -q
 ```
 
 默认模式是 `interpret`，上面的样例会输出经典的 Hello World。
@@ -57,7 +57,11 @@ cargo run -- tests/cases/1.bf -m compile -o hello_bf
 
 ```bash
 cargo run -- --help
+# 仅摘要
+cargo run -- -h
 ```
+
+仓库内提供手册页源文件 `man/amazingbf.1`，可本地预览：`man -l man/amazingbf.1`（安装到系统手册目录后即可用 `man amazingbf`）。
 
 ### 日志
 
@@ -152,8 +156,7 @@ cargo test
 
 ```bash
 cargo build --release
-bash tests/test.sh interp
-bash tests/test.sh compile
+cargo test --all
 ```
 
 测试数据位于 `tests/cases/`，每个样例通常包含：
@@ -163,11 +166,11 @@ bash tests/test.sh compile
 - `.out`：预期输出
 - `.md`：样例说明
 
-## 已知现状
+## 已知问题
 
 - `compile` 模式面向 Linux x86_64 后端
 - `dump` 模式目前会跑到 `AsmProgram`，但不会额外导出 HIR/LIR/ASM 可视化产物
-- 当前原生编译链路是手写的 `x86_64 ELF` 后端，不再依赖 LLVM
+- 当前原生编译链路是手写的 `x86_64 ELF` 后端，**不再依赖 LLVM**
 - `src/backend/` 下有较完整的中文模块文档，适合继续作为后端开发入口
 - `compile` 产物的 ELF 代码段默认按只读可执行（RX）封装，运行时 tape 由匿名 `mmap` 单独提供
 
@@ -175,6 +178,5 @@ bash tests/test.sh compile
 
 - 为 `cargo test` 补上真正的 CLI / IR / backend 测试
 - 让 `dump` 模式输出 HIR、LIR 或汇编中间结果
-- 把 `tests/test.sh` 与 CLI 枚举值持续保持同步
 - 在现有 LIR 基础上继续添加 peephole 或 loop 优化
 

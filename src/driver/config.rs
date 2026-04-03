@@ -12,8 +12,11 @@ pub struct DriverConfig {
 
 #[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
 pub enum RunMode {
+    /// 跑通流水线并在日志中输出各阶段规模，不写 ELF 或 listing
     Dump,
+    /// 在优化后的 HIR 上解释执行（默认）
     Interpret,
+    /// 生成 Linux x86_64 ELF，并在 `-o` 旁写出 `.asm` / `.lst`
     Compile,
 }
 
