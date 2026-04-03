@@ -30,6 +30,12 @@ pub enum LirInst {
     /// *ptr = value
     CellSet(u8),
 
+    /// 与 [`crate::ir::hir::HirInst::LinearMul`] 相同语义。
+    LinearMul(Vec<(isize, i32)>),
+
+    /// 与 [`crate::ir::hir::HirInst::Scan`] 相同语义（`dir` 为 ±1）。
+    Scan(isize),
+
     /// putchar
     PutByte,
 

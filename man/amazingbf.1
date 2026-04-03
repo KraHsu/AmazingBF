@@ -31,12 +31,23 @@ listings beside the output path).
 Output ELF path for compile mode (default:
 .BR a.out ).
 .TP
-.BR \-O ", " \-\-opt\-level " " \fI0|3\fR
-Compile optimization level (ignored outside compile mode):
+.BR \-O ", " \-\-opt\-level " " \fI0|1|3\fR
+Optimization level:
 .B 0
-(default) uses the normal LIR pipeline;
+(default) fuses consecutive HIR
+.B Move / Add
+only;
+.B 1
+adds one HIR pass: fuses runs of increments/decrements and pointer moves,
+peephole around clears, recognizes clear and scan loops, simple affine
+update loops (such as copy-to-neighbor idioms), and removes empty loops
+when the entry cell is provably zero;
 .B 3
-may emit a tiny
+uses the same HIR tier as
+.B 1
+and, in
+.B compile
+mode only, may emit a tiny
 .B exit(0)
 ELF when there is no output instruction, or fold fixed stdout when there is output but no input (precomputed
 .B write

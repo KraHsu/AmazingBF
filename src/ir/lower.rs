@@ -61,6 +61,12 @@ fn lower_to_lir_block(hir: &[HirInst], labels: &mut LabelGen) -> Vec<LirInst> {
             HirInst::PutByte => out.push(LirInst::PutByte),
             HirInst::GetByte => out.push(LirInst::GetByte),
 
+            HirInst::Zero => out.push(LirInst::CellSet(0)),
+
+            HirInst::LinearMul(factors) => out.push(LirInst::LinearMul(factors.clone())),
+
+            HirInst::Scan(dir) => out.push(LirInst::Scan(*dir)),
+
             HirInst::Loop(body) => {
                 let begin = labels.fresh();
                 let end = labels.fresh();

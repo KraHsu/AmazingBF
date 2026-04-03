@@ -68,6 +68,38 @@ const INTERNAL_LABEL_RESERVED_MIN_RAW: u32 = INTERNAL_LABEL_GROW_LOOP_RAW;
 /// 它们从“保留内部标签区间”以下开始递减分配，避免与固定内部标签撞号。
 const INTERNAL_LABEL_BASE_RAW: u32 = INTERNAL_LABEL_RESERVED_MIN_RAW - 1;
 
+/// 发射 `PtrAdd`：移动 `r13`，越界时 `call ensure_tape`。
+fn emit_ptr_add_out(
+    out: &mut Vec<AsmInst>,
+    next_internal_label: &mut u32,
+    n: isize,
+    ensure_tape_label: AsmLabel,
+) {
+    if n == 0 {
+        return;
+    }
+
+    let slow_path = fresh_internal_label(next_internal_label);
+    let done = fresh_internal_label(next_internal_label);
+
+    out.push(AsmInst::MovRegReg(Reg64::R15, Reg64::R13));
+    emit_add_reg_isize(out, Reg64::R15, n);
+
+    out.push(AsmInst::CmpRegReg(Reg64::R15, Reg64::R12));
+    out.push(AsmInst::Jb(slow_path));
+
+    out.push(AsmInst::CmpRegReg(Reg64::R15, Reg64::R14));
+    out.push(AsmInst::Jae(slow_path));
+
+    out.push(AsmInst::MovRegReg(Reg64::R13, Reg64::R15));
+    out.push(AsmInst::Jmp(done));
+
+    out.push(AsmInst::Label(slow_path));
+    out.push(AsmInst::Call(ensure_tape_label));
+
+    out.push(AsmInst::Label(done));
+}
+
 /// 将 LIR 程序编译为 x86_64 汇编程序。
 ///
 /// 生成的程序结构如下：
@@ -103,43 +135,41 @@ pub fn compile_lir_to_asm(lir: &LirProgram) -> AsmProgram {
             LirInst::PtrAdd(0) => {}
 
             // ---- PtrAdd(n)：移动数据指针 ----
-            //
-            // 生成的代码流程：
-            //   r15 = r13 + n          （计算候选新位置）
-            //   if r15 < r12: goto slow_path   （低于 tape 起始）
-            //   if r15 >= r14: goto slow_path   （超过 tape 末尾）
-            //   r13 = r15              （快速路径：直接更新指针）
-            //   goto done
-            // slow_path:
-            //   call ensure_tape       （慢速路径：扩容后更新指针）
-            // done:
             LirInst::PtrAdd(n) => {
-                // 分配两个临时标签用于边界检查的跳转
-                let slow_path = fresh_internal_label(&mut next_internal_label);
-                let done = fresh_internal_label(&mut next_internal_label);
+                emit_ptr_add_out(&mut out, &mut next_internal_label, *n, ensure_tape_label);
+            }
 
-                // 快速路径：先计算目标地址，检查是否在 [base, end) 范围内
-                out.push(AsmInst::MovRegReg(Reg64::R15, Reg64::R13)); // r15 = current_ptr
-                emit_add_reg_isize(&mut out, Reg64::R15, *n); // r15 += offset
+            // ---- LinearMul：`-O1` 仿射循环（如 `[->+<]`）----
+            LirInst::LinearMul(factors) => {
+                if factors.is_empty() {
+                    out.push(AsmInst::MovMem8Imm8(Reg64::R13, 0));
+                    continue;
+                }
+                out.push(AsmInst::Push(Reg64::Rbx));
+                out.push(AsmInst::MovzxEbxFromMemR13);
+                out.push(AsmInst::MovMem8Imm8(Reg64::R13, 0));
+                for (off, f) in factors {
+                    emit_ptr_add_out(&mut out, &mut next_internal_label, *off, ensure_tape_label);
+                    out.push(AsmInst::MovEaxEbx);
+                    out.push(AsmInst::ImulEaxEbxImm32(*f));
+                    out.push(AsmInst::AddMemR13Al);
+                    emit_ptr_add_out(&mut out, &mut next_internal_label, -*off, ensure_tape_label);
+                }
+                out.push(AsmInst::Pop(Reg64::Rbx));
+            }
 
-                // 无符号比较：r15 < tape_base？
-                out.push(AsmInst::CmpRegReg(Reg64::R15, Reg64::R12));
-                out.push(AsmInst::Jb(slow_path));
-
-                // 无符号比较：r15 >= tape_end？
-                out.push(AsmInst::CmpRegReg(Reg64::R15, Reg64::R14));
-                out.push(AsmInst::Jae(slow_path));
-
-                // 快速路径：指针在有效范围内，直接更新
-                out.push(AsmInst::MovRegReg(Reg64::R13, Reg64::R15));
-                out.push(AsmInst::Jmp(done));
-
-                // 慢速路径：需要扩容
-                out.push(AsmInst::Label(slow_path));
-                out.push(AsmInst::Call(ensure_tape_label));
-                // ensure_tape 返回后，R12/R13/R14 已经被更新为新 tape 的值
-
-                out.push(AsmInst::Label(done));
+            // ---- Scan：`while *p { < or > }`（`[<]` / `[>]`）----
+            LirInst::Scan(dir) => {
+                let step = *dir;
+                debug_assert!(step == 1 || step == -1, "Scan step must be ±1");
+                let loop_top = fresh_internal_label(&mut next_internal_label);
+                let loop_done = fresh_internal_label(&mut next_internal_label);
+                out.push(AsmInst::Label(loop_top));
+                out.push(AsmInst::CmpMem8Imm8(Reg64::R13, 0));
+                out.push(AsmInst::Jz(loop_done));
+                emit_ptr_add_out(&mut out, &mut next_internal_label, step, ensure_tape_label);
+                out.push(AsmInst::Jmp(loop_top));
+                out.push(AsmInst::Label(loop_done));
             }
 
             // ---- CellAdd(0)：空操作，跳过 ----

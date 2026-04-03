@@ -1,7 +1,7 @@
 /// HIR: High-level IR
 ///
 /// Only a minimal instruction set for now.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HirInst {
     /// Moves the data pointer. Positive values move it to the right,
     /// while negative values move it to the left.
@@ -17,11 +17,21 @@ pub enum HirInst {
     /// Reads one byte into the current cell.
     GetByte,
 
+    /// Set the current cell to 0 (strength-reduced from a `[-]`-style clear loop at `-O1`).
+    Zero,
+
+    /// `v = *p; *p = 0;` then for each `(off, f)` in order: `*(p+off) += v * f` (8-bit wrapping).
+    /// Produced from simple affine loops like `[->+<]` / `[->+>+<<]` at `-O1`.
+    LinearMul(Vec<(isize, i32)>),
+
+    /// While the current cell is non-zero, move the pointer by `dir` (−1 or +1). Matches `[<]` / `[>]`.
+    Scan(isize),
+
     /// A loop containing nested instructions.
     Loop(Vec<HirInst>),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HirProgram {
     pub insts: Vec<HirInst>,
 }

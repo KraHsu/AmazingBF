@@ -10,7 +10,7 @@ pub struct DriverConfig {
     pub output: PathBuf,
     /// When true in `interpret` mode, print tape statistics to stderr after the run.
     pub interp_debug: bool,
-    /// Compile-time optimization level (`compile` mode).
+    /// `-O` tier: HIR pipeline uses `optimize_o0` vs `optimize_o1`; `-O3` additionally enables whole-program `compile` folds.
     pub opt_level: OptLevel,
 }
 
@@ -40,13 +40,17 @@ impl std::fmt::Display for RunMode {
     }
 }
 
-/// Optimization level for `compile` mode. Other modes ignore this field.
+/// `-O` tier: selects the HIR optimization pass; `-O3` additionally enables whole-program folds in `compile` mode.
 #[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq, Default)]
 pub enum OptLevel {
-    /// No compile-time strength reductions beyond the usual HIR pipeline.
+    /// HIR: fuse consecutive `Move` / `Add` only (single pass).
     #[default]
     #[value(name = "0")]
     O0,
+    /// HIR: one pass of peephole (`Move`/`Add` fusion, `Zero`/`Add` simplification) and
+    /// loop simplification (e.g. `[-]` → `Zero`).
+    #[value(name = "1")]
+    O1,
     /// Strongest available compile optimizations (e.g. fold programs with no `.`,
     /// or precompute stdout when there is no `,`).
     #[value(name = "3")]
@@ -57,6 +61,7 @@ impl OptLevel {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::O0 => "0",
+            Self::O1 => "1",
             Self::O3 => "3",
         }
     }

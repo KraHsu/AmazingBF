@@ -56,6 +56,7 @@ pub enum Reg64 {
     Rax,
     Rcx,
     Rdx,
+    Rbx,
     Rsi,
     Rdi,
     R8,
@@ -78,6 +79,7 @@ impl fmt::Display for Reg64 {
             Reg64::Rax => "rax",
             Reg64::Rcx => "rcx",
             Reg64::Rdx => "rdx",
+            Reg64::Rbx => "rbx",
             Reg64::Rsi => "rsi",
             Reg64::Rdi => "rdi",
             Reg64::R8 => "r8",
@@ -242,6 +244,24 @@ pub enum AsmInst {
 
     /// 原始机器码字节（由 `-O3` 等路径预组装，不经指令级编码器）。
     RawBytes(Vec<u8>),
+
+    /// `push r64`
+    Push(Reg64),
+
+    /// `pop r64`
+    Pop(Reg64),
+
+    /// `movzx ebx, byte [r13]`（tape 当前格读入 ebx 低 8 位，高位清零）。
+    MovzxEbxFromMemR13,
+
+    /// `mov eax, ebx`
+    MovEaxEbx,
+
+    /// `imul eax, ebx, imm32`（仅用于 `-O1` LinearMul 低 8 位与 tape 语义一致）。
+    ImulEaxEbxImm32(i32),
+
+    /// `add byte [r13], al`
+    AddMemR13Al,
 }
 
 /// 汇编程序：一个平坦的指令序列。

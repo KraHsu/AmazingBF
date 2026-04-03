@@ -10,7 +10,7 @@ use crate::frontend::lexer::lex;
 use crate::frontend::parser::parse;
 use crate::interp::engine::Interpreter;
 use crate::ir::lower::{lower_to_hir, lower_to_lir};
-use crate::ir::optimize::optimize;
+use crate::ir::optimize::{optimize_o0, optimize_o1};
 use crate::runtime::host::NullHost;
 use crate::runtime::io::{BufferOutputIo, StdIo};
 use anyhow::{Context, Result};
@@ -36,7 +36,10 @@ pub fn run(config: DriverConfig) -> Result<()> {
     debug!(token_count = tokens.len(), "lexed source");
     let ast = parse(&tokens)?;
     debug!(ast_nodes = ast.len(), "parsed ast");
-    let hir = optimize(lower_to_hir(&ast));
+    let hir = match config.opt_level {
+        OptLevel::O0 => optimize_o0(lower_to_hir(&ast)),
+        OptLevel::O1 | OptLevel::O3 => optimize_o1(lower_to_hir(&ast)),
+    };
     debug!(hir_insts = hir.insts.len(), "lowered and optimized hir");
 
     match config.mode {

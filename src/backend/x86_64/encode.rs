@@ -277,6 +277,7 @@ fn reg_num(reg: Reg64) -> u8 {
         Reg64::Rax => 0,  // 000
         Reg64::Rcx => 1,  // 001
         Reg64::Rdx => 2,  // 010
+        Reg64::Rbx => 3,  // 011
         Reg64::Rsi => 6,  // 110
         Reg64::Rdi => 7,  // 111
         Reg64::R8 => 8,   // 1_000
@@ -534,7 +535,49 @@ fn encode_inst(buf: &mut CodeBuffer, inst: &AsmInst) {
         AsmInst::RawBytes(bytes) => {
             buf.emit_bytes(bytes);
         }
+
+        AsmInst::Push(reg) => emit_push_pop64(buf, *reg, true),
+        AsmInst::Pop(reg) => emit_push_pop64(buf, *reg, false),
+
+        // movzx ebx, byte [r13+0]
+        AsmInst::MovzxEbxFromMemR13 => {
+            buf.emit_u8(0x41);
+            buf.emit_u8(0x0f);
+            buf.emit_u8(0xb6);
+            buf.emit_u8(0x5d);
+            buf.emit_u8(0x00);
+        }
+
+        // mov eax, ebx
+        AsmInst::MovEaxEbx => {
+            buf.emit_u8(0x8b);
+            buf.emit_u8(0xc3);
+        }
+
+        // imul eax, ebx, imm32
+        AsmInst::ImulEaxEbxImm32(imm) => {
+            buf.emit_u8(0x69);
+            buf.emit_u8(0xc3);
+            buf.emit_i32(*imm);
+        }
+
+        // add byte [r13+0], al
+        AsmInst::AddMemR13Al => {
+            buf.emit_u8(0x41);
+            buf.emit_u8(0x00);
+            buf.emit_u8(0x45);
+            buf.emit_u8(0x00);
+        }
     }
+}
+
+fn emit_push_pop64(buf: &mut CodeBuffer, reg: Reg64, is_push: bool) {
+    let n = reg_num(reg);
+    let opc = if is_push { 0x50 } else { 0x58 };
+    if n >= 8 {
+        buf.emit_u8(0x41);
+    }
+    buf.emit_u8(opc + (n & 7));
 }
 
 #[cfg(test)]
