@@ -1,6 +1,8 @@
 use std::io::{Read, Write};
 use thiserror::Error;
 
+const EOF_BYTE: u8 = 255;
+
 #[derive(Debug, Error)]
 pub enum IoError {
     #[error("read error: {0}")]
@@ -36,9 +38,11 @@ impl RuntimeIo for StdIo {
     fn get_byte(&mut self) -> Result<u8, IoError> {
         let mut input = std::io::stdin();
         let mut buf = [0u8; 1];
-        input
-            .read_exact(&mut buf)
-            .map_err(|e| IoError::ReadError(e.to_string()))?;
-        Ok(buf[0])
+
+        match input.read_exact(&mut buf) {
+            Ok(()) => Ok(buf[0]),
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(EOF_BYTE),
+            Err(e) => Err(IoError::ReadError(e.to_string())),
+        }
     }
 }

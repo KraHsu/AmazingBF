@@ -1,3 +1,5 @@
+use anyhow::Result;
+
 mod backend;
 mod cli;
 mod driver;
@@ -6,22 +8,12 @@ mod interp;
 mod ir;
 mod runtime;
 
-#[cfg(all(feature = "llvm18", feature = "llvm22"))]
-compile_error!("features `llvm18` and `llvm22` cannot be enabled at the same time");
+fn main() -> Result<()> {
+    let config = cli::parse_cli()?;
 
-fn main() {
-    let config = match cli::parse_cli() {
-        Ok(cfg) => cfg,
-        Err(err) => {
-            eprintln!("{}", err);
-            std::process::exit(1);
-        }
-    };
+    driver::logging::init_logger(config.log_level)?;
 
-    println!("== SOURCE ==\n{:#?}", config.source);
+    driver::run::run(config.driver_cfg)?;
 
-    if let Err(err) = driver::run::run(config) {
-        eprintln!("{}", err);
-        std::process::exit(1);
-    }
+    Ok(())
 }
