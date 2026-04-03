@@ -38,10 +38,6 @@ pub fn run(config: DriverConfig) -> Result<()> {
     debug!(ast_nodes = ast.len(), "parsed ast");
     let hir = optimize(lower_to_hir(&ast));
     debug!(hir_insts = hir.insts.len(), "lowered and optimized hir");
-    let lir = lower_to_lir(&hir);
-    debug!(lir_insts = lir.len(), "lowered lir");
-    let asm = compile_lir_to_asm(&lir);
-    debug!(asm_insts = asm.insts.len(), "generated asm program");
 
     match config.mode {
         RunMode::Interpret => {
@@ -53,6 +49,11 @@ pub fn run(config: DriverConfig) -> Result<()> {
             info!(hir_insts = hir.insts.len(), "interpreter finished");
         }
         RunMode::Compile => {
+            let lir = lower_to_lir(&hir);
+            debug!(lir_insts = lir.len(), "lowered lir");
+            let asm = compile_lir_to_asm(&lir);
+            debug!(asm_insts = asm.insts.len(), "generated asm program");
+
             let elf = compile_asm_to_elf(&asm);
             let asm_listing_path = artifact_path(&config.output, ASM_LISTING_EXT);
             let hex_listing_path = artifact_path(&config.output, HEX_LISTING_EXT);
@@ -85,6 +86,11 @@ pub fn run(config: DriverConfig) -> Result<()> {
             );
         }
         RunMode::Dump => {
+            let lir = lower_to_lir(&hir);
+            debug!(lir_insts = lir.len(), "lowered lir");
+            let asm = compile_lir_to_asm(&lir);
+            debug!(asm_insts = asm.insts.len(), "generated asm program");
+
             info!(
                 hir_insts = hir.insts.len(),
                 lir_insts = lir.len(),
