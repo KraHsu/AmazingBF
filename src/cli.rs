@@ -25,6 +25,9 @@ const AFTER_LONG_HELP: &str = "\
   # 只跑通流水线并在日志里看各阶段规模（不写文件）
   AmazingBF path/to/hello.bf -m dump -vv
 
+  # 解释执行并在 stderr 打印 tape 使用统计
+  AmazingBF path/to/hello.bf --interp-debug
+
 手册页（若已安装）: man amazingbf";
 
 #[derive(Parser, Debug)]
@@ -57,6 +60,10 @@ struct Args {
     /// 运行模式
     #[arg(short, long, value_enum, default_value_t = RunMode::Interpret)]
     mode: RunMode,
+
+    /// 解释执行结束后在 stderr 输出 tape 统计（指针范围、向右扩容、左右移动量等）
+    #[arg(long = "interp-debug")]
+    interp_debug: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -119,6 +126,7 @@ pub fn parse_cli() -> Result<AppConfig> {
             source,
             mode: args.mode,
             output: args.output,
+            interp_debug: args.interp_debug,
         },
         log_level: if args.quiet { 0 } else { args.verbose + 1 },
     })

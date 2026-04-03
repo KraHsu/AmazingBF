@@ -36,6 +36,8 @@ cargo run -- tests/cases/1.bf -q
 
 默认模式是 `interpret`，上面的样例会输出经典的 Hello World。
 
+在解释模式下可加 `--interp-debug`，程序运行结束后在 **stderr** 打印 tape 统计：初始/最终槽位数、指针访问过的下标区间宽度、因右移而自动扩容的字节数，以及指针左移/右移的累计步数（与 HIR `Move` 合在一起的位移总量）。
+
 ### 编译为可执行文件
 
 ```bash

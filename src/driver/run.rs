@@ -47,6 +47,23 @@ pub fn run(config: DriverConfig) -> Result<()> {
 
             interp.run(&hir)?;
             info!(hir_insts = hir.insts.len(), "interpreter finished");
+
+            if config.interp_debug {
+                let s = interp.tape.stats();
+                eprintln!(
+                    "[interp-debug] tape initial_cells={} final_cells={} visited_span={} \
+                     right_growth_cells={} ptr_min={} ptr_max={} \
+                     move_left_units={} move_right_units={}",
+                    s.initial_len,
+                    s.final_len,
+                    s.visited_span(),
+                    s.right_growth,
+                    s.ptr_min,
+                    s.ptr_max,
+                    s.move_left_units,
+                    s.move_right_units,
+                );
+            }
         }
         RunMode::Compile => {
             let lir = lower_to_lir(&hir);

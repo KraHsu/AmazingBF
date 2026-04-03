@@ -8,6 +8,8 @@ pub struct DriverConfig {
     pub source: String,
     pub mode: RunMode,
     pub output: PathBuf,
+    /// When true in `interpret` mode, print tape statistics to stderr after the run.
+    pub interp_debug: bool,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]

@@ -37,6 +37,11 @@ Increase log verbosity (repeat up to three times for \-vvv).
 .BR \-q ", " \-\-quiet
 Quiet logging.
 .TP
+.B \-\-interp\-debug
+After HIR interpretation, print tape statistics to standard error (initial/final allocation,
+visited index span, right-growth from auto-resize, pointer min/max, cumulative left/right move units).
+Ignored outside interpret mode.
+.TP
 .BR \-h ", " \-\-help
 Print help (also shown when no
 .I FILE
