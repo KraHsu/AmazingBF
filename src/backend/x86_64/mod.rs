@@ -22,10 +22,10 @@ pub mod encode;
 /// let asm = compile_lir_to_asm(&lir);
 ///
 /// // 输出汇编文本到文件
-/// std::fs::write("output.asm", debug::dump_asm_listing(&asm))?;
+/// std::fs::write("hello_bf.asm", debug::dump_asm_listing(&asm))?;
 ///
 /// // 输出 hex listing 到文件
-/// std::fs::write("output.lst", debug::dump_hex_listing(&asm))?;
+/// std::fs::write("hello_bf.lst", debug::dump_hex_listing(&asm))?;
 /// ```
 pub mod debug;
 

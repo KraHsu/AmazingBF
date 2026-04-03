@@ -22,6 +22,17 @@ fi
 pass_count=0
 fail_count=0
 
+run_with_optional_input() {
+    local input_file="$1"
+    shift
+
+    if [[ -f "$input_file" ]]; then
+        "$@" < "$input_file"
+    else
+        "$@" < /dev/null
+    fi
+}
+
 run_interp_test() {
     local bf_file="$1"
     local name
@@ -31,13 +42,13 @@ run_interp_test() {
     local ans_file="$CASES_DIR/$name.out"
     local out_file="$OUT_TMP_DIR/${name}.interp.out"
     
-    if [[ ! -f "$in_file" || ! -f "$ans_file" ]]; then
-        echo "[interp] $name: missing .in or .out"
+    if [[ ! -f "$ans_file" ]]; then
+        echo "[interp] $name: missing .out"
         ((fail_count++))
         return
     fi
     
-    if "$BIN_PATH" "$bf_file" < "$in_file" > "$out_file"; then
+    if run_with_optional_input "$in_file" "$BIN_PATH" "$bf_file" -q > "$out_file"; then
         if diff -u "$ans_file" "$out_file" > /dev/null; then
             echo "[interp] $name: PASS"
             ((++pass_count))
@@ -60,21 +71,27 @@ run_compile_test() {
     local in_file="$CASES_DIR/$name.in"
     local ans_file="$CASES_DIR/$name.out"
     local exe_file="$BIN_TMP_DIR/$name"
+    local asm_file="${exe_file}.asm"
+    local lst_file="${exe_file}.lst"
     local out_file="$OUT_TMP_DIR/${name}.compile.out"
     
-    if [[ ! -f "$in_file" || ! -f "$ans_file" ]]; then
-        echo "[compile] $name: missing .in or .out"
+    if [[ ! -f "$ans_file" ]]; then
+        echo "[compile] $name: missing .out"
         ((fail_count++))
         return
     fi
     
-    rm -f "$exe_file" "$out_file"
+    rm -f "$exe_file" "$asm_file" "$lst_file" "$out_file"
     
-    if "$BIN_PATH" "$bf_file" -m to-elf -o "$exe_file"; then
-        chmod +x "$exe_file" || true
-        
+    if "$BIN_PATH" "$bf_file" -q -m compile -o "$exe_file"; then
+        if [[ ! -s "$exe_file" || ! -s "$asm_file" || ! -s "$lst_file" ]]; then
+            echo "[compile] $name: FAIL (missing compile artifacts)"
+            ((++fail_count))
+            return
+        fi
+
         # 按常见编译器习惯，编译后的程序直接运行即可
-        if "$exe_file" < "$in_file" > "$out_file"; then
+        if run_with_optional_input "$in_file" "$exe_file" > "$out_file"; then
             if diff -u "$ans_file" "$out_file" > /dev/null; then
                 echo "[compile] $name: PASS"
                 ((++pass_count))

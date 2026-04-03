@@ -107,26 +107,19 @@ impl fmt::Display for AsmLabel {
 ///
 /// 指令按功能分组：
 /// 1. 伪指令（Label）
-/// 2. 地址加载（LeaRipLabel）
-/// 3. 数据传送（MovRegImm64, MovRegReg, MovMem8Imm8）
-/// 4. 算术运算（AddRegImm32, AddRegReg, SubRegReg, AddMem8Imm8）
-/// 5. 比较（CmpRegReg, CmpRegImm32, CmpMem8Imm8）
-/// 6. 移位（ShrRegImm8）
-/// 7. 控制流（Jz, Jnz, Jb, Jae, Jl, Jge, Jmp, Call, Ret）
-/// 8. 字符串操作（Cld, RepMovsb）
-/// 9. 系统调用（Syscall）
+/// 2. 数据传送（MovRegImm64, MovRegReg, MovMem8Imm8）
+/// 3. 算术运算（AddRegImm32, AddRegReg, SubRegReg, AddMem8Imm8）
+/// 4. 比较（CmpRegReg, CmpRegImm32, CmpMem8Imm8）
+/// 5. 移位（ShrRegImm8）
+/// 6. 控制流（Jz, Jnz, Jb, Jae, Jl, Jge, Jmp, Call, Ret）
+/// 7. 字符串操作（Cld, RepMovsb）
+/// 8. 系统调用（Syscall）
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AsmInst {
     /// 标签定义（伪指令，不产生机器码字节）。
     ///
     /// 标记一个代码位置，供跳转和调用指令引用。
     Label(AsmLabel),
-
-    /// `lea reg, [rip + label]` — RIP 相对地址加载。
-    ///
-    /// 将标签对应的运行时虚拟地址加载到寄存器中。
-    /// 当前实现仅支持 R13 作为目标寄存器。
-    LeaRipLabel(Reg64, AsmLabel),
 
     /// `mov reg, imm64` — 将 64 位立即数加载到寄存器。
     ///
@@ -166,16 +159,19 @@ pub enum AsmInst {
     ///
     /// 对 `reg` 指向的内存地址处的单个字节进行加法。
     /// 这是 Brainfuck `+` 和 `-` 指令的直接实现。
+    /// 当前编码器仅支持无需 SIB 的基址寄存器组合（实际由 codegen 固定为 R13）。
     AddMem8Imm8(Reg64, i8),
 
     /// `mov byte ptr [reg], imm8` — 将立即数写入内存字节。
     ///
     /// 用于优化后的 BF 操作，如 `[-]` 被优化为 `CellSet(0)`。
+    /// 当前编码器仅支持无需 SIB 的基址寄存器组合（实际由 codegen 固定为 R13）。
     MovMem8Imm8(Reg64, u8),
 
     /// `cmp byte ptr [reg], imm8` — 内存字节与立即数比较。
     ///
     /// 用于 BF 的 `[` 和 `]`：检查当前单元是否为零。
+    /// 当前编码器仅支持无需 SIB 的基址寄存器组合（实际由 codegen 固定为 R13）。
     CmpMem8Imm8(Reg64, u8),
 
     /// `jz label` — 条件跳转：零标志位为 1 时跳转（ZF=1）。

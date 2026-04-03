@@ -18,7 +18,7 @@
 //!
 //! 特点：
 //! - 仅一个 LOAD 段，包含整个文件（ELF 头 + 程序头 + 代码）
-//! - 权限为 RWX（读/写/执行），因为 tape 数据和代码在同一段
+//! - 权限为 RX（读/执行）；运行时 tape 由独立的匿名 mmap 提供
 //! - 无 Section Header Table（意味着 objdump/gdb 无法识别代码段）
 //! - 入口点 = 基地址 + ELF 头大小 + 程序头大小 = .text 段起始
 //!
@@ -141,9 +141,9 @@ pub fn build_elf_executable(encoded: &EncodedProgram) -> Vec<u8> {
     push_u32(&mut out, 1); // PT_LOAD = 1（可加载段）
 
     // ---- p_flags: 段权限 ----
-    // PF_R(4) | PF_W(2) | PF_X(1) = 7
-    // 需要可执行（代码）、可读（常量/跳转目标）、可写（mmap 返回的 tape）
-    push_u32(&mut out, 0x4 | 0x2 | 0x1);
+    // PF_R(4) | PF_X(1) = 5
+    // 代码段不承载运行时 tape；tape 通过匿名 mmap 单独分配。
+    push_u32(&mut out, 0x4 | 0x1);
 
     // ---- p_offset: 段在文件中的偏移 ----
     push_u64(&mut out, 0); // 从文件开头开始（包含 ELF 头和程序头）
@@ -188,4 +188,44 @@ fn push_u32(out: &mut Vec<u8>, v: u32) {
 /// 写入 64 位无符号整数（小端序）
 fn push_u64(out: &mut Vec<u8>, v: u64) {
     out.extend_from_slice(&v.to_le_bytes());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::x86_64::encode::EncodedProgram;
+
+    fn read_u16(bytes: &[u8], offset: usize) -> u16 {
+        u16::from_le_bytes(bytes[offset..offset + 2].try_into().unwrap())
+    }
+
+    fn read_u32(bytes: &[u8], offset: usize) -> u32 {
+        u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
+    }
+
+    fn read_u64(bytes: &[u8], offset: usize) -> u64 {
+        u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap())
+    }
+
+    #[test]
+    fn elf_header_and_segment_flags_match_backend_contract() {
+        let encoded = EncodedProgram {
+            text: vec![0xC3], // ret
+        };
+        let elf = build_elf_executable(&encoded);
+
+        assert_eq!(&elf[0..4], b"\x7FELF");
+        assert_eq!(read_u16(&elf, 16), 2);
+        assert_eq!(read_u16(&elf, 18), 62);
+        assert_eq!(
+            read_u64(&elf, 24),
+            BASE_VADDR + (ELF64_EHDR_SIZE + ELF64_PHDR_SIZE) as u64
+        );
+        assert_eq!(read_u64(&elf, 32), ELF64_EHDR_SIZE as u64);
+        assert_eq!(read_u16(&elf, 54), ELF64_PHDR_SIZE as u16);
+        assert_eq!(read_u32(&elf, ELF64_EHDR_SIZE), 1);
+        assert_eq!(read_u32(&elf, ELF64_EHDR_SIZE + 4), 0x5);
+        assert_eq!(read_u64(&elf, ELF64_EHDR_SIZE + 32), elf.len() as u64);
+        assert_eq!(read_u64(&elf, ELF64_EHDR_SIZE + 40), elf.len() as u64);
+    }
 }

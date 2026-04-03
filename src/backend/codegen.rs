@@ -46,10 +46,10 @@ const INITIAL_TAPE_SIZE: usize = 4096;
 /// 当 PtrAdd 检测到指针越界时，会 CALL 到此标签。
 const INTERNAL_LABEL_ENSURE_TAPE_RAW: u32 = u32::MAX;
 
-/// 内部标签 ID：OOM 退出点。
+/// 内部标签 ID：统一的失败退出点。
 ///
-/// 当 mmap 返回负值（分配失败）时，跳转到此标签执行 exit(1)。
-const INTERNAL_LABEL_OOM_EXIT_RAW: u32 = u32::MAX - 1;
+/// 当 mmap/read 等系统调用返回负值（失败）时，跳转到此标签执行 exit(1)。
+const INTERNAL_LABEL_EXIT_ONE_RAW: u32 = u32::MAX - 1;
 
 /// 内部标签 ID：`ensure_tape` 中翻倍循环的入口。
 ///
@@ -86,7 +86,7 @@ const INTERNAL_LABEL_BASE_RAW: u32 = INTERNAL_LABEL_RESERVED_MIN_RAW - 1;
 /// 编译后的汇编程序
 pub fn compile_lir_to_asm(lir: &LirProgram) -> AsmProgram {
     let ensure_tape_label = AsmLabel(INTERNAL_LABEL_ENSURE_TAPE_RAW);
-    let oom_exit_label = AsmLabel(INTERNAL_LABEL_OOM_EXIT_RAW);
+    let exit_one_label = AsmLabel(INTERNAL_LABEL_EXIT_ONE_RAW);
 
     // 内部标签计数器，从 INTERNAL_LABEL_BASE_RAW 递减分配
     let mut next_internal_label = INTERNAL_LABEL_BASE_RAW;
@@ -94,7 +94,7 @@ pub fn compile_lir_to_asm(lir: &LirProgram) -> AsmProgram {
     let mut out = Vec::new();
 
     // ==== 1. 初始化 tape（mmap 分配内存） ====
-    emit_init_tape(&mut out, oom_exit_label);
+    emit_init_tape(&mut out, exit_one_label);
 
     // ==== 2. 翻译 LIR 指令 ====
     for inst in &lir.insts {
@@ -120,7 +120,7 @@ pub fn compile_lir_to_asm(lir: &LirProgram) -> AsmProgram {
 
                 // 快速路径：先计算目标地址，检查是否在 [base, end) 范围内
                 out.push(AsmInst::MovRegReg(Reg64::R15, Reg64::R13)); // r15 = current_ptr
-                out.push(AsmInst::AddRegImm32(Reg64::R15, *n as i32)); // r15 += offset
+                emit_add_reg_isize(&mut out, Reg64::R15, *n); // r15 += offset
 
                 // 无符号比较：r15 < tape_base？
                 out.push(AsmInst::CmpRegReg(Reg64::R15, Reg64::R12));
@@ -189,12 +189,23 @@ pub fn compile_lir_to_asm(lir: &LirProgram) -> AsmProgram {
             // 等价于 BF 的 ',' 操作。
             // 使用 Linux sys_read 系统调用：
             //   read(fd=0(stdin), buf=data_ptr, count=1)
+            //
+            // 语义上需要与解释器保持一致：
+            // - 返回 1：成功读取一个字节，内核已经写入 *data_ptr
+            // - 返回 0：EOF，将当前单元设为 255
+            // - 返回负值：读取失败，exit(1)
             LirInst::GetByte => {
+                let done = fresh_internal_label(&mut next_internal_label);
                 out.push(AsmInst::MovRegImm64(Reg64::Rax, 0)); // syscall 号 = 0 (read)
                 out.push(AsmInst::MovRegImm64(Reg64::Rdi, 0)); // fd = 0 (stdin)
                 out.push(AsmInst::MovRegReg(Reg64::Rsi, Reg64::R13)); // buf = data_ptr
                 out.push(AsmInst::MovRegImm64(Reg64::Rdx, 1)); // count = 1
                 out.push(AsmInst::Syscall);
+                out.push(AsmInst::CmpRegImm32(Reg64::Rax, 0));
+                out.push(AsmInst::Jl(exit_one_label));
+                out.push(AsmInst::Jnz(done));
+                out.push(AsmInst::MovMem8Imm8(Reg64::R13, 255));
+                out.push(AsmInst::Label(done));
             }
 
             // ---- Label：标签定义 ----
@@ -234,8 +245,8 @@ pub fn compile_lir_to_asm(lir: &LirProgram) -> AsmProgram {
     out.push(AsmInst::Syscall);
 
     // ==== 4. 辅助函数 ====
-    emit_ensure_tape_contains_r15(&mut out, ensure_tape_label, oom_exit_label);
-    emit_exit_one(&mut out, oom_exit_label);
+    emit_ensure_tape_contains_r15(&mut out, ensure_tape_label, exit_one_label);
+    emit_exit_one(&mut out, exit_one_label);
 
     AsmProgram { insts: out }
 }
@@ -257,7 +268,7 @@ pub fn compile_lir_to_asm(lir: &LirProgram) -> AsmProgram {
 ///
 /// 将指针初始化在中间而非开头，是为了支持 BF 程序向左移动指针（'<'），
 /// 而无需立即触发扩容。
-fn emit_init_tape(out: &mut Vec<AsmInst>, oom_exit_label: AsmLabel) {
+fn emit_init_tape(out: &mut Vec<AsmInst>, exit_one_label: AsmLabel) {
     // ---- mmap 系统调用参数 ----
     out.push(AsmInst::MovRegImm64(Reg64::Rax, 9)); // sys_mmap = 9
     out.push(AsmInst::MovRegImm64(Reg64::Rdi, 0)); // addr = NULL（让内核选择地址）
@@ -279,7 +290,7 @@ fn emit_init_tape(out: &mut Vec<AsmInst>, oom_exit_label: AsmLabel) {
     // ---- 检查 mmap 返回值 ----
     // 返回值 < 0 表示错误（如 ENOMEM）
     out.push(AsmInst::CmpRegImm32(Reg64::Rax, 0));
-    out.push(AsmInst::Jl(oom_exit_label));
+    out.push(AsmInst::Jl(exit_one_label));
 
     // ---- 初始化寄存器 ----
     // R12 = tape_base = mmap 返回的地址
@@ -317,7 +328,7 @@ fn emit_init_tape(out: &mut Vec<AsmInst>, oom_exit_label: AsmLabel) {
 fn emit_ensure_tape_contains_r15(
     out: &mut Vec<AsmInst>,
     ensure_tape_label: AsmLabel,
-    oom_exit_label: AsmLabel,
+    exit_one_label: AsmLabel,
 ) {
     let grow_loop = AsmLabel(INTERNAL_LABEL_GROW_LOOP_RAW);
 
@@ -374,7 +385,7 @@ fn emit_ensure_tape_contains_r15(
 
     // 检查 mmap 返回值
     out.push(AsmInst::CmpRegImm32(Reg64::Rax, 0));
-    out.push(AsmInst::Jl(oom_exit_label));
+    out.push(AsmInst::Jl(exit_one_label));
 
     // ---- 重新计算被 syscall 覆写的值 ----
     //
@@ -413,12 +424,19 @@ fn emit_ensure_tape_contains_r15(
     out.push(AsmInst::Cld); // 清除方向标志（确保向前复制）
     out.push(AsmInst::RepMovsb); // 执行复制
 
+    // ---- 在 munmap 之前先准备好新 tape 的结束地址 ----
+    // syscall 会覆写 r11，因此不能在 munmap 之后再依赖 new_len。
+    out.push(AsmInst::MovRegReg(Reg64::R14, Reg64::Rdx));
+    out.push(AsmInst::AddRegReg(Reg64::R14, Reg64::R11)); // r14 = new_base + new_len
+
     // ---- 释放旧缓冲区 ----
     // munmap(old_base, old_len)
     out.push(AsmInst::MovRegImm64(Reg64::Rax, 11)); // sys_munmap = 11
     out.push(AsmInst::MovRegReg(Reg64::Rdi, Reg64::R12)); // addr = old_base
     out.push(AsmInst::MovRegReg(Reg64::Rsi, Reg64::R10)); // length = old_len
     out.push(AsmInst::Syscall);
+    out.push(AsmInst::CmpRegImm32(Reg64::Rax, 0));
+    out.push(AsmInst::Jl(exit_one_label));
 
     // ---- 更新核心寄存器 ----
     // R12 = new_base
@@ -429,10 +447,6 @@ fn emit_ensure_tape_contains_r15(
     out.push(AsmInst::MovRegReg(Reg64::R13, Reg64::Rdx));
     out.push(AsmInst::AddRegReg(Reg64::R13, Reg64::R8)); // + copy_start
     out.push(AsmInst::AddRegReg(Reg64::R13, Reg64::R9)); // + desired_offset
-
-    // R14 = new_base + new_len
-    out.push(AsmInst::MovRegReg(Reg64::R14, Reg64::Rdx));
-    out.push(AsmInst::AddRegReg(Reg64::R14, Reg64::R11)); // + new_len
 
     // 返回到调用者（PtrAdd 的 slow_path 中的 CALL 之后）
     out.push(AsmInst::Ret);
@@ -472,4 +486,103 @@ fn fresh_internal_label(next_raw: &mut u32) -> AsmLabel {
 /// 两者不会冲突。
 fn map_label(id: LabelId) -> AsmLabel {
     AsmLabel(id.0)
+}
+
+fn emit_add_reg_isize(out: &mut Vec<AsmInst>, reg: Reg64, value: isize) {
+    let mut remaining = i64::try_from(value).expect("pointer delta did not fit in i64");
+
+    while remaining != 0 {
+        let chunk = if remaining > i64::from(i32::MAX) {
+            i32::MAX
+        } else if remaining < i64::from(i32::MIN) {
+            i32::MIN
+        } else {
+            remaining as i32
+        };
+
+        out.push(AsmInst::AddRegImm32(reg, chunk));
+        remaining -= i64::from(chunk);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ir::lir::{LirInst, LirProgram};
+
+    #[test]
+    fn get_byte_sets_eof_cell_to_255() {
+        let asm = compile_lir_to_asm(&LirProgram {
+            insts: vec![LirInst::GetByte],
+        });
+
+        let mut matched = false;
+        for window in asm.insts.windows(5) {
+            matched = matches!(
+                window,
+                [
+                    AsmInst::CmpRegImm32(Reg64::Rax, 0),
+                    AsmInst::Jl(_),
+                    AsmInst::Jnz(_),
+                    AsmInst::MovMem8Imm8(Reg64::R13, 255),
+                    AsmInst::Label(_)
+                ]
+            );
+
+            if matched {
+                break;
+            }
+        }
+
+        assert!(matched, "GetByte should map EOF to 255 in generated asm");
+    }
+
+    #[test]
+    fn ptr_add_is_emitted_without_i32_truncation() {
+        let large_delta = isize::try_from(i64::from(i32::MAX) + 5).unwrap();
+        let asm = compile_lir_to_asm(&LirProgram {
+            insts: vec![LirInst::PtrAdd(large_delta)],
+        });
+
+        let chunks: Vec<i32> = asm
+            .insts
+            .iter()
+            .filter_map(|inst| match inst {
+                AsmInst::AddRegImm32(Reg64::R15, imm) => Some(*imm),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(chunks, vec![i32::MAX, 5]);
+    }
+
+    #[test]
+    fn ensure_tape_does_not_use_r11_after_munmap_syscall() {
+        let asm = compile_lir_to_asm(&LirProgram {
+            insts: vec![LirInst::PtrAdd(4096)],
+        });
+
+        let munmap_idx = asm
+            .insts
+            .iter()
+            .position(|inst| matches!(inst, AsmInst::MovRegImm64(Reg64::Rax, 11)))
+            .expect("expected munmap syscall sequence");
+
+        let tail = &asm.insts[munmap_idx..];
+        let mut saw_syscall = false;
+
+        for inst in tail {
+            if matches!(inst, AsmInst::Syscall) {
+                saw_syscall = true;
+                continue;
+            }
+
+            if saw_syscall {
+                assert!(
+                    !matches!(inst, AsmInst::AddRegReg(Reg64::R14, Reg64::R11)),
+                    "r11 is clobbered by syscall and must not be used after munmap"
+                );
+            }
+        }
+    }
 }

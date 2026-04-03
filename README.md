@@ -12,7 +12,7 @@
 - 前端链路完整：`Lexer -> Parser -> AST`
 - 中间表示分层：`HIR -> optimize -> LIR`
 - 解释器基于 HIR 执行
-- 原生后端可生成 ELF，并输出 `output.asm` / `output.lst` 调试文件
+- 原生后端可生成 ELF，并输出与目标路径同 basename 的 `.asm` / `.lst` 调试文件
 - 提供基于 `tracing` 的结构化日志，支持 `RUST_LOG` 覆盖和 JSON 输出
 
 ## 快速开始
@@ -43,10 +43,15 @@ cargo run -- tests/cases/1.bf -m compile -o hello_bf
 ./hello_bf
 ```
 
-执行编译模式时，程序会额外在当前工作目录生成：
+执行编译模式时，程序会额外在输出文件旁边生成调试产物：
 
-- `output.asm`：可读的汇编 listing
-- `output.lst`：带偏移的十六进制 listing
+- `hello_bf.asm`：可读的汇编 listing
+- `hello_bf.lst`：带偏移的十六进制 listing
+
+调试产物路径使用 Rust `Path::with_extension()` 规则：
+
+- `-o hello_bf` 会生成 `hello_bf.asm` / `hello_bf.lst`
+- 默认输出 `-o a.out` 会生成 `a.asm` / `a.lst`
 
 ### 查看 CLI 帮助
 
@@ -79,10 +84,11 @@ Brainfuck source
   -> ELF
 ```
 
-其中两条主要执行路径如下：
+当前 `driver` 会统一执行到 `AsmProgram`，然后再按模式分支：
 
-- `interpret`：`source -> AST -> HIR -> optimize -> interpreter`
-- `compile`：`source -> AST -> HIR -> optimize -> LIR -> x86_64 backend -> ELF`
+- `interpret`：`source -> lexer -> parser -> AST -> HIR -> optimize -> LIR -> AsmProgram`，最终仍在 `HIR` 上解释执行
+- `compile`：`source -> lexer -> parser -> AST -> HIR -> optimize -> LIR -> AsmProgram -> x86_64 backend -> ELF`
+- `dump`：`source -> lexer -> parser -> AST -> HIR -> optimize -> LIR -> AsmProgram`，仅记录日志，不写出产物
 
 ### 模块分层
 
@@ -110,7 +116,7 @@ tests/
 - `src/driver/logging.rs`
   负责统一 tracing subscriber、默认过滤级别和 JSON 日志切换
 - `src/driver/run.rs`
-  负责串起 `lex -> parse -> lower_to_hir -> optimize -> lower_to_lir`，并记录关键流水线日志
+  负责串起 `lex -> parse -> lower_to_hir -> optimize -> lower_to_lir -> compile_lir_to_asm`，再按 mode 分发解释执行或落盘编译产物
 - `src/interp/engine.rs`
   在 HIR 上执行程序，依赖 `Tape`、`RuntimeIo`、`HostRuntime`
 - `src/backend/codegen.rs`
@@ -140,28 +146,30 @@ tests/
 cargo test
 ```
 
-当前仓库可以正常运行 `cargo test`，但还没有实际的 Rust 单元测试或集成测试用例。（目前使用一个独立bash脚本完成测试任务）
+当前仓库可以正常运行 `cargo test`，并覆盖后端编码、ELF 结构以及 `.lst` 与真实机器码一致性等关键回归；端到端样例仍主要通过独立 bash 脚本完成。
 
 ### Shell 样例测试
 
 ```bash
 cargo build --release
 bash tests/test.sh interp
+bash tests/test.sh compile
 ```
 
 测试数据位于 `tests/cases/`，每个样例通常包含：
 
 - `.bf`：Brainfuck 程序
-- `.in`：输入
+- `.in`：输入（可选；缺失时按空输入处理）
 - `.out`：预期输出
 - `.md`：样例说明
 
 ## 已知现状
 
 - `compile` 模式面向 Linux x86_64 后端
-- `dump` 模式目前会跑完整个前端和 IR 流程，但不会额外导出可视化产物
+- `dump` 模式目前会跑到 `AsmProgram`，但不会额外导出 HIR/LIR/ASM 可视化产物
 - 当前原生编译链路是手写的 `x86_64 ELF` 后端，不再依赖 LLVM
 - `src/backend/` 下有较完整的中文模块文档，适合继续作为后端开发入口
+- `compile` 产物的 ELF 代码段默认按只读可执行（RX）封装，运行时 tape 由匿名 `mmap` 单独提供
 
 ## 适合继续演进的方向
 

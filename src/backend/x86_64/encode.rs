@@ -52,6 +52,18 @@ pub struct EncodedProgram {
     pub text: Vec<u8>,
 }
 
+/// 单条 `AsmInst` 在最终 `.text` 中对应的字节范围。
+///
+/// `dump_hex_listing()` 使用这份元数据直接从生产编码结果切片，
+/// 避免再维护一套独立的调试编码器。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct EncodedInst {
+    /// 指令在 `.text` 中的起始偏移。
+    pub offset: usize,
+    /// 指令编码后的字节长度。标签等伪指令长度为 0。
+    pub len: usize,
+}
+
 /// Fixup 的种类。
 ///
 /// 目前仅支持一种：从下一条指令的 IP 计算的 32 位相对偏移。
@@ -135,7 +147,12 @@ impl CodeBuffer {
     /// 之后的 fixup 回填会使用这个偏移作为跳转目标。
     /// 如果同一个标签被绑定两次，后者会覆盖前者（通常这是 bug）。
     fn bind_label(&mut self, label: AsmLabel) {
-        self.labels.insert(label, self.pos());
+        let previous = self.labels.insert(label, self.pos());
+        assert!(
+            previous.is_none(),
+            "label bound multiple times: {:?}",
+            label
+        );
     }
 
     /// 写入单个字节
@@ -217,13 +234,29 @@ impl CodeBuffer {
 ///
 /// 这是本模块的入口函数，供 `x86_64/mod.rs` 调用。
 pub fn encode_program(program: &AsmProgram) -> EncodedProgram {
+    encode_program_with_inst_map(program).0
+}
+
+/// 将 `AsmProgram` 编码为机器码，并保留每条指令在 `.text` 中的范围信息。
+pub(crate) fn encode_program_with_inst_map(
+    program: &AsmProgram,
+) -> (EncodedProgram, Vec<EncodedInst>) {
     let mut buf = CodeBuffer::new();
+    let mut inst_map = Vec::with_capacity(program.insts.len());
 
     for inst in &program.insts {
+        let offset = buf.pos();
         encode_inst(&mut buf, inst);
+        inst_map.push(EncodedInst {
+            offset,
+            len: buf.pos() - offset,
+        });
     }
 
-    EncodedProgram { text: buf.finish() }
+    (
+        EncodedProgram { text: buf.finish() },
+        inst_map,
+    )
 }
 
 // ============================================================================
@@ -302,6 +335,20 @@ fn emit_shift_right_imm8(buf: &mut CodeBuffer, reg: Reg64, imm: u8) {
     buf.emit_u8(imm);
 }
 
+fn emit_mem8_disp0(buf: &mut CodeBuffer, opcode: u8, subcode: u8, reg: Reg64, imm: u8) {
+    let rm = reg_num(reg);
+    assert!(
+        (rm & 7) != 4,
+        "mem8 disp0 encoding requires SIB for register {:?}",
+        reg
+    );
+    emit_rex_w(buf, 0, 0, rm >> 3);
+    buf.emit_u8(opcode);
+    buf.emit_u8(0b01_000_000 | ((subcode & 7) << 3) | (rm & 7));
+    buf.emit_u8(0x00);
+    buf.emit_u8(imm);
+}
+
 /// 发射条件跳转指令：`0F cc rel32`。
 ///
 /// 所有近条件跳转共享这个编码格式，cc 字节决定跳转条件。
@@ -325,27 +372,6 @@ fn encode_inst(buf: &mut CodeBuffer, inst: &AsmInst) {
         AsmInst::Label(label) => {
             // 标签不产生字节，只记录当前偏移
             buf.bind_label(*label);
-        }
-
-        // ========== lea reg, [rip + rel32] ==========
-        //
-        // RIP 相对寻址的 LEA 指令。
-        // 这种寻址模式使用 ModRM mod=00, rm=101 的特殊编码。
-        //
-        // 当前硬编码仅支持 R13：
-        //   0x4C = REX.WR (W=1, R=1) → reg 字段扩展到 r13 (1_101)
-        //   0x8D = LEA 操作码
-        //   0x2D = ModRM: mod=00, reg=101(r13低3位), rm=101(RIP相对)
-        AsmInst::LeaRipLabel(reg, label) => {
-            match reg {
-                Reg64::R13 => {
-                    buf.emit_u8(0x4C); // REX.WR
-                    buf.emit_u8(0x8D); // LEA
-                    buf.emit_u8(0x2D); // ModRM: [rip+disp32], r13
-                    buf.emit_rel32_fixup(*label);
-                }
-                _ => panic!("LeaRipLabel unsupported register: {:?}", reg),
-            }
         }
 
         // ========== mov r64, imm64 ==========
@@ -434,12 +460,7 @@ fn encode_inst(buf: &mut CodeBuffer, inst: &AsmInst) {
         //   ModRM 之后跟一个 SIB 字节，但当前代码没有发射 SIB。
         //   目前安全，因为 codegen 仅对 R13 使用此指令。
         AsmInst::AddMem8Imm8(reg, imm) => {
-            let rm = reg_num(*reg);
-            emit_rex_w(buf, 0, 0, rm >> 3);
-            buf.emit_u8(0x80); // 字节 ALU 指令组
-            buf.emit_u8(0b01_000_000 | (rm & 7)); // ModRM: mod=01, reg=0(ADD), rm
-            buf.emit_u8(0x00); // disp8 = 0
-            buf.emit_u8(*imm as u8); // imm8
+            emit_mem8_disp0(buf, 0x80, 0, *reg, *imm as u8);
         }
 
         // ========== mov byte ptr [reg+0], imm8 ==========
@@ -447,12 +468,7 @@ fn encode_inst(buf: &mut CodeBuffer, inst: &AsmInst) {
         // 编码：REX.W + 0xC6 + ModRM(01, 0, rm) + disp8(0) + imm8
         // 0xC6 是 MOV r/m8, imm8 的操作码
         AsmInst::MovMem8Imm8(reg, imm) => {
-            let rm = reg_num(*reg);
-            emit_rex_w(buf, 0, 0, rm >> 3);
-            buf.emit_u8(0xC6);
-            buf.emit_u8(0b01_000_000 | (rm & 7));
-            buf.emit_u8(0x00);
-            buf.emit_u8(*imm);
+            emit_mem8_disp0(buf, 0xC6, 0, *reg, *imm);
         }
 
         // ========== cmp byte ptr [reg+0], imm8 ==========
@@ -460,12 +476,7 @@ fn encode_inst(buf: &mut CodeBuffer, inst: &AsmInst) {
         // 编码：REX.W + 0x80 + ModRM(01, 7, rm) + disp8(0) + imm8
         // ModRM.reg = 7 表示 CMP
         AsmInst::CmpMem8Imm8(reg, imm) => {
-            let rm = reg_num(*reg);
-            emit_rex_w(buf, 0, 0, rm >> 3);
-            buf.emit_u8(0x80);
-            buf.emit_u8(0b01_111_000 | (rm & 7)); // ModRM: mod=01, reg=7(CMP), rm
-            buf.emit_u8(0x00);
-            buf.emit_u8(*imm);
+            emit_mem8_disp0(buf, 0x80, 7, *reg, *imm);
         }
 
         // ========== 条件跳转 ==========
@@ -515,5 +526,56 @@ fn encode_inst(buf: &mut CodeBuffer, inst: &AsmInst) {
             buf.emit_u8(0x0F);
             buf.emit_u8(0x05);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inst_map_tracks_per_instruction_byte_ranges() {
+        let program = AsmProgram {
+            insts: vec![
+                AsmInst::MovRegImm64(Reg64::Rax, 9),
+                AsmInst::Label(AsmLabel(3)),
+                AsmInst::Ret,
+            ],
+        };
+
+        let (encoded, inst_map) = encode_program_with_inst_map(&program);
+
+        assert_eq!(inst_map.len(), program.insts.len());
+        assert_eq!(inst_map[0].offset, 0);
+        assert_eq!(inst_map[0].len, 10);
+        assert_eq!(inst_map[1].offset, 10);
+        assert_eq!(inst_map[1].len, 0);
+        assert_eq!(inst_map[2].offset, 10);
+        assert_eq!(inst_map[2].len, 1);
+        assert_eq!(encoded.text.len(), 11);
+    }
+
+    #[test]
+    #[should_panic(expected = "label bound multiple times")]
+    fn duplicate_labels_panic_during_encoding() {
+        let program = AsmProgram {
+            insts: vec![
+                AsmInst::Label(AsmLabel(1)),
+                AsmInst::Label(AsmLabel(1)),
+                AsmInst::Ret,
+            ],
+        };
+
+        let _ = encode_program(&program);
+    }
+
+    #[test]
+    #[should_panic(expected = "mem8 disp0 encoding requires SIB")]
+    fn mem8_disp0_rejects_r12_without_sib_support() {
+        let program = AsmProgram {
+            insts: vec![AsmInst::MovMem8Imm8(Reg64::R12, 1)],
+        };
+
+        let _ = encode_program(&program);
     }
 }
