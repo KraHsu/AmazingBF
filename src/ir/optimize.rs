@@ -299,9 +299,6 @@ fn push_o1(out: &mut Vec<HirInst>, inst: HirInst) {
         HirInst::Add(0) => {}
 
         HirInst::Add(k) => {
-            if matches!(out.last(), Some(HirInst::Zero)) {
-                out.pop();
-            }
             out.push(HirInst::Add(k));
         }
 
@@ -333,12 +330,13 @@ mod tests {
     }
 
     #[test]
-    fn o1_zero_then_add_collapses() {
+    fn o1_zero_then_add_kept() {
+        // `Zero; Add(k)` is *not* `Add(k)`: the former clears then adds; the latter is relative to the prior value.
         let p = HirProgram {
             insts: vec![HirInst::Zero, HirInst::Add(7)],
         };
         let o = optimize_o1(p);
-        assert_eq!(o.insts, vec![HirInst::Add(7)]);
+        assert_eq!(o.insts, vec![HirInst::Zero, HirInst::Add(7)]);
     }
 
     #[test]
