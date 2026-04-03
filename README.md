@@ -1,0 +1,161 @@
+# AmazingBF
+
+`AmazingBF` 是一个用 Rust 编写的 Brainfuck 工具链项目，目前包含两条可运行路径：
+
+- 解释执行：将源码解析后在 HIR 上运行
+- 原生编译：将 LIR 编译为 Linux x86_64 ELF 可执行文件
+
+## 当前能力
+
+- 支持 Brainfuck 基本语法：`><+-.,[]`
+- 提供 `interpret`、`compile`、`dump` 三种运行模式
+- 前端链路完整：`Lexer -> Parser -> AST`
+- 中间表示分层：`HIR -> optimize -> LIR`
+- 解释器基于 HIR 执行
+- 原生后端可生成 ELF，并输出 `output.asm` / `output.lst` 调试文件
+
+## 快速开始
+
+### 环境要求
+
+- Rust stable
+- 若使用 `compile` 模式，目标平台默认为 Linux x86_64
+
+### 构建
+
+```bash
+cargo build
+```
+
+### 解释执行
+
+```bash
+cargo run -- tests/cases/1.bf
+```
+
+默认模式是 `interpret`，上面的样例会输出经典的 Hello World。
+
+### 编译为可执行文件
+
+```bash
+cargo run -- tests/cases/1.bf -m compile -o hello_bf
+./hello_bf
+```
+
+执行编译模式时，程序会额外在当前工作目录生成：
+
+- `output.asm`：可读的汇编 listing
+- `output.lst`：带偏移的十六进制 listing
+
+### 查看 CLI 帮助
+
+```bash
+cargo run -- --help
+```
+
+## 项目架构
+
+### 总体流水线
+
+```text
+Brainfuck source
+  -> lexer
+  -> parser
+  -> AST
+  -> HIR
+  -> optimize
+  -> LIR
+  -> AsmProgram
+  -> machine code
+  -> ELF
+```
+
+其中两条主要执行路径如下：
+
+- `interpret`：`source -> AST -> HIR -> optimize -> interpreter`
+- `compile`：`source -> AST -> HIR -> optimize -> LIR -> x86_64 backend -> ELF`
+
+### 模块分层
+
+```text
+src/
+  main.rs              # 程序入口，初始化日志并启动 driver
+  cli.rs               # Clap CLI，构造 AppConfig / DriverConfig
+  driver/              # 运行模式分发与整体流水线编排
+  frontend/            # lexer / parser / AST
+  ir/                  # HIR、LIR、lower、optimize
+  interp/              # HIR 解释器
+  runtime/             # tape、IO、host 抽象
+  backend/             # 汇编 IR、代码生成、x86_64 ELF 后端
+tests/
+  cases/               # Brainfuck 测试样例与输入输出
+  test.sh              # shell 测试脚本
+```
+
+### 关键模块说明
+
+- `src/main.rs`
+  负责初始化 tracing 日志，并调用 `driver::run::run()`
+- `src/cli.rs`
+  负责把命令行参数解析成 `DriverConfig`
+- `src/driver/run.rs`
+  负责串起 `lex -> parse -> lower_to_hir -> optimize -> lower_to_lir`
+- `src/interp/engine.rs`
+  在 HIR 上执行程序，依赖 `Tape`、`RuntimeIo`、`HostRuntime`
+- `src/backend/codegen.rs`
+  把 LIR 翻译为汇编 IR，并固定了寄存器角色与 tape 扩容策略
+- `src/backend/x86_64/`
+  将汇编 IR 编码为机器码，并封装为 ELF 可执行文件
+
+## 解释器与编译器的边界
+
+- 解释器执行的是 `HIR`
+- 原生后端消费的是 `LIR`
+- `AsmProgram` 是后端内部使用的汇编级 IR
+- `src/backend/asm.rs` 与 `src/backend/codegen.rs` 一起定义了寄存器约定、标签分配和扩容策略
+
+这意味着如果要贡献：
+
+- 语法和语言前端：优先看 `src/frontend/`
+- 优化和 IR 结构：优先看 `src/ir/`
+- 运行语义：优先看 `src/interp/` 与 `src/runtime/`
+- 原生代码生成：优先看 `src/backend/`
+
+## 测试
+
+### Rust 测试
+
+```bash
+cargo test
+```
+
+当前仓库可以正常运行 `cargo test`，但还没有实际的 Rust 单元测试或集成测试用例。（目前使用一个独立bash脚本完成测试任务）
+
+### Shell 样例测试
+
+```bash
+cargo build --release
+bash tests/test.sh interp
+```
+
+测试数据位于 `tests/cases/`，每个样例通常包含：
+
+- `.bf`：Brainfuck 程序
+- `.in`：输入
+- `.out`：预期输出
+- `.md`：样例说明
+
+## 已知现状
+
+- `compile` 模式面向 Linux x86_64 后端
+- `dump` 模式目前会跑完整个前端和 IR 流程，但不会额外导出可视化产物
+- `Cargo.toml` 中存在 `llvm18` / `llvm22` feature，但当前代码树里的主后端仍然是手写的 x86_64 ELF 路径
+- `src/backend/` 下有较完整的中文模块文档，适合继续作为后端开发入口
+
+## 适合继续演进的方向
+
+- 为 `cargo test` 补上真正的 CLI / IR / backend 测试
+- 让 `dump` 模式输出 HIR、LIR 或汇编中间结果
+- 把 `tests/test.sh` 与 CLI 枚举值持续保持同步
+- 在现有 LIR 基础上继续添加 peephole 或 loop 优化
+
