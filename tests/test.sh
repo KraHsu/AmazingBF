@@ -3,10 +3,7 @@
 set -euo pipefail
 
 TEST_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-echo "$TEST_DIR"
-
 BIN_PATH="$TEST_DIR/../target/release/AmazingBF"
-echo "$BIN_PATH"
 
 CASES_DIR="$TEST_DIR/cases"
 TMP_DIR="$TEST_DIR/tmp"
@@ -80,19 +77,19 @@ run_compile_test() {
         if "$exe_file" < "$in_file" > "$out_file"; then
             if diff -u "$ans_file" "$out_file" > /dev/null; then
                 echo "[compile] $name: PASS"
-                ((pass_count++))
+                ((++pass_count))
             else
                 echo "[compile] $name: FAIL (output mismatch)"
                 diff -u "$ans_file" "$out_file" || true
-                ((fail_count++))
+                ((++fail_count))
             fi
         else
             echo "[compile] $name: FAIL (compiled program runtime error)"
-            ((fail_count++))
+            ((++fail_count))
         fi
     else
         echo "[compile] $name: FAIL (compile error)"
-        ((fail_count++))
+        ((++fail_count))
     fi
 }
 
