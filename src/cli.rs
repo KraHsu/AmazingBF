@@ -72,6 +72,7 @@ pub fn parse_cli() -> Result<AppConfig> {
 
     Ok(AppConfig {
         driver_cfg: DriverConfig {
+            input: args.input,
             source,
             mode: args.mode,
             output: args.output,

@@ -13,7 +13,7 @@ src/
   ir/
   runtime/
   interp/
-  llvm/
+  backend/
   extensions/
   driver/
 ```
@@ -26,5 +26,5 @@ BF source ──► Lexer ──► Parser ──► IR
                                     │
              Interpreter backend ◄──┤
                                     │
-                    LLVM backend ◄──┘
+              x86_64 ELF backend ◄──┘
 ```

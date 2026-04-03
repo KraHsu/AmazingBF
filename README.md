@@ -13,6 +13,7 @@
 - 中间表示分层：`HIR -> optimize -> LIR`
 - 解释器基于 HIR 执行
 - 原生后端可生成 ELF，并输出 `output.asm` / `output.lst` 调试文件
+- 提供基于 `tracing` 的结构化日志，支持 `RUST_LOG` 覆盖和 JSON 输出
 
 ## 快速开始
 
@@ -52,6 +53,14 @@ cargo run -- tests/cases/1.bf -m compile -o hello_bf
 ```bash
 cargo run -- --help
 ```
+
+### 日志
+
+默认日志输出为适合终端阅读的文本格式，`-v/-vv/-vvv` 会提升默认详细度，`-q` 会把默认过滤级别降为静默。
+
+- `RUST_LOG`：覆盖默认过滤规则，例如 `RUST_LOG=debug cargo run -- tests/cases/1.bf`
+- `AMAZINGBF_LOG_FORMAT=json`：切换为 JSON 日志
+- `AMAZINGBF_LOG_JSON=1`：JSON 日志的兼容开关
 
 ## 项目架构
 
@@ -95,11 +104,13 @@ tests/
 ### 关键模块说明
 
 - `src/main.rs`
-  负责初始化 tracing 日志，并调用 `driver::run::run()`
+  负责解析 CLI、初始化 tracing 日志，并调用 `driver::run::run()`
 - `src/cli.rs`
   负责把命令行参数解析成 `DriverConfig`
+- `src/driver/logging.rs`
+  负责统一 tracing subscriber、默认过滤级别和 JSON 日志切换
 - `src/driver/run.rs`
-  负责串起 `lex -> parse -> lower_to_hir -> optimize -> lower_to_lir`
+  负责串起 `lex -> parse -> lower_to_hir -> optimize -> lower_to_lir`，并记录关键流水线日志
 - `src/interp/engine.rs`
   在 HIR 上执行程序，依赖 `Tape`、`RuntimeIo`、`HostRuntime`
 - `src/backend/codegen.rs`
@@ -149,7 +160,7 @@ bash tests/test.sh interp
 
 - `compile` 模式面向 Linux x86_64 后端
 - `dump` 模式目前会跑完整个前端和 IR 流程，但不会额外导出可视化产物
-- `Cargo.toml` 中存在 `llvm18` / `llvm22` feature，但当前代码树里的主后端仍然是手写的 x86_64 ELF 路径
+- 当前原生编译链路是手写的 `x86_64 ELF` 后端，不再依赖 LLVM
 - `src/backend/` 下有较完整的中文模块文档，适合继续作为后端开发入口
 
 ## 适合继续演进的方向

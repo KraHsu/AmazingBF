@@ -10,5 +10,5 @@ alwaysApply: true
 - `RunMode::Interpret` executes HIR in `src/interp/engine.rs`.
 - `RunMode::Compile` lowers LIR through `src/backend/codegen.rs` and `src/backend/x86_64/` into an ELF executable.
 - Keep user-facing behavior aligned across `src/cli.rs`, `src/driver/config.rs`, `src/driver/run.rs`, tests, and `README.md`.
-- `llvm18` and `llvm22` are optional feature flags in `Cargo.toml`, not the primary backend implemented in this tree.
+- The only native backend in this tree is the handwritten x86_64 ELF path under `src/backend/`.
 - When compile output behavior changes, also update docs for generated artifacts such as `output.asm` and `output.lst`.
