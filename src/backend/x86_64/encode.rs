@@ -160,6 +160,10 @@ impl CodeBuffer {
         self.bytes.push(b);
     }
 
+    fn emit_bytes(&mut self, chunk: &[u8]) {
+        self.bytes.extend_from_slice(chunk);
+    }
+
     /// 写入 32 位有符号整数（小端序）。
     ///
     /// x86_64 使用小端序，即最低有效字节在最低地址。
@@ -525,6 +529,10 @@ fn encode_inst(buf: &mut CodeBuffer, inst: &AsmInst) {
         AsmInst::Syscall => {
             buf.emit_u8(0x0F);
             buf.emit_u8(0x05);
+        }
+
+        AsmInst::RawBytes(bytes) => {
+            buf.emit_bytes(bytes);
         }
     }
 }

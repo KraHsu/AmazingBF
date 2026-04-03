@@ -1,4 +1,4 @@
-use crate::driver::config::{DriverConfig, RunMode};
+use crate::driver::config::{DriverConfig, OptLevel, RunMode};
 
 use anyhow::Result;
 use clap::{ArgAction, ColorChoice, Parser, error::ErrorKind};
@@ -60,6 +60,10 @@ struct Args {
     /// 运行模式
     #[arg(short, long, value_enum, default_value_t = RunMode::Interpret)]
     mode: RunMode,
+
+    /// 编译优化级别（仅 compile 模式；`-O3` 启用当前最强编译期折叠）
+    #[arg(short = 'O', long = "opt-level", value_enum, default_value_t = OptLevel::O0)]
+    opt_level: OptLevel,
 
     /// 解释执行结束后在 stderr 输出 tape 统计（指针范围、向右扩容、左右移动量等）
     #[arg(long = "interp-debug")]
@@ -127,6 +131,7 @@ pub fn parse_cli() -> Result<AppConfig> {
             mode: args.mode,
             output: args.output,
             interp_debug: args.interp_debug,
+            opt_level: args.opt_level,
         },
         log_level: if args.quiet { 0 } else { args.verbose + 1 },
     })

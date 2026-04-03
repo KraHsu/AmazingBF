@@ -46,3 +46,20 @@ impl RuntimeIo for StdIo {
         }
     }
 }
+
+/// Collects `PutByte` output into memory. `get_byte` returns EOF (255) like stdin EOF.
+#[derive(Debug, Default)]
+pub struct BufferOutputIo {
+    pub bytes: Vec<u8>,
+}
+
+impl RuntimeIo for BufferOutputIo {
+    fn put_byte(&mut self, byte: u8) -> Result<(), IoError> {
+        self.bytes.push(byte);
+        Ok(())
+    }
+
+    fn get_byte(&mut self) -> Result<u8, IoError> {
+        Ok(EOF_BYTE)
+    }
+}

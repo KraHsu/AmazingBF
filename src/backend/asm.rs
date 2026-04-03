@@ -114,6 +114,7 @@ impl fmt::Display for AsmLabel {
 /// 6. 控制流（Jz, Jnz, Jb, Jae, Jl, Jge, Jmp, Call, Ret）
 /// 7. 字符串操作（Cld, RepMovsb）
 /// 8. 系统调用（Syscall）
+/// 9. 原始机器码（RawBytes，用于 `-O3` 等预计算路径）
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AsmInst {
     /// 标签定义（伪指令，不产生机器码字节）。
@@ -238,6 +239,9 @@ pub enum AsmInst {
     /// - 返回值写入 rax
     /// - 内核会覆写 rcx（保存旧 RIP）和 r11（保存旧 RFLAGS）
     Syscall,
+
+    /// 原始机器码字节（由 `-O3` 等路径预组装，不经指令级编码器）。
+    RawBytes(Vec<u8>),
 }
 
 /// 汇编程序：一个平坦的指令序列。

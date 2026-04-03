@@ -304,6 +304,15 @@ fn format_inst_asm(out: &mut String, inst: &AsmInst) {
         AsmInst::Syscall => {
             writeln!(out, "    syscall").unwrap();
         }
+
+        AsmInst::RawBytes(bytes) => {
+            writeln!(
+                out,
+                "    ; <raw {} bytes: precomputed -O3 machine code>",
+                bytes.len()
+            )
+            .unwrap();
+        }
     }
 }
 

@@ -55,6 +55,11 @@ cargo run -- tests/cases/1.bf -m compile -o hello_bf
 - `-o hello_bf` 会生成 `hello_bf.asm` / `hello_bf.lst`
 - 默认输出 `-o a.out` 会生成 `a.asm` / `a.lst`
 
+编译优化级别由 `-O` / `--opt-level` 指定（默认 `0`）。当前实现中：
+
+- `-O0`：走常规 LIR → 汇编路径（含 mmap tape 等）。
+- `-O3`：在 **compile** 模式下启用最强编译期折叠：若源码中没有任何 `.`，生成仅 `exit(0)` 的极小 ELF；若有 `.` 且没有任何 `,`，则在编译时于 HIR 上解释执行一次以收集标准输出字节序列，再生成直接 `write` 该序列后 `exit` 的 ELF（无 Brainfuck tape）。
+
 ### 查看 CLI 帮助
 
 ```bash

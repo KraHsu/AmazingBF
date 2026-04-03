@@ -2,17 +2,17 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
-use crate::backend::codegen::compile_lir_to_asm;
+use crate::backend::codegen::{compile_lir_to_asm, compile_precomputed_stdout_asm, compile_trivial_exit_asm};
 use crate::backend::x86_64::compile_asm_to_elf;
 use crate::backend::x86_64::debug;
-use crate::driver::config::{DriverConfig, RunMode};
+use crate::driver::config::{DriverConfig, OptLevel, RunMode};
 use crate::frontend::lexer::lex;
 use crate::frontend::parser::parse;
 use crate::interp::engine::Interpreter;
 use crate::ir::lower::{lower_to_hir, lower_to_lir};
 use crate::ir::optimize::optimize;
 use crate::runtime::host::NullHost;
-use crate::runtime::io::StdIo;
+use crate::runtime::io::{BufferOutputIo, StdIo};
 use anyhow::{Context, Result};
 use tracing::{debug, info, info_span};
 
@@ -66,9 +66,26 @@ pub fn run(config: DriverConfig) -> Result<()> {
             }
         }
         RunMode::Compile => {
-            let lir = lower_to_lir(&hir);
-            debug!(lir_insts = lir.len(), "lowered lir");
-            let asm = compile_lir_to_asm(&lir);
+            let asm = if config.opt_level == OptLevel::O3 {
+                if !hir.has_put_byte() {
+                    info!("compile -O3: no output ops; emitting trivial exit(0) ELF");
+                    compile_trivial_exit_asm()
+                } else if !hir.has_get_byte() {
+                    info!("compile -O3: no input; folding stdout to precomputed write+exit");
+                    let io = BufferOutputIo::default();
+                    let mut interp = Interpreter::new(30_000, io, NullHost::new());
+                    interp.run(&hir)?;
+                    compile_precomputed_stdout_asm(&interp.io.bytes)
+                } else {
+                    let lir = lower_to_lir(&hir);
+                    debug!(lir_insts = lir.len(), "lowered lir");
+                    compile_lir_to_asm(&lir)
+                }
+            } else {
+                let lir = lower_to_lir(&hir);
+                debug!(lir_insts = lir.len(), "lowered lir");
+                compile_lir_to_asm(&lir)
+            };
             debug!(asm_insts = asm.insts.len(), "generated asm program");
 
             let elf = compile_asm_to_elf(&asm);

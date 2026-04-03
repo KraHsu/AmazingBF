@@ -251,6 +251,99 @@ pub fn compile_lir_to_asm(lir: &LirProgram) -> AsmProgram {
     AsmProgram { insts: out }
 }
 
+/// 最小 ELF 载荷：仅 `exit(0)`。用于 `-O3` 且源码中无任何 `.` 时。
+pub fn compile_trivial_exit_asm() -> AsmProgram {
+    AsmProgram {
+        insts: vec![
+            AsmInst::MovRegImm64(Reg64::Rax, 60),
+            AsmInst::MovRegImm64(Reg64::Rdi, 0),
+            AsmInst::Syscall,
+        ],
+    }
+}
+
+/// `write(1, buf, n); exit(0)`，字节放在栈上，不经过 Brainfuck tape。
+///
+/// `data` 为空时等价于 [`compile_trivial_exit_asm`]。
+pub fn compile_precomputed_stdout_asm(data: &[u8]) -> AsmProgram {
+    if data.is_empty() {
+        return compile_trivial_exit_asm();
+    }
+    AsmProgram {
+        insts: vec![AsmInst::RawBytes(build_precomputed_stdout_machine_code(data))],
+    }
+}
+
+/// 生成 `sub rsp` / `mov [rsp+off]` / `write` / `exit` 的机器码（Linux x86_64）。
+fn build_precomputed_stdout_machine_code(data: &[u8]) -> Vec<u8> {
+    let n = data.len();
+    let mut code = Vec::new();
+    let alloc = (n + 15) & !15;
+
+    emit_sub_rsp_imm32(&mut code, alloc as i32);
+
+    for (i, &b) in data.iter().enumerate() {
+        emit_mov_byte_rsp_offset(&mut code, i, b);
+    }
+
+    emit_mov_reg_imm64_low3(&mut code, 0, 1);
+    emit_mov_reg_imm64_low3(&mut code, 7, 1);
+    code.extend_from_slice(&[0x48, 0x89, 0xe6]);
+    emit_mov_reg_imm64_low3(&mut code, 2, n as i64);
+
+    code.extend_from_slice(&[0x0f, 0x05]);
+
+    emit_add_rsp_imm32(&mut code, alloc as i32);
+
+    emit_mov_reg_imm64_low3(&mut code, 0, 60);
+    emit_mov_reg_imm64_low3(&mut code, 7, 0);
+    code.extend_from_slice(&[0x0f, 0x05]);
+
+    code
+}
+
+fn emit_mov_reg_imm64_low3(code: &mut Vec<u8>, reg_low3: u8, imm: i64) {
+    debug_assert!(reg_low3 < 8);
+    code.push(0x48);
+    code.push(0xb8 + reg_low3);
+    code.extend_from_slice(&imm.to_le_bytes());
+}
+
+fn emit_sub_rsp_imm32(code: &mut Vec<u8>, imm: i32) {
+    debug_assert!(imm > 0);
+    if imm <= 127 {
+        code.extend_from_slice(&[0x48, 0x83, 0xec, imm as u8]);
+    } else {
+        code.push(0x48);
+        code.push(0x81);
+        code.push(0xec);
+        code.extend_from_slice(&imm.to_le_bytes());
+    }
+}
+
+fn emit_add_rsp_imm32(code: &mut Vec<u8>, imm: i32) {
+    debug_assert!(imm > 0);
+    if imm <= 127 {
+        code.extend_from_slice(&[0x48, 0x83, 0xc4, imm as u8]);
+    } else {
+        code.push(0x48);
+        code.push(0x81);
+        code.push(0xc4);
+        code.extend_from_slice(&imm.to_le_bytes());
+    }
+}
+
+fn emit_mov_byte_rsp_offset(code: &mut Vec<u8>, offset: usize, val: u8) {
+    if offset <= 127 {
+        code.extend_from_slice(&[0xc6, 0x44, 0x24, offset as u8, val]);
+    } else {
+        code.push(0x48);
+        code.extend_from_slice(&[0xc6, 0x84, 0x24]);
+        code.extend_from_slice(&(offset as u32).to_le_bytes());
+        code.push(val);
+    }
+}
+
 /// 生成 tape 初始化代码。
 ///
 /// 使用 mmap 系统调用分配初始缓冲区：
@@ -554,6 +647,17 @@ mod tests {
             .collect();
 
         assert_eq!(chunks, vec![i32::MAX, 5]);
+    }
+
+    #[test]
+    fn precomputed_stdout_asm_encodes_large_stack_offsets() {
+        let data: Vec<u8> = (0..130).map(|i| (i % 256) as u8).collect();
+        let asm = compile_precomputed_stdout_asm(&data);
+        let encoded = crate::backend::x86_64::encode::encode_program(&asm);
+        assert!(
+            encoded.text.len() > 400,
+            "130 output bytes should use disp8 + disp32 mov-to-[rsp+i] encodings"
+        );
     }
 
     #[test]

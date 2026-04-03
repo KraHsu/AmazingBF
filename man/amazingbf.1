@@ -31,6 +31,17 @@ listings beside the output path).
 Output ELF path for compile mode (default:
 .BR a.out ).
 .TP
+.BR \-O ", " \-\-opt\-level " " \fI0|3\fR
+Compile optimization level (ignored outside compile mode):
+.B 0
+(default) uses the normal LIR pipeline;
+.B 3
+may emit a tiny
+.B exit(0)
+ELF when there is no output instruction, or fold fixed stdout when there is output but no input (precomputed
+.B write
+sequence).
+.TP
 .BR \-v ", " \-\-verbose
 Increase log verbosity (repeat up to three times for \-vvv).
 .TP
