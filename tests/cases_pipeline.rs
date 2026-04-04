@@ -68,7 +68,7 @@ fn interp_cases_match_expected_output() {
         cmd.arg(&bf_file).arg("-q");
 
         let output = common::run_with_optional_input(cmd, &in_file);
-        let expected = fs::read(&out_file).unwrap();
+        let expected = common::read_fixture_bytes(&out_file);
 
         if !output.status.success() {
             failures.push(format!(
@@ -134,7 +134,73 @@ fn compile_cases_match_expected_output_and_emit_artifacts() {
         }
 
         let runtime_output = common::run_with_optional_input(Command::new(&exe_file), &in_file);
-        let expected = fs::read(&out_file).unwrap();
+        let expected = common::read_fixture_bytes(&out_file);
+
+        if !runtime_output.status.success() {
+            failures.push(format!(
+                "[compile] {name}: compiled program runtime error\nstderr:\n{}",
+                String::from_utf8_lossy(&runtime_output.stderr)
+            ));
+            continue;
+        }
+
+        if runtime_output.stdout != expected {
+            failures.push(format!(
+                "[compile] {name}: output mismatch\nexpected: {:?}\nactual:   {:?}",
+                expected, runtime_output.stdout
+            ));
+        }
+    }
+
+    assert!(failures.is_empty(), "{}", failures.join("\n\n"));
+}
+
+#[cfg(target_os = "windows")]
+#[test]
+fn compile_cases_match_expected_output_and_emit_artifacts() {
+    let temp = TempDirGuard::new("amazingbf-cases");
+    let bin_tmp_dir = temp.path().join("bin");
+    fs::create_dir_all(&bin_tmp_dir).unwrap();
+
+    let mut failures = Vec::new();
+
+    for bf_file in case_paths() {
+        let name = bf_file.file_stem().unwrap().to_string_lossy().into_owned();
+        let in_file = Path::new(CASES_DIR).join(format!("{name}.in"));
+        let out_file = Path::new(CASES_DIR).join(format!("{name}.out"));
+        let exe_file = bin_tmp_dir.join(format!("{name}.exe"));
+        let asm_file = exe_file.with_extension("asm");
+        let lst_file = exe_file.with_extension("lst");
+        assert!(out_file.is_file(), "[compile] {name}: missing .out");
+
+        let mut compile_cmd = Command::cargo_bin("AmazingBF").unwrap();
+        compile_cmd
+            .arg(&bf_file)
+            .arg("-q")
+            .arg("-m")
+            .arg("compile")
+            .arg("-o")
+            .arg(&exe_file);
+
+        let compile_output = compile_cmd.output().unwrap();
+        if !compile_output.status.success() {
+            failures.push(format!(
+                "[compile] {name}: compile error\nstderr:\n{}",
+                String::from_utf8_lossy(&compile_output.stderr)
+            ));
+            continue;
+        }
+
+        let artifacts_ok = [(&exe_file, "executable"), (&asm_file, "asm"), (&lst_file, "lst")]
+            .into_iter()
+            .all(|(path, _)| fs::metadata(path).map(|meta| meta.len() > 0).unwrap_or(false));
+        if !artifacts_ok {
+            failures.push(format!("[compile] {name}: missing compile artifacts"));
+            continue;
+        }
+
+        let runtime_output = common::run_with_optional_input(Command::new(&exe_file), &in_file);
+        let expected = common::read_fixture_bytes(&out_file);
 
         if !runtime_output.status.success() {
             failures.push(format!(

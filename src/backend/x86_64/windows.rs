@@ -5,19 +5,25 @@ const INITIAL_TAPE_SIZE: usize = 4096;
 const MEM_COMMIT_RESERVE: i64 = 0x3000;
 const MEM_RELEASE: i64 = 0x8000;
 const PAGE_READWRITE: i64 = 0x04;
+const ERROR_HANDLE_EOF: i64 = 38;
+const ERROR_BROKEN_PIPE: i64 = 109;
 const STD_INPUT_HANDLE: i64 = -10;
 const STD_OUTPUT_HANDLE: i64 = -11;
-const SHADOW_SPACE_BYTES: i32 = 40;
-const IO_COUNT_SLOT_DISP: i32 = 24;
+const ENTRY_STACK_FRAME_BYTES: i32 = 48;
+const CALLEE_STACK_FRAME_BYTES: i32 = 88;
+const IO_COUNT_SLOT_DISP: i32 = 40;
 const OVERLAPPED_SLOT_DISP: i32 = 32;
-const STACK_SAVED_NEW_BASE: i32 = 0;
-const STACK_SAVED_COPY_START: i32 = 8;
-const STACK_SAVED_NEW_LEN: i32 = 16;
-const STACK_SAVED_DESIRED_OFFSET: i32 = 24;
+const STACK_SAVED_NEW_BASE: i32 = 40;
+const STACK_SAVED_COPY_START: i32 = 48;
+const STACK_SAVED_NEW_LEN: i32 = 56;
+const STACK_SAVED_DESIRED_OFFSET: i32 = 64;
+const STACK_SAVED_RDI: i32 = 72;
+const STACK_SAVED_RSI: i32 = 80;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kernel32Import {
     ExitProcess,
+    GetLastError,
     GetStdHandle,
     ReadFile,
     WriteFile,
@@ -29,6 +35,7 @@ impl Kernel32Import {
     fn name(self) -> &'static str {
         match self {
             Self::ExitProcess => "ExitProcess",
+            Self::GetLastError => "GetLastError",
             Self::GetStdHandle => "GetStdHandle",
             Self::ReadFile => "ReadFile",
             Self::WriteFile => "WriteFile",
@@ -181,6 +188,7 @@ pub fn compile_lir_to_windows_program(lir: &LirProgram) -> WindowsProgram {
         &mut labels,
         &[
             Kernel32Import::ExitProcess,
+            Kernel32Import::GetLastError,
             Kernel32Import::GetStdHandle,
             Kernel32Import::ReadFile,
             Kernel32Import::WriteFile,
@@ -260,6 +268,7 @@ pub fn compile_lir_to_windows_program(lir: &LirProgram) -> WindowsProgram {
                 &mut out,
                 &mut labels,
                 imports.iat_label(Kernel32Import::ReadFile),
+                imports.iat_label(Kernel32Import::GetLastError),
                 exit_one_label,
             ),
             LirInst::Label(id) => out.push(AsmInst::Label(map_label(*id))),
@@ -417,7 +426,7 @@ pub fn compile_precomputed_stdout_program(data: &[u8]) -> WindowsProgram {
 fn emit_entry_prologue(out: &mut Vec<AsmInst>, entry_label: AsmLabel) {
     out.push(AsmInst::Label(entry_label));
     out.push(AsmInst::AndRegImm32(Reg64::Rsp, -16));
-    out.push(AsmInst::AddRegImm32(Reg64::Rsp, -SHADOW_SPACE_BYTES));
+    out.push(AsmInst::AddRegImm32(Reg64::Rsp, -ENTRY_STACK_FRAME_BYTES));
 }
 
 fn emit_ptr_add_out(
@@ -498,9 +507,12 @@ fn emit_get_byte(
     out: &mut Vec<AsmInst>,
     labels: &mut LabelAllocator,
     read_file_iat: AsmLabel,
+    get_last_error_iat: AsmLabel,
     exit_one_label: AsmLabel,
 ) {
     let done = labels.fresh();
+    let eof = labels.fresh();
+    let read_ok = labels.fresh();
     emit_zero_stack_qword(out, IO_COUNT_SLOT_DISP);
     out.push(AsmInst::MovRegReg(Reg64::Rcx, Reg64::Rsi));
     out.push(AsmInst::MovRegReg(Reg64::Rdx, Reg64::R13));
@@ -508,10 +520,18 @@ fn emit_get_byte(
     out.push(AsmInst::LeaRegMem(Reg64::R9, Reg64::Rsp, IO_COUNT_SLOT_DISP));
     out.push(AsmInst::CallMemLabel(read_file_iat));
     out.push(AsmInst::CmpRegImm32(Reg64::Rax, 0));
-    out.push(AsmInst::Jz(exit_one_label));
+    out.push(AsmInst::Jnz(read_ok));
+    out.push(AsmInst::CallMemLabel(get_last_error_iat));
+    out.push(AsmInst::CmpRegImm32(Reg64::Rax, ERROR_HANDLE_EOF as i32));
+    out.push(AsmInst::Jz(eof));
+    out.push(AsmInst::CmpRegImm32(Reg64::Rax, ERROR_BROKEN_PIPE as i32));
+    out.push(AsmInst::Jz(eof));
+    out.push(AsmInst::Jmp(exit_one_label));
+    out.push(AsmInst::Label(read_ok));
     out.push(AsmInst::MovRegMem64(Reg64::Rax, Reg64::Rsp, IO_COUNT_SLOT_DISP));
     out.push(AsmInst::CmpRegImm32(Reg64::Rax, 0));
     out.push(AsmInst::Jnz(done));
+    out.push(AsmInst::Label(eof));
     out.push(AsmInst::MovMem8Imm8(Reg64::R13, 255));
     out.push(AsmInst::Label(done));
 }
@@ -530,7 +550,9 @@ fn emit_ensure_tape_contains_r15(
     virtual_free_iat: AsmLabel,
 ) {
     out.push(AsmInst::Label(ensure_tape_label));
-    out.push(AsmInst::AddRegImm32(Reg64::Rsp, -SHADOW_SPACE_BYTES));
+    out.push(AsmInst::AddRegImm32(Reg64::Rsp, -CALLEE_STACK_FRAME_BYTES));
+    out.push(AsmInst::MovMemReg64(Reg64::Rsp, STACK_SAVED_RDI, Reg64::Rdi));
+    out.push(AsmInst::MovMemReg64(Reg64::Rsp, STACK_SAVED_RSI, Reg64::Rsi));
     out.push(AsmInst::MovRegReg(Reg64::R10, Reg64::R14));
     out.push(AsmInst::SubRegReg(Reg64::R10, Reg64::R12));
     out.push(AsmInst::MovRegReg(Reg64::R9, Reg64::R15));
@@ -614,7 +636,9 @@ fn emit_ensure_tape_contains_r15(
     out.push(AsmInst::AddRegReg(Reg64::R13, Reg64::R9));
     out.push(AsmInst::MovRegReg(Reg64::R14, Reg64::Rdx));
     out.push(AsmInst::AddRegReg(Reg64::R14, Reg64::R11));
-    out.push(AsmInst::AddRegImm32(Reg64::Rsp, SHADOW_SPACE_BYTES));
+    out.push(AsmInst::MovRegMem64(Reg64::Rdi, Reg64::Rsp, STACK_SAVED_RDI));
+    out.push(AsmInst::MovRegMem64(Reg64::Rsi, Reg64::Rsp, STACK_SAVED_RSI));
+    out.push(AsmInst::AddRegImm32(Reg64::Rsp, CALLEE_STACK_FRAME_BYTES));
     out.push(AsmInst::Ret);
 }
 
@@ -688,6 +712,7 @@ mod tests {
             names,
             vec![
                 "ExitProcess",
+                "GetLastError",
                 "GetStdHandle",
                 "ReadFile",
                 "WriteFile",

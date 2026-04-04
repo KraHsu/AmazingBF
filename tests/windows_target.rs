@@ -137,3 +137,49 @@ fn compile_windows_target_emits_pe_artifacts_and_imports_kernel32() {
     assert!(exe.windows(b"WriteFile".len()).any(|w| w == b"WriteFile"));
     assert!(exe.windows(b"VirtualAlloc".len()).any(|w| w == b"VirtualAlloc"));
 }
+
+#[test]
+fn bf_compiler_defaults_to_build_target_and_supports_cross_compile() {
+    let temp = TempDirGuard::new("amazingbf-cross-target");
+    let source_path = Path::new(CASES_DIR).join("1.bf");
+    let default_output = temp.path().join("default_target.bin");
+    let cross_output = temp.path().join("cross_target.bin");
+
+    let default_status = Command::cargo_bin("bf-compiler")
+        .unwrap()
+        .arg("-q")
+        .arg(&source_path)
+        .arg("-o")
+        .arg(&default_output)
+        .status()
+        .unwrap();
+    assert!(default_status.success());
+
+    let cross_target = if cfg!(target_os = "windows") {
+        "x86_64-linux"
+    } else {
+        "x86_64-windows"
+    };
+    let cross_status = Command::cargo_bin("bf-compiler")
+        .unwrap()
+        .arg("-q")
+        .arg(&source_path)
+        .arg("--target")
+        .arg(cross_target)
+        .arg("-o")
+        .arg(&cross_output)
+        .status()
+        .unwrap();
+    assert!(cross_status.success());
+
+    let default_bytes = fs::read(&default_output).unwrap();
+    let cross_bytes = fs::read(&cross_output).unwrap();
+
+    if cfg!(target_os = "windows") {
+        assert_eq!(&default_bytes[0..2], b"MZ");
+        assert_eq!(&cross_bytes[0..4], b"\x7FELF");
+    } else {
+        assert_eq!(&default_bytes[0..4], b"\x7FELF");
+        assert_eq!(&cross_bytes[0..2], b"MZ");
+    }
+}

@@ -5,7 +5,7 @@
 - 解释执行：将源码解析后在 HIR 上运行
 - 原生编译：将 LIR 编译为 x86_64 原生可执行文件（已实现 Linux ELF 与 Windows PE64 后端）
 
-`cargo build` 会生成三个入口：`AmazingBF`（完整 CLI，含 `-m` / `--mode` / `--target`）、`bf-interpreter`（固定解释模式）、`bf-compiler`（固定编译模式且 target 跟随构建目标）。后两者与 `AmazingBF -m interpret -q` / `AmazingBF -m compile` 行为一致，无需再传 `-m`。**此专为十行代码测评提供**
+`cargo build` 会生成三个入口：`AmazingBF`（完整 CLI，含 `-m` / `--mode` / `--target`）、`bf-interpreter`（固定解释模式）、`bf-compiler`（固定编译模式，默认 target 跟随构建目标，也支持 `--target` 交叉编译）。后两者与 `AmazingBF -m interpret -q` / `AmazingBF -m compile` 行为一致，无需再传 `-m`。**此专为十行代码测评提供**
 
 ## 当前能力
 
@@ -22,8 +22,8 @@
 ### 环境要求
 
 - Rust stable
-- 若使用 `AmazingBF` 的 `compile` 模式，可用 `--target x86_64-linux|x86_64-windows` 选择目标；默认跟随构建目标
-- 当前树里实际落地的原生后端包括 `x86_64-linux`（ELF）与 `x86_64-windows`（PE64）
+- 若使用 `AmazingBF` 的 `compile` 模式或 `bf-compiler`，可用 `--target x86_64-linux|x86_64-windows` 选择目标；默认跟随构建目标
+- 当前实际落地的原生后端包括 `x86_64-linux`（ELF）与 `x86_64-windows`（PE64）
 
 ### 构建
 
@@ -50,6 +50,12 @@ cargo run -- tests/cases/1.bf -m compile --target x86_64-linux -o hello_bf
 # 或
 cargo run --bin bf-compiler -- tests/cases/1.bf -o hello_bf
 ./hello_bf
+```
+
+`bf-compiler` 默认输出当前构建目标对应的格式，也可以显式交叉编译：
+
+```bash
+cargo run --bin bf-compiler -- tests/cases/1.bf --target x86_64-windows -o hello_bf.exe
 ```
 
 若要生成 Windows 可执行文件：

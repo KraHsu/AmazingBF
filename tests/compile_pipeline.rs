@@ -68,6 +68,10 @@ fn read_u32(bytes: &[u8], offset: usize) -> u32 {
     u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap())
 }
 
+fn read_u16(bytes: &[u8], offset: usize) -> u16 {
+    u16::from_le_bytes(bytes[offset..offset + 2].try_into().unwrap())
+}
+
 fn read_u64(bytes: &[u8], offset: usize) -> u64 {
     u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap())
 }
@@ -174,7 +178,7 @@ fn compile_mode_emits_rx_elf_artifacts_and_preserves_eof_semantics() {
         let in_file = Path::new(CASES_DIR).join(format!("{name}.in"));
         let out_file = Path::new(CASES_DIR).join(format!("{name}.out"));
         assert!(out_file.is_file(), "[compile_pipeline] {name}: missing .out");
-        let expected = fs::read(&out_file).unwrap();
+        let expected = common::read_fixture_bytes(&out_file);
 
         eprintln!();
         eprintln!("--- case {name} ({}) ---", bf_file.display());
@@ -356,4 +360,173 @@ fn compile_mode_emits_rx_elf_artifacts_and_preserves_eof_semantics() {
             "(install GNU /usr/bin/time for rss_compile / rss_run; wall times still measured)"
         );
     }
+}
+
+#[cfg(target_os = "windows")]
+#[ignore = "slow: cargo test --test compile_pipeline -- --ignored --nocapture"]
+#[test]
+fn compile_mode_emits_rx_pe_artifacts_and_preserves_eof_semantics() {
+    let levels: &[(&str, &str)] = &[("0", "O0"), ("1", "O1"), ("2", "O2"), ("3", "O3")];
+
+    let temp = TempDirGuard::new("amazingbf-compile");
+    let amazingbf = Path::new(env!("CARGO_BIN_EXE_AmazingBF"));
+
+    let mut sum_compile_mean_by_level = [0.0f64; 4];
+    let mut sum_run_mean_by_level = [0.0f64; 4];
+    let case_count = case_paths().len();
+
+    eprintln!();
+    eprintln!(
+        "compile_pipeline(windows): {} cases × {} opt levels × {} trials (stdin from case N.in if present; stdout vs N.out)",
+        case_count,
+        levels.len(),
+        TRIALS
+    );
+
+    for bf_file in case_paths() {
+        let name = bf_file.file_stem().unwrap().to_string_lossy().into_owned();
+        let in_file = Path::new(CASES_DIR).join(format!("{name}.in"));
+        let out_file = Path::new(CASES_DIR).join(format!("{name}.out"));
+        assert!(out_file.is_file(), "[compile_pipeline] {name}: missing .out");
+        let expected = common::read_fixture_bytes(&out_file);
+
+        eprintln!();
+        eprintln!("--- case {name} ({}) ---", bf_file.display());
+
+        let mut case_sum_compile_mean = 0.0f64;
+        let mut case_sum_run_mean = 0.0f64;
+
+        for (level_idx, (flag, label)) in levels.iter().enumerate() {
+            let output_path = temp.path().join(format!("{name}_eof_{}.exe", flag));
+
+            let mut compile_ms_samples = Vec::with_capacity(TRIALS);
+            let mut run_ms_samples = Vec::with_capacity(TRIALS);
+            let mut pe_len = 0usize;
+            let mut asm_bytes = 0u64;
+
+            for trial in 0..TRIALS {
+                let t_compile = Instant::now();
+                assert!(
+                    Command::new(amazingbf)
+                        .arg("-q")
+                        .arg(&bf_file)
+                        .arg("-m")
+                        .arg("compile")
+                        .arg("-O")
+                        .arg(flag)
+                        .arg("-o")
+                        .arg(&output_path)
+                        .stdin(Stdio::null())
+                        .status()
+                        .unwrap()
+                        .success(),
+                    "compile failed case {name} -O{flag}"
+                );
+                compile_ms_samples.push(t_compile.elapsed().as_secs_f64() * 1000.0);
+
+                let asm_path = output_path.with_extension("asm");
+                let lst_path = output_path.with_extension("lst");
+
+                if trial == 0 {
+                    let exe = fs::read(&output_path).unwrap();
+                    let asm_listing = fs::read_to_string(&asm_path).unwrap();
+                    let hex_listing = fs::read_to_string(&lst_path).unwrap();
+                    asm_bytes = fs::metadata(&asm_path).map(|m| m.len()).unwrap_or(0);
+
+                    let pe_off = read_u32(&exe, 0x3C) as usize;
+                    let import_rva = read_u32(&exe, pe_off + 24 + 112 + 8);
+                    let section_off = pe_off + 24 + 240;
+                    let virtual_size = read_u32(&exe, section_off + 8) as usize;
+                    let raw_ptr = read_u32(&exe, section_off + 20) as usize;
+                    let text_bytes = &exe[raw_ptr..raw_ptr + virtual_size];
+                    let listing_bytes = parse_hex_listing_bytes(&hex_listing);
+                    let import_off = (import_rva - 0x1000) as usize;
+
+                    assert_eq!(&exe[0..2], b"MZ", "{label} {name}");
+                    assert_eq!(&exe[pe_off..pe_off + 4], b"PE\0\0", "{label} {name}");
+                    assert_eq!(read_u16(&exe, pe_off + 4), 0x8664, "{label} {name}");
+                    assert_eq!(read_u16(&exe, pe_off + 24), 0x20B, "{label} {name}");
+                    assert!(asm_path.is_file(), "{label} {name}");
+                    assert!(lst_path.is_file(), "{label} {name}");
+                    assert!(!asm_listing.trim().is_empty(), "{label} {name}");
+                    assert!(asm_listing.contains("; === Brainfuck x86_64 Assembly Listing ==="));
+                    assert!(hex_listing.contains("; === Brainfuck x86_64 Hex Listing ==="));
+                    assert_eq!(listing_bytes[..import_off], text_bytes[..import_off], "{label} {name}");
+                    assert!(
+                        exe.windows(b"kernel32.dll".len()).any(|w| w == b"kernel32.dll"),
+                        "{label} {name}"
+                    );
+                    pe_len = exe.len();
+                }
+
+                let t_run = Instant::now();
+                let runtime_output =
+                    common::run_with_optional_input(Command::new(&output_path), &in_file);
+                run_ms_samples.push(t_run.elapsed().as_secs_f64() * 1000.0);
+
+                assert!(
+                    runtime_output.status.success(),
+                    "{label} {name} trial {trial} stderr:\n{}",
+                    String::from_utf8_lossy(&runtime_output.stderr)
+                );
+                assert_eq!(
+                    runtime_output.stdout, expected,
+                    "{label} {name} trial {trial}"
+                );
+            }
+
+            let (c_mean, c_min, c_max) = mean_min_max(&compile_ms_samples);
+            let (r_mean, r_min, r_max) = mean_min_max(&run_ms_samples);
+
+            sum_compile_mean_by_level[level_idx] += c_mean;
+            sum_run_mean_by_level[level_idx] += r_mean;
+            case_sum_compile_mean += c_mean;
+            case_sum_run_mean += r_mean;
+
+            let hir_note = match *flag {
+                "0" => "o0",
+                "1" => "o1×1",
+                "2" => "o2 fixpt",
+                "3" => "o2 + O3 fold",
+                _ => "",
+            };
+
+            eprintln!(
+                "{:<5} {:>7} {:>7} | compile_ms mean/min/max: {:>6.3} / {:>6.3} / {:>6.3} | run_ms mean/min/max: {:>6.3} / {:>6.3} / {:>6.3} | {}",
+                label,
+                pe_len,
+                asm_bytes,
+                c_mean,
+                c_min,
+                c_max,
+                r_mean,
+                r_min,
+                r_max,
+                hir_note,
+            );
+        }
+
+        eprintln!(
+            "    [case {name} Σ means over O0..O3] compile {case_sum_compile_mean:.3} ms | run {case_sum_run_mean:.3} ms"
+        );
+    }
+
+    eprintln!();
+    eprintln!("=== TOTALS (sum of per-case mean times over {case_count} cases) ===");
+    eprintln!(
+        "{:<5} {:>22} {:>22}",
+        "lvl", "sum_compile_mean_ms", "sum_run_mean_ms"
+    );
+    for (idx, (_, label)) in levels.iter().enumerate() {
+        eprintln!(
+            "{:<5} {:>22.3} {:>22.3}",
+            label, sum_compile_mean_by_level[idx], sum_run_mean_by_level[idx]
+        );
+    }
+    let grand_compile: f64 = sum_compile_mean_by_level.iter().sum();
+    let grand_run: f64 = sum_run_mean_by_level.iter().sum();
+    eprintln!(
+        "{:<5} {:>22.3} {:>22.3}",
+        "ALL_O", grand_compile, grand_run
+    );
 }

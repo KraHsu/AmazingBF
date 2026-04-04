@@ -46,13 +46,16 @@ const INTERP_AFTER_HELP: &str = "\
   cat hello.bf | bf-interpreter -";
 
 const COMPILER_LONG_ABOUT: &str = "\
-将 Brainfuck 编译为当前构建目标对应的 x86_64 原生可执行文件，并在 `-o` 指定路径旁生成 `.asm` / `.lst`。\
-与 `AmazingBF -m compile` 等价，但目标平台固定为构建本二进制时的 target（Linux 构建产物默认生成 ELF，Windows 构建产物默认生成 PE64）。";
+将 Brainfuck 编译为 x86_64 原生可执行文件，并在 `-o` 指定路径旁生成 `.asm` / `.lst`。\
+与 `AmazingBF -m compile` 等价；默认目标平台跟随构建本二进制时的 target（Linux 构建产物默认生成 ELF，Windows 构建产物默认生成 PE64），也可通过 `--target` 选择交叉编译。";
 
 const COMPILER_AFTER_HELP: &str = "\
 示例:
   bf-compiler path/to/hello.bf -o ./hello_bf
-  ./hello_bf";
+  ./hello_bf
+
+  # 交叉编译为 Windows PE64
+  bf-compiler path/to/hello.bf --target x86_64-windows -o ./hello_bf.exe";
 
 /// Shared flags for every frontend (input, logging, optimization, output path).
 #[derive(Parser, Debug)]
@@ -138,6 +141,9 @@ struct InterpreterArgs {
 struct CompilerArgs {
     #[command(flatten)]
     core: CoreCli,
+    /// 编译目标平台；默认跟随构建本二进制时的目标平台，可通过该参数交叉编译
+    #[arg(long, value_enum, default_value_t = CompileTarget::build_default())]
+    target: CompileTarget,
 }
 
 #[derive(Debug, Clone)]
@@ -247,5 +253,5 @@ pub fn parse_compiler_cli() -> Result<AppConfig> {
         Ok(a) => a,
         Err(e) => handle_clap_error(e, quiet),
     };
-    finish_config(args.core, RunMode::Compile, false)
+    finish_config_with_target(args.core, RunMode::Compile, args.target, false)
 }

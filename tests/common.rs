@@ -4,12 +4,39 @@ use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::thread::{self, JoinHandle};
 
+fn normalize_fixture_newlines(bytes: Vec<u8>) -> Vec<u8> {
+    #[cfg(target_os = "windows")]
+    {
+        let mut normalized = Vec::with_capacity(bytes.len());
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'\r' && bytes.get(i + 1) == Some(&b'\n') {
+                normalized.push(b'\n');
+                i += 2;
+            } else {
+                normalized.push(bytes[i]);
+                i += 1;
+            }
+        }
+        normalized
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        bytes
+    }
+}
+
+pub fn read_fixture_bytes(path: &Path) -> Vec<u8> {
+    normalize_fixture_newlines(fs::read(path).expect("read fixture file"))
+}
+
 fn spawn_with_optional_input(mut cmd: Command, input_path: &Path) -> (Child, Option<JoinHandle<()>>) {
     cmd.stdin(Stdio::piped());
 
     let mut child = cmd.spawn().expect("spawn child");
     let writer = if input_path.is_file() {
-        let input = fs::read(input_path).expect("read case input file");
+        let input = read_fixture_bytes(input_path);
         let mut stdin = child.stdin.take().expect("child stdin pipe");
         Some(thread::spawn(move || {
             stdin.write_all(&input).expect("write child stdin");
