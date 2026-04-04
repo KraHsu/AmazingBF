@@ -89,6 +89,7 @@ fn interp_cases_match_expected_output() {
     assert!(failures.is_empty(), "{}", failures.join("\n\n"));
 }
 
+#[cfg(not(target_os = "windows"))]
 #[test]
 fn compile_cases_match_expected_output_and_emit_artifacts() {
     let temp = TempDirGuard::new("amazingbf-cases");

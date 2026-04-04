@@ -4,12 +4,16 @@
 //! - `elf`: ELF64 可执行文件生成器
 //! - `encode`: x86_64 机器码编码器
 //! - `debug`: 调试输出工具（汇编 listing + hex dump）
+//! - `pe`: PE32+ 可执行文件生成器
+//! - `windows`: x86_64 Windows 代码生成辅助
 //!
 //! 提供 `compile_asm_to_elf` 作为后端落地入口，
-//! 将汇编 IR 编译到可执行的 ELF 二进制文件。
+//! 将汇编 IR 编译到目标平台可执行文件。
 
 pub mod elf;
 pub mod encode;
+pub mod pe;
+pub mod windows;
 
 /// 调试输出模块。
 ///
@@ -56,4 +60,70 @@ pub fn compile_asm_to_elf(asm: &AsmProgram) -> Vec<u8> {
         "encoded x86_64 machine code"
     );
     elf::build_elf_executable(&encoded)
+}
+
+pub fn compile_windows_program_to_pe(program: &windows::WindowsProgram) -> Vec<u8> {
+    let (mut encoded, labels) = encode::encode_program_with_labels(&program.asm);
+    debug!(
+        target: "AmazingBF::backend::x86_64",
+        asm_insts = program.asm.insts.len(),
+        text_bytes = encoded.text.len(),
+        "encoded x86_64 windows machine code"
+    );
+
+    let label_offset = |label| -> usize {
+        *labels
+            .get(&label)
+            .unwrap_or_else(|| panic!("missing encoded offset for label {:?}", label))
+    };
+    let label_rva = |label| -> u32 {
+        0x1000 + u32::try_from(label_offset(label)).expect("label offset exceeded u32")
+    };
+
+    patch_u32(&mut encoded.text, label_offset(program.import_desc_label), label_rva(program.imports[0].ilt_entry_label));
+    patch_u32(
+        &mut encoded.text,
+        label_offset(program.import_desc_label) + 12,
+        label_rva(program.dll_name_label),
+    );
+    patch_u32(
+        &mut encoded.text,
+        label_offset(program.import_desc_label) + 16,
+        label_rva(program.imports[0].iat_entry_label),
+    );
+
+    for import in &program.imports {
+        debug_assert!(!import.name.is_empty());
+        patch_u64(
+            &mut encoded.text,
+            label_offset(import.ilt_entry_label),
+            u64::from(label_rva(import.hint_name_label)),
+        );
+        patch_u64(
+            &mut encoded.text,
+            label_offset(import.iat_entry_label),
+            u64::from(label_rva(import.hint_name_label)),
+        );
+    }
+
+    pe::build_pe_executable(
+        &encoded,
+        u32::try_from(label_offset(program.entry_label)).expect("entry offset exceeded u32"),
+        pe::DataDirectory {
+            rva: label_rva(program.import_desc_label),
+            size: program.import_dir_size,
+        },
+        pe::DataDirectory {
+            rva: label_rva(program.iat_label),
+            size: program.iat_size,
+        },
+    )
+}
+
+fn patch_u32(bytes: &mut [u8], offset: usize, value: u32) {
+    bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+}
+
+fn patch_u64(bytes: &mut [u8], offset: usize, value: u64) {
+    bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
 }

@@ -204,7 +204,7 @@ impl CodeBuffer {
     ///
     /// - 如果引用了未绑定的标签
     /// - 如果相对偏移超出 i32 范围（代码段 > 2GB 时才会发生）
-    fn finish(mut self) -> Vec<u8> {
+    fn finish(mut self) -> (Vec<u8>, HashMap<AsmLabel, usize>) {
         for fixup in &self.fixups {
             // 查找目标标签的偏移
             let target = *self
@@ -230,7 +230,7 @@ impl CodeBuffer {
             }
         }
 
-        self.bytes
+        (self.bytes, self.labels)
     }
 }
 
@@ -239,6 +239,17 @@ impl CodeBuffer {
 /// 这是本模块的入口函数，供 `x86_64/mod.rs` 调用。
 pub fn encode_program(program: &AsmProgram) -> EncodedProgram {
     encode_program_with_inst_map(program).0
+}
+
+pub(crate) fn encode_program_with_labels(
+    program: &AsmProgram,
+) -> (EncodedProgram, HashMap<AsmLabel, usize>) {
+    let mut buf = CodeBuffer::new();
+    for inst in &program.insts {
+        encode_inst(&mut buf, inst);
+    }
+    let (text, labels) = buf.finish();
+    (EncodedProgram { text }, labels)
 }
 
 /// 将 `AsmProgram` 编码为机器码，并保留每条指令在 `.text` 中的范围信息。
@@ -257,10 +268,8 @@ pub(crate) fn encode_program_with_inst_map(
         });
     }
 
-    (
-        EncodedProgram { text: buf.finish() },
-        inst_map,
-    )
+    let (text, _labels) = buf.finish();
+    (EncodedProgram { text }, inst_map)
 }
 
 // ============================================================================
@@ -278,6 +287,7 @@ fn reg_num(reg: Reg64) -> u8 {
         Reg64::Rcx => 1,  // 001
         Reg64::Rdx => 2,  // 010
         Reg64::Rbx => 3,  // 011
+        Reg64::Rsp => 4,  // 100
         Reg64::Rsi => 6,  // 110
         Reg64::Rdi => 7,  // 111
         Reg64::R8 => 8,   // 1_000
@@ -325,6 +335,52 @@ fn emit_reg_imm32(buf: &mut CodeBuffer, subcode: u8, reg: Reg64, imm: i32) {
     buf.emit_u8(0x81); // 操作码：r/m64, imm32 格式
     buf.emit_u8(0b11_000_000 | ((subcode & 7) << 3) | (rm & 7));
     buf.emit_i32(imm);
+}
+
+fn emit_modrm_sib_mem(buf: &mut CodeBuffer, reg_field: u8, base: Reg64, disp: i32) {
+    let base_num = reg_num(base);
+    let rm_low3 = base_num & 7;
+    let needs_sib = rm_low3 == 4;
+    let fits_disp8 = i8::try_from(disp).is_ok();
+    let force_disp32 = !fits_disp8;
+
+    let mod_bits = if disp == 0 && rm_low3 != 5 && !force_disp32 {
+        0b00
+    } else if !force_disp32 {
+        0b01
+    } else {
+        0b10
+    };
+
+    buf.emit_u8((mod_bits << 6) | ((reg_field & 7) << 3) | if needs_sib { 4 } else { rm_low3 });
+    if needs_sib {
+        buf.emit_u8(0b00_100_100);
+    }
+    match mod_bits {
+        0b00 => {}
+        0b01 => buf.emit_u8(disp as i8 as u8),
+        0b10 => buf.emit_i32(disp),
+        _ => unreachable!(),
+    }
+}
+
+fn emit_mem_reg64(buf: &mut CodeBuffer, opcode: u8, base: Reg64, disp: i32, reg: Reg64) {
+    emit_rex_w(buf, reg_num(reg) >> 3, 0, reg_num(base) >> 3);
+    buf.emit_u8(opcode);
+    emit_modrm_sib_mem(buf, reg_num(reg), base, disp);
+}
+
+fn emit_lea_reg_mem(buf: &mut CodeBuffer, dst: Reg64, base: Reg64, disp: i32) {
+    emit_rex_w(buf, reg_num(dst) >> 3, 0, reg_num(base) >> 3);
+    buf.emit_u8(0x8D);
+    emit_modrm_sib_mem(buf, reg_num(dst), base, disp);
+}
+
+fn emit_rip_rel(buf: &mut CodeBuffer, opcode: u8, subcode_or_reg: u8, label: AsmLabel, rex_r: u8) {
+    emit_rex_w(buf, rex_r, 0, 0);
+    buf.emit_u8(opcode);
+    buf.emit_u8(0b00_000_101 | ((subcode_or_reg & 7) << 3));
+    buf.emit_rel32_fixup(label);
 }
 
 /// 发射逻辑右移指令：`shr reg, imm8`。
@@ -411,6 +467,10 @@ fn encode_inst(buf: &mut CodeBuffer, inst: &AsmInst) {
             emit_reg_imm32(buf, 0, *reg, *imm); // subcode 0 = ADD
         }
 
+        AsmInst::AndRegImm32(reg, imm) => {
+            emit_reg_imm32(buf, 4, *reg, *imm); // subcode 4 = AND
+        }
+
         // ========== add dst, src ==========
         //
         // 编码：REX.W + 0x01 + ModRM(11, src, dst)
@@ -449,6 +509,20 @@ fn encode_inst(buf: &mut CodeBuffer, inst: &AsmInst) {
 
         // ========== shr r64, imm8 ==========
         AsmInst::ShrRegImm8(reg, imm) => emit_shift_right_imm8(buf, *reg, *imm),
+
+        AsmInst::LeaRegMem(dst, base, disp) => emit_lea_reg_mem(buf, *dst, *base, *disp),
+
+        AsmInst::LeaRegLabel(dst, label) => {
+            emit_rip_rel(buf, 0x8D, reg_num(*dst), *label, reg_num(*dst) >> 3);
+        }
+
+        AsmInst::MovMemReg64(base, disp, src) => {
+            emit_mem_reg64(buf, 0x89, *base, *disp, *src);
+        }
+
+        AsmInst::MovRegMem64(dst, base, disp) => {
+            emit_mem_reg64(buf, 0x8B, *base, *disp, *dst);
+        }
 
         // ========== add byte ptr [reg+0], imm8 ==========
         //
@@ -506,6 +580,10 @@ fn encode_inst(buf: &mut CodeBuffer, inst: &AsmInst) {
         AsmInst::Call(label) => {
             buf.emit_u8(0xE8);
             buf.emit_rel32_fixup(*label);
+        }
+
+        AsmInst::CallMemLabel(label) => {
+            emit_rip_rel(buf, 0xFF, 2, *label, 0);
         }
 
         // ========== 返回 ==========
@@ -628,5 +706,46 @@ mod tests {
         };
 
         let _ = encode_program(&program);
+    }
+
+    #[test]
+    fn lea_rsp_disp8_and_stack_load_store_encode_with_sib() {
+        let program = AsmProgram {
+            insts: vec![
+                AsmInst::LeaRegMem(Reg64::R9, Reg64::Rsp, 24),
+                AsmInst::MovMemReg64(Reg64::Rsp, 32, Reg64::Rax),
+                AsmInst::MovRegMem64(Reg64::R11, Reg64::Rsp, 16),
+            ],
+        };
+
+        let encoded = encode_program(&program);
+        assert_eq!(
+            encoded.text,
+            vec![
+                0x4c, 0x8d, 0x4c, 0x24, 0x18, //
+                0x48, 0x89, 0x44, 0x24, 0x20, //
+                0x4c, 0x8b, 0x5c, 0x24, 0x10, //
+            ]
+        );
+    }
+
+    #[test]
+    fn call_mem_label_and_label_map_use_rip_relative_fixups() {
+        let slot = AsmLabel(9);
+        let program = AsmProgram {
+            insts: vec![
+                AsmInst::CallMemLabel(slot),
+                AsmInst::Ret,
+                AsmInst::Label(slot),
+                AsmInst::RawBytes(vec![0; 8]),
+            ],
+        };
+
+        let (encoded, labels) = encode_program_with_labels(&program);
+        assert_eq!(labels.get(&slot), Some(&8usize));
+        assert_eq!(
+            encoded.text[..7],
+            [0x48, 0xff, 0x15, 0x01, 0x00, 0x00, 0x00]
+        );
     }
 }

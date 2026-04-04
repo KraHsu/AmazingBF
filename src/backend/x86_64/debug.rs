@@ -45,6 +45,7 @@ fn reg_name(reg: Reg64) -> &'static str {
         Reg64::Rcx => "rcx",
         Reg64::Rdx => "rdx",
         Reg64::Rbx => "rbx",
+        Reg64::Rsp => "rsp",
         Reg64::Rsi => "rsi",
         Reg64::Rdi => "rdi",
         Reg64::R8 => "r8",
@@ -179,6 +180,16 @@ fn format_inst_asm(out: &mut String, inst: &AsmInst) {
             .unwrap();
         }
 
+        AsmInst::AndRegImm32(reg, imm) => {
+            writeln!(
+                out,
+                "    and     {}, {}",
+                reg_name(*reg),
+                format_signed_hex_i32(*imm)
+            )
+            .unwrap();
+        }
+
         AsmInst::AddRegReg(dst, src) => {
             writeln!(out, "    add     {}, {}", reg_name(*dst), reg_name(*src)).unwrap();
         }
@@ -205,6 +216,46 @@ fn format_inst_asm(out: &mut String, inst: &AsmInst) {
         // ---- 移位 ----
         AsmInst::ShrRegImm8(reg, imm) => {
             writeln!(out, "    shr     {}, {}", reg_name(*reg), imm).unwrap();
+        }
+
+        AsmInst::LeaRegMem(dst, base, disp) => {
+            writeln!(
+                out,
+                "    lea     {}, [{}{}{}]",
+                reg_name(*dst),
+                reg_name(*base),
+                if *disp < 0 { " - " } else { " + " },
+                format_signed_hex_i32(disp.abs())
+            )
+            .unwrap();
+        }
+
+        AsmInst::LeaRegLabel(dst, label) => {
+            writeln!(out, "    lea     {}, [rel {}]", reg_name(*dst), label_name(*label)).unwrap();
+        }
+
+        AsmInst::MovMemReg64(base, disp, src) => {
+            writeln!(
+                out,
+                "    mov     qword [{}{}{}], {}",
+                reg_name(*base),
+                if *disp < 0 { " - " } else { " + " },
+                format_signed_hex_i32(disp.abs()),
+                reg_name(*src)
+            )
+            .unwrap();
+        }
+
+        AsmInst::MovRegMem64(dst, base, disp) => {
+            writeln!(
+                out,
+                "    mov     {}, qword [{}{}{}]",
+                reg_name(*dst),
+                reg_name(*base),
+                if *disp < 0 { " - " } else { " + " },
+                format_signed_hex_i32(disp.abs())
+            )
+            .unwrap();
         }
 
         // ---- 内存字节操作（Brainfuck 核心） ----
@@ -282,6 +333,10 @@ fn format_inst_asm(out: &mut String, inst: &AsmInst) {
         // ---- 函数调用与返回 ----
         AsmInst::Call(label) => {
             writeln!(out, "    call    {}", label_name(*label)).unwrap();
+        }
+
+        AsmInst::CallMemLabel(label) => {
+            writeln!(out, "    call    qword [rel {}]", label_name(*label)).unwrap();
         }
 
         AsmInst::Ret => {

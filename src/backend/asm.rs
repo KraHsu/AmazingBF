@@ -24,6 +24,7 @@
 //! | R14    | tape 结束地址（base + length）                |
 //! | R15    | PtrAdd 的临时目标地址（边界检查前的候选值）   |
 //! | RAX    | 系统调用号 / 返回值                          |
+//! | RSP    | 栈指针（Win64 shadow space / 临时槽位）      |
 //! | RDI    | 系统调用参数 1                               |
 //! | RSI    | 系统调用参数 2                               |
 //! | RDX    | 系统调用参数 3 / 临时变量                    |
@@ -47,16 +48,17 @@ pub struct AsmLabel(pub u32);
 
 /// x86_64 通用 64 位寄存器。
 ///
-/// 仅列出本编译器实际使用的寄存器，未包含 RBX、RSP、RBP。
+/// 仅列出本编译器实际使用的寄存器，未包含 RBP。
 /// 这是因为：
-/// - RSP/RBP 用于栈管理，本编译器不使用栈帧
-/// - RBX 是 callee-saved 寄存器，保留以备将来扩展
+/// - RBP 目前仍未使用栈帧
+/// - 其余寄存器会被 Linux / Windows 后端按各自 ABI 复用
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Reg64 {
     Rax,
     Rcx,
     Rdx,
     Rbx,
+    Rsp,
     Rsi,
     Rdi,
     R8,
@@ -80,6 +82,7 @@ impl fmt::Display for Reg64 {
             Reg64::Rcx => "rcx",
             Reg64::Rdx => "rdx",
             Reg64::Rbx => "rbx",
+            Reg64::Rsp => "rsp",
             Reg64::Rsi => "rsi",
             Reg64::Rdi => "rdi",
             Reg64::R8 => "r8",
@@ -110,10 +113,11 @@ impl fmt::Display for AsmLabel {
 /// 指令按功能分组：
 /// 1. 伪指令（Label）
 /// 2. 数据传送（MovRegImm64, MovRegReg, MovMem8Imm8）
-/// 3. 算术运算（AddRegImm32, AddRegReg, SubRegReg, AddMem8Imm8）
+/// 3. 算术运算（AddRegImm32, AndRegImm32, AddRegReg, SubRegReg, AddMem8Imm8）
 /// 4. 比较（CmpRegReg, CmpRegImm32, CmpMem8Imm8）
-/// 5. 移位（ShrRegImm8）
-/// 6. 控制流（Jz, Jnz, Jb, Jae, Jl, Jge, Jmp, Call, Ret）
+/// 5. 地址计算 / 栈槽 / RIP-relative（LeaRegMem, LeaRegLabel, MovMemReg64, MovRegMem64）
+/// 6. 移位（ShrRegImm8）
+/// 7. 控制流（Jz, Jnz, Jb, Jae, Jl, Jge, Jmp, Call, CallMemLabel, Ret）
 /// 7. 字符串操作（Cld, RepMovsb）
 /// 8. 系统调用（Syscall）
 /// 9. 原始机器码（RawBytes，用于 `-O3` 等预计算路径）
@@ -139,6 +143,11 @@ pub enum AsmInst {
     /// 用于指针偏移计算（如 tape 基址 + 偏移量）。
     AddRegImm32(Reg64, i32),
 
+    /// `and reg, imm32` — 寄存器与符号扩展的 32 位立即数按位与。
+    ///
+    /// 主要用于栈指针对齐，例如 `and rsp, -16`。
+    AndRegImm32(Reg64, i32),
+
     /// `add dst, src` — 寄存器加寄存器。
     AddRegReg(Reg64, Reg64),
 
@@ -157,6 +166,26 @@ pub enum AsmInst {
     ///
     /// 用于 tape 扩容时计算 `(new_len - old_len) / 2`。
     ShrRegImm8(Reg64, u8),
+
+    /// `lea dst, [base + disp]` — 计算基址加偏移后的地址。
+    ///
+    /// 主要用于 Win64 调用时构造栈上 scratch/第五参数地址。
+    LeaRegMem(Reg64, Reg64, i32),
+
+    /// `lea dst, [rip + rel32]` — 取当前指令附近标签的地址。
+    ///
+    /// 主要用于访问同一段内嵌入的 IAT / 字符串 / 只读数据。
+    LeaRegLabel(Reg64, AsmLabel),
+
+    /// `mov qword ptr [base + disp], src` — 将 64 位寄存器写入内存。
+    ///
+    /// 当前主要用于 Win64 shadow space / 栈槽写入。
+    MovMemReg64(Reg64, i32, Reg64),
+
+    /// `mov dst, qword ptr [base + disp]` — 从内存加载 64 位值到寄存器。
+    ///
+    /// 当前主要用于 Win64 shadow space / 栈槽读取。
+    MovRegMem64(Reg64, Reg64, i32),
 
     /// `add byte ptr [reg], imm8` — 内存字节加立即数。
     ///
@@ -215,6 +244,11 @@ pub enum AsmInst {
     /// 将返回地址（下一条指令的 RIP）压入栈中，然后跳转到目标标签。
     /// 用于调用 `ensure_tape` 扩容函数。
     Call(AsmLabel),
+
+    /// `call qword ptr [rip + rel32]` — 通过内存中的函数指针间接调用。
+    ///
+    /// 主要用于调用 PE 导入表中的 Win32 API。
+    CallMemLabel(AsmLabel),
 
     /// `ret` — 函数返回。
     ///

@@ -1,11 +1,15 @@
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use crate::backend::codegen::{compile_lir_to_asm, compile_precomputed_stdout_asm, compile_trivial_exit_asm};
 use crate::backend::x86_64::compile_asm_to_elf;
 use crate::backend::x86_64::debug;
-use crate::driver::config::{DriverConfig, OptLevel, RunMode};
+use crate::backend::x86_64::windows::{
+    compile_lir_to_windows_program, compile_precomputed_stdout_program,
+    compile_trivial_exit_program,
+};
+use crate::backend::x86_64::compile_windows_program_to_pe;
+use crate::driver::config::{CompileTarget, DriverConfig, OptLevel, RunMode};
 use crate::frontend::lexer::lex;
 use crate::frontend::parser::parse;
 use crate::interp::engine::Interpreter;
@@ -24,6 +28,7 @@ pub fn run(config: DriverConfig) -> Result<()> {
     let run_span = info_span!(
         "driver.run",
         mode = config.mode.as_str(),
+        target = config.target.as_str(),
         input = %config.input.display(),
         output = %config.output.display(),
         source_bytes = config.source.len()
@@ -70,53 +75,30 @@ pub fn run(config: DriverConfig) -> Result<()> {
             }
         }
         RunMode::Compile => {
-            let asm = if config.opt_level == OptLevel::O3 {
-                if !hir.has_put_byte() {
-                    info!("compile -O3: no output ops; emitting trivial exit(0) ELF");
-                    compile_trivial_exit_asm()
-                } else if !hir.has_get_byte() {
-                    info!("compile -O3: no input; folding stdout to precomputed write+exit");
-                    let io = BufferOutputIo::default();
-                    let mut interp = Interpreter::new(30_000, io, NullHost::new());
-                    interp.run(&hir)?;
-                    compile_precomputed_stdout_asm(&interp.io.bytes)
-                } else {
-                    let lir = lower_to_lir(&hir);
-                    debug!(lir_insts = lir.len(), "lowered lir");
-                    compile_lir_to_asm(&lir)
-                }
-            } else {
-                let lir = lower_to_lir(&hir);
-                debug!(lir_insts = lir.len(), "lowered lir");
-                compile_lir_to_asm(&lir)
-            };
-            debug!(asm_insts = asm.insts.len(), "generated asm program");
-
-            let elf = compile_asm_to_elf(&asm);
             let asm_listing_path = artifact_path(&config.output, ASM_LISTING_EXT);
             let hex_listing_path = artifact_path(&config.output, HEX_LISTING_EXT);
-            fs::write(&config.output, &elf).with_context(|| {
-                format!("failed to write executable to {}", config.output.display())
-            })?;
-            let mut perms = fs::metadata(&config.output)
-                .with_context(|| {
-                    format!("failed to read metadata for {}", config.output.display())
-                })?
-                .permissions();
-            perms.set_mode(0o755);
-            fs::set_permissions(&config.output, perms).with_context(|| {
-                format!(
-                    "failed to set executable permissions on {}",
-                    config.output.display()
-                )
-            })?;
+            let (asm, executable) = match config.target {
+                CompileTarget::X86_64Linux => {
+                    let asm = compile_linux_asm(&hir, config.opt_level)?;
+                    let executable = compile_asm_to_elf(&asm);
+                    (asm, executable)
+                }
+                CompileTarget::X86_64Windows => {
+                    let program = compile_windows_program(&hir, config.opt_level)?;
+                    let executable = compile_windows_program_to_pe(&program);
+                    (program.asm, executable)
+                }
+            };
+            debug!(asm_insts = asm.insts.len(), "generated asm program");
+            write_executable(&config.output, &executable)?;
 
             write_artifact(&asm_listing_path, debug::dump_asm_listing(&asm))?;
             write_artifact(&hex_listing_path, debug::dump_hex_listing(&asm))?;
 
             info!(
+                executable_target = config.target.as_str(),
                 executable = %config.output.display(),
-                elf_bytes = elf.len(),
+                executable_bytes = executable.len(),
                 asm_insts = asm.insts.len(),
                 asm_listing = %asm_listing_path.display(),
                 hex_listing = %hex_listing_path.display(),
@@ -143,11 +125,79 @@ pub fn run(config: DriverConfig) -> Result<()> {
     Ok(())
 }
 
+fn compile_linux_asm(hir: &crate::ir::hir::HirProgram, opt_level: OptLevel) -> Result<crate::backend::asm::AsmProgram> {
+    if opt_level == OptLevel::O3 {
+        if !hir.has_put_byte() {
+            info!("compile -O3: no output ops; emitting trivial exit(0) ELF");
+            return Ok(compile_trivial_exit_asm());
+        }
+        if !hir.has_get_byte() {
+            info!("compile -O3: no input; folding stdout to precomputed write+exit");
+            let io = BufferOutputIo::default();
+            let mut interp = Interpreter::new(30_000, io, NullHost::new());
+            interp.run(hir)?;
+            return Ok(compile_precomputed_stdout_asm(&interp.io.bytes));
+        }
+    }
+
+    let lir = lower_to_lir(hir);
+    debug!(lir_insts = lir.len(), "lowered lir");
+    Ok(compile_lir_to_asm(&lir))
+}
+
+fn compile_windows_program(
+    hir: &crate::ir::hir::HirProgram,
+    opt_level: OptLevel,
+) -> Result<crate::backend::x86_64::windows::WindowsProgram> {
+    if opt_level == OptLevel::O3 {
+        if !hir.has_put_byte() {
+            info!("compile -O3: no output ops; emitting trivial exit(0) PE");
+            return Ok(compile_trivial_exit_program(0));
+        }
+        if !hir.has_get_byte() {
+            info!("compile -O3: no input; folding stdout to precomputed WriteFile+ExitProcess");
+            let io = BufferOutputIo::default();
+            let mut interp = Interpreter::new(30_000, io, NullHost::new());
+            interp.run(hir)?;
+            return Ok(compile_precomputed_stdout_program(&interp.io.bytes));
+        }
+    }
+
+    let lir = lower_to_lir(hir);
+    debug!(lir_insts = lir.len(), "lowered lir");
+    Ok(compile_lir_to_windows_program(&lir))
+}
+
 fn write_artifact(path: impl AsRef<Path>, contents: String) -> Result<()> {
     let path = path.as_ref();
     fs::write(path, contents)
         .with_context(|| format!("failed to write debug artifact {}", path.display()))?;
     info!(artifact = %path.display(), "wrote debug artifact");
+    Ok(())
+}
+
+fn write_executable(path: &Path, bytes: &[u8]) -> Result<()> {
+    fs::write(path, bytes)
+        .with_context(|| format!("failed to write executable to {}", path.display()))?;
+    set_executable_permissions(path)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_executable_permissions(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut perms = fs::metadata(path)
+        .with_context(|| format!("failed to read metadata for {}", path.display()))?
+        .permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(path, perms)
+        .with_context(|| format!("failed to set executable permissions on {}", path.display()))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_executable_permissions(_path: &Path) -> Result<()> {
     Ok(())
 }
 

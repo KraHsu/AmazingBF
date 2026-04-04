@@ -1,13 +1,13 @@
 .TH AMAZINGBF 1
 .SH NAME
-AmazingBF \- Brainfuck compiler and interpreter (HIR interpreter, x86_64 ELF backend)
+AmazingBF \- Brainfuck compiler and interpreter (HIR interpreter, x86_64 native backend)
 .SH SYNOPSIS
 .B AmazingBF
 .RI [ options ]
 .I FILE
 .SH DESCRIPTION
 AmazingBF compiles or interprets Brainfuck source.
-The pipeline is lexer → parser → AST → optimized HIR → LIR, then either HIR interpretation or native code generation for Linux x86_64.
+The pipeline is lexer → parser → AST → optimized HIR → LIR, then either HIR interpretation or x86_64 native code generation.
 .PP
 If
 .I FILE
@@ -25,6 +25,10 @@ which behave like
 .B AmazingBF
 with a fixed run mode (no
 .BR \-m / \-\-mode ).
+.B bf-compiler
+and
+.B bf-interpreter
+also use the compile target selected at build time.
 .SH OPTIONS
 .TP
 .BR \-m ", " \-\-mode " " \fIMODE\fR
@@ -34,13 +38,26 @@ Run mode:
 .B interpret
 (default), or
 .B compile
-(emit ELF and write
+(emit a native executable and write
 .BR \&.asm / \&.lst
 listings beside the output path).
 .TP
+.BR \-\-target " " \fIx86_64\-linux|x86_64\-windows\fR
+Compile target for
+.B AmazingBF
+when
+.B \-\-mode compile
+is selected.
+The default follows the build target.
+Linux targets emit ELF executables; Windows targets emit PE32+ console executables.
+.TP
 .BR \-o ", " \-\-output " " \fIPATH\fR
-Output ELF path for compile mode (default:
-.BR a.out ).
+Output executable path for compile mode.
+Default:
+.BR a.out
+for Linux targets and
+.BR a.exe
+for Windows targets.
 .TP
 .BR \-O ", " \-\-opt\-level " " \fI0|1|2|3\fR
 Optimization level:
@@ -64,9 +81,7 @@ and, in
 .B compile
 mode only, may emit a tiny
 .B exit(0)
-ELF when there is no output instruction, or fold fixed stdout when there is output but no input (precomputed
-.B write
-sequence).
+target-native executable when there is no output instruction, or fold fixed stdout when there is output but no input (precomputed output sequence).
 .TP
 .BR \-v ", " \-\-verbose
 Increase log verbosity (repeat up to three times for \-vvv).
@@ -89,7 +104,7 @@ Print version.
 .SH EXAMPLES
 .nf
 AmazingBF tests/cases/1.bf
-AmazingBF \-m compile \-o ./hello_bf tests/cases/1.bf
+AmazingBF \-m compile \-\-target x86_64\-linux \-o ./hello_bf tests/cases/1.bf
 ./hello_bf
 cat prog.bf | AmazingBF \-
 bf\-interpreter tests/cases/1.bf

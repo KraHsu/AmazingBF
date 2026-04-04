@@ -1,4 +1,4 @@
-use crate::driver::config::{DriverConfig, OptLevel, RunMode};
+use crate::driver::config::{CompileTarget, DriverConfig, OptLevel, RunMode};
 
 use anyhow::Result;
 use clap::{ArgAction, ColorChoice, Parser, error::ErrorKind};
@@ -7,8 +7,8 @@ use std::path::PathBuf;
 
 const LONG_ABOUT: &str = "\
 AmazingBF 将 Brainfuck 源码走完整前端与中间层：词法/语法 → AST → HIR（可优化）→ LIR → \
-（解释执行或 x86_64 后端）。\
-默认在 HIR 上解释运行；compile 模式生成 Linux ELF，并在输出路径旁写入汇编与十六进制 listing。";
+（解释执行或 x86_64 原生后端）。\
+默认在 HIR 上解释运行；compile 模式可通过 --target 选择 x86_64-linux ELF 或 x86_64-windows PE64，并在输出路径旁写入汇编与十六进制 listing。";
 
 const AFTER_LONG_HELP: &str = "\
 示例:
@@ -21,6 +21,9 @@ const AFTER_LONG_HELP: &str = "\
   # 编译为可执行文件并运行
   AmazingBF path/to/hello.bf -m compile -o ./hello_bf
   ./hello_bf
+
+  # 显式指定编译目标
+  AmazingBF path/to/hello.bf -m compile --target x86_64-linux -o ./hello_bf
 
   # 只跑通流水线并在日志里看各阶段规模（不写文件）
   AmazingBF path/to/hello.bf -m dump -vv
@@ -43,8 +46,8 @@ const INTERP_AFTER_HELP: &str = "\
   cat hello.bf | bf-interpreter -";
 
 const COMPILER_LONG_ABOUT: &str = "\
-将 Brainfuck 编译为 Linux x86_64 ELF，并在 `-o` 指定路径旁生成 `.asm` / `.lst`。\
-与 `AmazingBF -m compile` 等价，无需 `-m`。";
+将 Brainfuck 编译为当前构建目标对应的 x86_64 原生可执行文件，并在 `-o` 指定路径旁生成 `.asm` / `.lst`。\
+与 `AmazingBF -m compile` 等价，但目标平台固定为构建本二进制时的 target（Linux 构建产物默认生成 ELF，Windows 构建产物默认生成 PE64）。";
 
 const COMPILER_AFTER_HELP: &str = "\
 示例:
@@ -58,9 +61,9 @@ struct CoreCli {
     #[arg(value_name = "FILE")]
     input: PathBuf,
 
-    /// ELF 输出路径（`compile` / `bf-compiler`）；会生成同基名的 .asm / .lst；解释模式下忽略
-    #[arg(short, long, value_name = "PATH", default_value = "a.out")]
-    output: PathBuf,
+    /// 编译输出路径（`compile` / `bf-compiler`）；会生成同基名的 .asm / .lst；解释模式下忽略。默认随 target：Linux 为 `a.out`，Windows 为 `a.exe`
+    #[arg(short, long, value_name = "PATH")]
+    output: Option<PathBuf>,
 
     /// 提高日志详细度（可重复：-v / -vv / -vvv）
     #[arg(short, long, action = ArgAction::Count, group = "log_level")]
@@ -86,7 +89,7 @@ struct InterpFlags {
 #[command(
     name = "AmazingBF",
     version,
-    about = "Brainfuck 编译器与解释器（HIR / Linux x86_64 ELF）",
+    about = "Brainfuck 编译器与解释器（HIR / x86_64 native backend）",
     long_about = LONG_ABOUT,
     after_long_help = AFTER_LONG_HELP,
     arg_required_else_help = true,
@@ -100,6 +103,9 @@ struct FullArgs {
     /// 运行模式
     #[arg(short, long, value_enum, default_value_t = RunMode::Interpret)]
     mode: RunMode,
+    /// 编译目标平台（仅 compile 模式生效）
+    #[arg(long, value_enum, default_value_t = CompileTarget::build_default())]
+    target: CompileTarget,
 }
 
 #[derive(Parser, Debug)]
@@ -123,7 +129,7 @@ struct InterpreterArgs {
 #[command(
     name = "bf-compiler",
     version,
-    about = "Brainfuck → Linux x86_64 ELF 编译器",
+    about = "Brainfuck → 构建目标对应的 x86_64 原生编译器",
     long_about = COMPILER_LONG_ABOUT,
     after_long_help = COMPILER_AFTER_HELP,
     arg_required_else_help = true,
@@ -177,6 +183,16 @@ fn handle_clap_error(err: clap::Error, quiet: bool) -> ! {
 }
 
 fn finish_config(core: CoreCli, mode: RunMode, interp_debug: bool) -> Result<AppConfig> {
+    let target = CompileTarget::build_default();
+    finish_config_with_target(core, mode, target, interp_debug)
+}
+
+fn finish_config_with_target(
+    core: CoreCli,
+    mode: RunMode,
+    target: CompileTarget,
+    interp_debug: bool,
+) -> Result<AppConfig> {
     let source = load_source(&core.input)?;
 
     if core.verbose > 3 {
@@ -191,7 +207,10 @@ fn finish_config(core: CoreCli, mode: RunMode, interp_debug: bool) -> Result<App
             input: core.input,
             source,
             mode,
-            output: core.output,
+            target,
+            output: core
+                .output
+                .unwrap_or_else(|| PathBuf::from(target.default_output_name())),
             interp_debug,
             opt_level: core.opt_level,
         },
@@ -205,7 +224,7 @@ pub fn parse_cli() -> Result<AppConfig> {
         Ok(a) => a,
         Err(e) => handle_clap_error(e, quiet),
     };
-    finish_config(args.core, args.mode, args.interp.interp_debug)
+    finish_config_with_target(args.core, args.mode, args.target, args.interp.interp_debug)
 }
 
 /// Fixed `RunMode::Interpret`; no `-m` / `--mode`.

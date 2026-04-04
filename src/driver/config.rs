@@ -7,6 +7,7 @@ pub struct DriverConfig {
     pub input: PathBuf,
     pub source: String,
     pub mode: RunMode,
+    pub target: CompileTarget,
     pub output: PathBuf,
     /// When true in `interpret` mode, print tape statistics to stderr after the run.
     pub interp_debug: bool,
@@ -20,7 +21,7 @@ pub enum RunMode {
     Dump,
     /// 在优化后的 HIR 上解释执行（默认）
     Interpret,
-    /// 生成 Linux x86_64 ELF，并在 `-o` 旁写出 `.asm` / `.lst`
+    /// 生成 target 对应的原生可执行文件，并在 `-o` 旁写出 `.asm` / `.lst`
     Compile,
 }
 
@@ -35,6 +36,49 @@ impl RunMode {
 }
 
 impl std::fmt::Display for RunMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+pub enum CompileTarget {
+    /// Handwritten x86_64 Linux ELF backend.
+    #[value(name = "x86_64-linux")]
+    X86_64Linux,
+    /// Handwritten x86_64 Windows PE backend.
+    #[value(name = "x86_64-windows")]
+    X86_64Windows,
+}
+
+impl CompileTarget {
+    pub const fn build_default() -> Self {
+        #[cfg(target_os = "windows")]
+        {
+            Self::X86_64Windows
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            Self::X86_64Linux
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::X86_64Linux => "x86_64-linux",
+            Self::X86_64Windows => "x86_64-windows",
+        }
+    }
+
+    pub const fn default_output_name(self) -> &'static str {
+        match self {
+            Self::X86_64Linux => "a.out",
+            Self::X86_64Windows => "a.exe",
+        }
+    }
+}
+
+impl std::fmt::Display for CompileTarget {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
     }
@@ -74,5 +118,25 @@ impl OptLevel {
 impl std::fmt::Display for OptLevel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CompileTarget;
+
+    #[test]
+    fn compile_target_default_output_names_match_platform_convention() {
+        assert_eq!(CompileTarget::X86_64Linux.default_output_name(), "a.out");
+        assert_eq!(CompileTarget::X86_64Windows.default_output_name(), "a.exe");
+    }
+
+    #[test]
+    fn build_default_tracks_compile_time_target() {
+        #[cfg(target_os = "windows")]
+        assert_eq!(CompileTarget::build_default(), CompileTarget::X86_64Windows);
+
+        #[cfg(not(target_os = "windows"))]
+        assert_eq!(CompileTarget::build_default(), CompileTarget::X86_64Linux);
     }
 }

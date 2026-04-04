@@ -7,10 +7,12 @@
 mod common;
 
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
 
 const CASES_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/cases");
 /// Repetitions per (case × `-O` level) for timing statistics.
@@ -144,6 +146,7 @@ fn run_executable_gnu_time_rss_kb(
     gnu_time_elapsed_and_rss_kb(time_out).map(|(_, rss)| rss)
 }
 
+#[cfg(not(target_os = "windows"))]
 #[ignore = "slow: cargo test --test compile_pipeline -- --ignored --nocapture"]
 #[test]
 fn compile_mode_emits_rx_elf_artifacts_and_preserves_eof_semantics() {
