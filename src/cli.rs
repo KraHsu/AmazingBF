@@ -28,24 +28,37 @@ const AFTER_LONG_HELP: &str = "\
   # 解释执行并在 stderr 打印 tape 使用统计
   AmazingBF path/to/hello.bf --interp-debug
 
+  # 特化入口（无需 -m）：bf-interpreter / bf-compiler
+  bf-interpreter path/to/hello.bf
+  bf-compiler path/to/hello.bf -o ./hello_bf
+
 手册页（若已安装）: man amazingbf";
 
+const INTERP_LONG_ABOUT: &str = "\
+在优化后的 HIR 上解释执行 Brainfuck。与 `AmazingBF -m interpret` 等价，无需 `-m`。";
+
+const INTERP_AFTER_HELP: &str = "\
+示例:
+  bf-interpreter path/to/hello.bf
+  cat hello.bf | bf-interpreter -";
+
+const COMPILER_LONG_ABOUT: &str = "\
+将 Brainfuck 编译为 Linux x86_64 ELF，并在 `-o` 指定路径旁生成 `.asm` / `.lst`。\
+与 `AmazingBF -m compile` 等价，无需 `-m`。";
+
+const COMPILER_AFTER_HELP: &str = "\
+示例:
+  bf-compiler path/to/hello.bf -o ./hello_bf
+  ./hello_bf";
+
+/// Shared flags for every frontend (input, logging, optimization, output path).
 #[derive(Parser, Debug)]
-#[command(
-    name = "AmazingBF",
-    version,
-    about = "Brainfuck 编译器与解释器（HIR / Linux x86_64 ELF）",
-    long_about = LONG_ABOUT,
-    after_long_help = AFTER_LONG_HELP,
-    arg_required_else_help = true,
-    color = ColorChoice::Auto
-)]
-struct Args {
+struct CoreCli {
     /// Brainfuck 源文件路径；使用 `-` 表示从标准输入读取
     #[arg(value_name = "FILE")]
     input: PathBuf,
 
-    /// 写入的 ELF 路径（仅 compile 模式；同时生成同基名的 .asm / .lst）
+    /// ELF 输出路径（`compile` / `bf-compiler`）；会生成同基名的 .asm / .lst；解释模式下忽略
     #[arg(short, long, value_name = "PATH", default_value = "a.out")]
     output: PathBuf,
 
@@ -57,17 +70,68 @@ struct Args {
     #[arg(short, long, action = ArgAction::SetTrue, group = "log_level")]
     quiet: bool,
 
-    /// 运行模式
-    #[arg(short, long, value_enum, default_value_t = RunMode::Interpret)]
-    mode: RunMode,
-
     /// 编译优化级别：`-O0` 仅合并连续位移/加减；`-O1` 单次窥孔与 `[-]` 等循环化简；`-O2` 重复窥孔直至不动点；`-O3` 在 compile 模式下还启用整程序折叠（HIR 同 `-O2`）
     #[arg(short = 'O', long = "opt-level", value_enum, default_value_t = OptLevel::O0)]
     opt_level: OptLevel,
+}
 
+#[derive(Parser, Debug)]
+struct InterpFlags {
     /// 解释执行结束后在 stderr 输出 tape 统计（指针范围、向右扩容、左右移动量等）
     #[arg(long = "interp-debug")]
     interp_debug: bool,
+}
+
+#[derive(Parser, Debug)]
+#[command(
+    name = "AmazingBF",
+    version,
+    about = "Brainfuck 编译器与解释器（HIR / Linux x86_64 ELF）",
+    long_about = LONG_ABOUT,
+    after_long_help = AFTER_LONG_HELP,
+    arg_required_else_help = true,
+    color = ColorChoice::Auto
+)]
+struct FullArgs {
+    #[command(flatten)]
+    core: CoreCli,
+    #[command(flatten)]
+    interp: InterpFlags,
+    /// 运行模式
+    #[arg(short, long, value_enum, default_value_t = RunMode::Interpret)]
+    mode: RunMode,
+}
+
+#[derive(Parser, Debug)]
+#[command(
+    name = "bf-interpreter",
+    version,
+    about = "Brainfuck HIR 解释器",
+    long_about = INTERP_LONG_ABOUT,
+    after_long_help = INTERP_AFTER_HELP,
+    arg_required_else_help = true,
+    color = ColorChoice::Auto
+)]
+struct InterpreterArgs {
+    #[command(flatten)]
+    core: CoreCli,
+    #[command(flatten)]
+    interp: InterpFlags,
+}
+
+#[derive(Parser, Debug)]
+#[command(
+    name = "bf-compiler",
+    version,
+    about = "Brainfuck → Linux x86_64 ELF 编译器",
+    long_about = COMPILER_LONG_ABOUT,
+    after_long_help = COMPILER_AFTER_HELP,
+    arg_required_else_help = true,
+    color = ColorChoice::Auto
+)]
+struct CompilerArgs {
+    #[command(flatten)]
+    core: CoreCli,
 }
 
 #[derive(Debug, Clone)]
@@ -92,33 +156,31 @@ fn load_source(input: &PathBuf) -> Result<String> {
     }
 }
 
-pub fn parse_cli() -> Result<AppConfig> {
-    let quiet_requested = std::env::args_os().any(|arg| arg == "-q" || arg == "--quiet");
+fn quiet_requested() -> bool {
+    std::env::args_os().any(|arg| arg == "-q" || arg == "--quiet")
+}
 
-    let args = match Args::try_parse() {
-        Ok(args) => args,
-        Err(err) => {
-            if !quiet_requested {
-                err.print()?;
-            }
-
-            match err.kind() {
-                ErrorKind::DisplayHelp
-                | ErrorKind::DisplayVersion
-                | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand => {
-                    std::process::exit(0);
-                }
-                _ => {
-                    std::process::exit(2);
-                }
-            }
+fn handle_clap_error(err: clap::Error, quiet: bool) -> ! {
+    if !quiet {
+        let _ = err.print();
+    }
+    match err.kind() {
+        ErrorKind::DisplayHelp
+        | ErrorKind::DisplayVersion
+        | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand => {
+            std::process::exit(0);
         }
-    };
+        _ => {
+            std::process::exit(2);
+        }
+    }
+}
 
-    let source = load_source(&args.input)?;
+fn finish_config(core: CoreCli, mode: RunMode, interp_debug: bool) -> Result<AppConfig> {
+    let source = load_source(&core.input)?;
 
-    if args.verbose > 3 {
-        if !args.quiet {
+    if core.verbose > 3 {
+        if !core.quiet {
             eprintln!("错误: 详细级别最多为 3（即 -vvv）");
         }
         std::process::exit(1);
@@ -126,13 +188,45 @@ pub fn parse_cli() -> Result<AppConfig> {
 
     Ok(AppConfig {
         driver_cfg: DriverConfig {
-            input: args.input,
+            input: core.input,
             source,
-            mode: args.mode,
-            output: args.output,
-            interp_debug: args.interp_debug,
-            opt_level: args.opt_level,
+            mode,
+            output: core.output,
+            interp_debug,
+            opt_level: core.opt_level,
         },
-        log_level: if args.quiet { 0 } else { args.verbose + 1 },
+        log_level: if core.quiet { 0 } else { core.verbose + 1 },
     })
+}
+
+pub fn parse_cli() -> Result<AppConfig> {
+    let quiet = quiet_requested();
+    let args = match FullArgs::try_parse() {
+        Ok(a) => a,
+        Err(e) => handle_clap_error(e, quiet),
+    };
+    finish_config(args.core, args.mode, args.interp.interp_debug)
+}
+
+/// Fixed `RunMode::Interpret`; no `-m` / `--mode`.
+pub fn parse_interpreter_cli() -> Result<AppConfig> {
+    let quiet = quiet_requested();
+    let mut args = match InterpreterArgs::try_parse() {
+        Ok(a) => a,
+        Err(e) => handle_clap_error(e, quiet),
+    };
+    if args.core.verbose == 0 {
+        args.core.quiet = true;
+    }
+    finish_config(args.core, RunMode::Interpret, args.interp.interp_debug)
+}
+
+/// Fixed `RunMode::Compile`; no `-m` / `--mode` (and no `--interp-debug`).
+pub fn parse_compiler_cli() -> Result<AppConfig> {
+    let quiet = quiet_requested();
+    let args = match CompilerArgs::try_parse() {
+        Ok(a) => a,
+        Err(e) => handle_clap_error(e, quiet),
+    };
+    finish_config(args.core, RunMode::Compile, false)
 }

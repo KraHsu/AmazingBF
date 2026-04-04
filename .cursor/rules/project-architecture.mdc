@@ -5,7 +5,7 @@ alwaysApply: true
 
 # AmazingBF Architecture
 
-- Treat this repo as a single binary crate rooted at `src/main.rs`.
+- Treat this repo as a library crate (`src/lib.rs`) with multiple binaries: default `AmazingBF` (`src/main.rs`), `bf-interpreter`, and `bf-compiler` (`src/bin/`).
 - Preserve the main pipeline: source -> lexer -> parser -> AST -> HIR -> optimize -> LIR.
 - `RunMode::Interpret` executes HIR in `src/interp/engine.rs`.
 - `RunMode::Compile` lowers LIR through `src/backend/codegen.rs` and `src/backend/x86_64/` into an ELF executable.

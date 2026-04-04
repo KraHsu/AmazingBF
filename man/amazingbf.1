@@ -14,6 +14,17 @@ If
 is
 .BR \- ,
 source is read from standard input.
+.PP
+The same
+.B cargo build
+also produces
+.B bf-interpreter
+and
+.BR bf-compiler ,
+which behave like
+.B AmazingBF
+with a fixed run mode (no
+.BR \-m / \-\-mode ).
 .SH OPTIONS
 .TP
 .BR \-m ", " \-\-mode " " \fIMODE\fR
@@ -81,6 +92,8 @@ AmazingBF tests/cases/1.bf
 AmazingBF \-m compile \-o ./hello_bf tests/cases/1.bf
 ./hello_bf
 cat prog.bf | AmazingBF \-
+bf\-interpreter tests/cases/1.bf
+bf\-compiler \-o ./hello_bf tests/cases/1.bf
 .fi
 .SH ENVIRONMENT
 .TP

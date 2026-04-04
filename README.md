@@ -5,6 +5,8 @@
 - 解释执行：将源码解析后在 HIR 上运行
 - 原生编译：将 LIR 编译为 Linux x86_64 ELF 可执行文件
 
+`cargo build` 会生成三个入口：`AmazingBF`（完整 CLI，含 `-m` / `--mode`）、`bf-interpreter`（固定解释模式）、`bf-compiler`（固定编译模式）。后两者与 `AmazingBF -m interpret -q` / `AmazingBF -m compile` 行为一致，无需再传 `-m`。**此专为十行代码测评提供**
+
 ## 当前能力
 
 - 支持 Brainfuck 基本语法：`><+-.,[]`
@@ -32,16 +34,20 @@ cargo build
 
 ```bash
 cargo run -- tests/cases/1.bf -q
+# 或特化入口
+cargo run --bin bf-interpreter -- tests/cases/1.bf
 ```
 
 默认模式是 `interpret`，上面的样例会输出经典的 Hello World。
 
-在解释模式下可加 `--interp-debug`，程序运行结束后在 **stderr** 打印 tape 统计：初始/最终槽位数、指针访问过的下标区间宽度、因右移而自动扩容的字节数，以及指针左移/右移的累计步数（与 HIR `Move` 合在一起的位移总量）。
+在解释模式下可加 `--interp-debug`，程序运行结束后在 **stderr** 打印 tape 统计：初始/最终槽位数、指针访问过的下标区间宽度、因右移而自动扩容的字节数，以及指针左移/右移的累计步数。
 
 ### 编译为可执行文件
 
 ```bash
 cargo run -- tests/cases/1.bf -m compile -o hello_bf
+# 或
+cargo run --bin bf-compiler -- tests/cases/1.bf -o hello_bf
 ./hello_bf
 ```
 
@@ -57,7 +63,7 @@ cargo run -- tests/cases/1.bf -m compile -o hello_bf
 
 编译优化级别由 `-O` / `--opt-level` 指定（默认 `0`）。当前实现中：
 
-- `-O0`：HIR 上仅合并连续的 `Move` / `Add`（单次扫描）；随后走常规 LIR → 汇编路径（含 mmap tape 等）。
+- `-O0`：HIR 上仅合并连续的 `Move` / `Add`（单次扫描）；随后走常规 LIR → 汇编路径。
 - `-O1`：在 `-O0` 基础上再做**一次** HIR 扫描：将 `[-]` 化为 `Zero`；将仅含单方向移动的循环 `[>]` / `[<]` 化为 `Scan`；将仅含加减与指针回退的仿射循环（如 `[->+<]`、`[->>++<<]`）化为 `LinearMul`；在 tape 全零初值假设下做简单常数传播，并删除入口格为 0 的空循环体 `[]`。窥孔化简包含 `Add; Zero`→`Zero` 等等价情形；**不会**把 `Zero; Add(k)` 合成单次 `Add(k)`（前者为先清零再累加，后者为在旧值上相对加）。
 - `-O2`：在 `-O1` 基础上**重复**整条 HIR 优化管线，直到程序到达不动点。
 - `-O3`：HIR 与 `-O2` 相同；并在 **compile** 模式下额外启用最强编译期折叠：若源码中没有任何 `.`，生成仅 `exit(0)` 的极小 ELF；若有 `.` 且没有任何 `,`，则在编译时于 HIR 上解释执行一次以收集标准输出字节序列，再生成直接 `write` 该序列后 `exit` 的 ELF。
@@ -143,7 +149,10 @@ Brainfuck source
 
 ```text
 src/
-  main.rs              # 程序入口，初始化日志并启动 driver
+  lib.rs               # 共享模块树与 `run_*` 入口（供默认二进制与 `bf-*` 使用）
+  main.rs              # `AmazingBF` 默认二进制入口
+  bin/bf-interpreter.rs
+  bin/bf-compiler.rs   # 固定模式的前端，调用 lib 中对应 `run_*`
   cli.rs               # Clap CLI，构造 AppConfig / DriverConfig
   driver/              # 运行模式分发与整体流水线编排
   frontend/            # lexer / parser / AST

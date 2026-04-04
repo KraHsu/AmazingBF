@@ -1,5 +1,5 @@
 use anyhow::Result;
 
 fn main() -> Result<()> {
-    AmazingBF::run_amazingbf()
+    AmazingBF::run_bf_interpreter()
 }
