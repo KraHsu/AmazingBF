@@ -1,5 +1,7 @@
 //! AmazingBF library crate: shared pipeline and CLI helpers for multiple binaries.
 
+#![allow(non_snake_case)] // package name `AmazingBF` is intentional for branding
+
 use anyhow::Result;
 
 mod backend;

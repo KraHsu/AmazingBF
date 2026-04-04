@@ -72,6 +72,7 @@ fn read_u16(bytes: &[u8], offset: usize) -> u16 {
     u16::from_le_bytes(bytes[offset..offset + 2].try_into().unwrap())
 }
 
+#[cfg(not(target_os = "windows"))]
 fn read_u64(bytes: &[u8], offset: usize) -> u64 {
     u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap())
 }
@@ -113,6 +114,7 @@ fn parse_hex_listing_bytes(listing: &str) -> Vec<u8> {
 }
 
 /// GNU `time` (`%e` elapsed sec, `%M` max RSS KB). Returns `None` if missing or parse fails.
+#[cfg(not(target_os = "windows"))]
 fn gnu_time_elapsed_and_rss_kb(path: &Path) -> Option<(f64, u64)> {
     let s = fs::read_to_string(path).ok()?;
     let mut it = s.split_whitespace();
@@ -130,6 +132,7 @@ fn mean_min_max(vals: &[f64]) -> (f64, f64, f64) {
     (mean, min, max)
 }
 
+#[cfg(not(target_os = "windows"))]
 fn run_executable_gnu_time_rss_kb(
     gnu_time: &Path,
     exe: &Path,

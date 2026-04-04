@@ -1,16 +1,12 @@
+//! Host runtime integration (planned: fs, gui, net, time).
+#![allow(dead_code)] // public surface for the future host ABI
+
 #[derive(Debug, Clone)]
 pub enum HostArg {
     Int(i64),
     Str(String),
 }
 
-/// Host runtime abs.
-///
-/// will be used in future for:
-/// - fs
-/// - gui
-/// - net
-/// - time
 pub trait HostRuntime {
     fn call(&mut self, _name: &str, _args: &[HostArg]) -> Result<(), String>;
 }

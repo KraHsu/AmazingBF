@@ -14,6 +14,7 @@ pub enum RuntimeError {
     Io(String),
 
     #[error("host error: {0}")]
+    #[allow(dead_code)] // constructed when host calls are implemented
     Host(String),
 }
 
@@ -35,6 +36,7 @@ impl From<IoError> for RuntimeError {
 pub struct Interpreter<I: RuntimeIo, H: HostRuntime> {
     pub tape: Tape,
     pub io: I,
+    #[allow(dead_code)] // used once host-call lowering reaches the interpreter
     pub host: H,
 }
 

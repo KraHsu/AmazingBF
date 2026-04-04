@@ -69,11 +69,6 @@ impl Tape {
         &self.stats
     }
 
-    /// Returns the current pointer position.
-    pub fn ptr(&self) -> usize {
-        self.ptr
-    }
-
     /// Returns the value of the current cell.
     pub fn current(&self) -> u8 {
         self.cells[self.ptr]
@@ -120,11 +115,6 @@ impl Tape {
         self.stats.final_len = self.cells.len();
 
         Ok(())
-    }
-
-    /// Returns the current cells
-    pub fn cells(&self) -> &[u8] {
-        &self.cells
     }
 }
 
