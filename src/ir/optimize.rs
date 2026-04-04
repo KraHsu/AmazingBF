@@ -17,6 +17,20 @@ pub fn optimize_o1(program: HirProgram) -> HirProgram {
     }
 }
 
+/// `-O2`: repeat the `-O1` pipeline until the HIR reaches a fixed point (no further changes).
+pub fn optimize_o2(program: HirProgram) -> HirProgram {
+    const MAX_ITERS: usize = 4096;
+    let mut current = program;
+    for _ in 0..MAX_ITERS {
+        let next = optimize_o1(current.clone());
+        if next == current {
+            return next;
+        }
+        current = next;
+    }
+    panic!("optimize_o2: did not converge within {MAX_ITERS} iterations");
+}
+
 fn optimize_block_o0(insts: Vec<HirInst>) -> Vec<HirInst> {
     let mut out = Vec::new();
     let mut i = 0;
@@ -379,5 +393,15 @@ mod tests {
         };
         let o = optimize_o1(p);
         assert!(o.insts.is_empty());
+    }
+
+    #[test]
+    fn o2_matches_o1_at_fixed_point() {
+        let p = HirProgram {
+            insts: vec![HirInst::Loop(vec![HirInst::Add(-1)])],
+        };
+        let once = optimize_o1(p.clone());
+        let twice = optimize_o2(p);
+        assert_eq!(once, twice);
     }
 }

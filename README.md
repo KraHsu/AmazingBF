@@ -59,7 +59,44 @@ cargo run -- tests/cases/1.bf -m compile -o hello_bf
 
 - `-O0`：HIR 上仅合并连续的 `Move` / `Add`（单次扫描）；随后走常规 LIR → 汇编路径（含 mmap tape 等）。
 - `-O1`：在 `-O0` 基础上再做**一次** HIR 扫描：将 `[-]` 化为 `Zero`；将仅含单方向移动的循环 `[>]` / `[<]` 化为 `Scan`；将仅含加减与指针回退的仿射循环（如 `[->+<]`、`[->>++<<]`）化为 `LinearMul`；在 tape 全零初值假设下做简单常数传播，并删除入口格为 0 的空循环体 `[]`。窥孔化简包含 `Add; Zero`→`Zero` 等等价情形；**不会**把 `Zero; Add(k)` 合成单次 `Add(k)`（前者为先清零再累加，后者为在旧值上相对加）。
-- `-O3`：HIR 与 `-O1` 相同；并在 **compile** 模式下额外启用最强编译期折叠：若源码中没有任何 `.`，生成仅 `exit(0)` 的极小 ELF；若有 `.` 且没有任何 `,`，则在编译时于 HIR 上解释执行一次以收集标准输出字节序列，再生成直接 `write` 该序列后 `exit` 的 ELF（无 Brainfuck tape）。
+- `-O2`：在 `-O1` 基础上**重复**整条 HIR 优化管线，直到程序到达不动点。
+- `-O3`：HIR 与 `-O2` 相同；并在 **compile** 模式下额外启用最强编译期折叠：若源码中没有任何 `.`，生成仅 `exit(0)` 的极小 ELF；若有 `.` 且没有任何 `,`，则在编译时于 HIR 上解释执行一次以收集标准输出字节序列，再生成直接 `write` 该序列后 `exit` 的 ELF。
+
+比如对于 `tests/cases/1.bf` 将会直接输出：
+
+```hex
+; === Brainfuck x86_64 Hex Listing ===
+; 共 1 条指令，编码后 130 字节
+
+Offset    Hex                                          Assembly
+--------- -------------------------------------------- ----------------------------------------
+0x0000:  48 83 ec 10 c6 44 24 00 48 c6 44 24 01 65    ; <raw 130 bytes: precomputed -O3 machine code>
+         c6 44 24 02 6c c6 44 24 03 6c c6 44 24 04
+         6f c6 44 24 05 20 c6 44 24 06 57 c6 44 24
+         07 6f c6 44 24 08 72 c6 44 24 09 6c c6 44
+         24 0a 64 c6 44 24 0b 21 c6 44 24 0c 0a 48
+         b8 01 00 00 00 00 00 00 00 48 bf 01 00 00
+         00 00 00 00 00 48 89 e6 48 ba 0d 00 00 00
+         00 00 00 00 0f 05 48 83 c4 10 48 b8 3c 00
+         00 00 00 00 00 00 48 bf 00 00 00 00 00 00
+         00 00 0f 05
+
+; 总计 130 字节机器码
+```
+
+优化性能测试结果如下：
+```bash
+=== TOTALS (sum of per-case mean times over 9 cases) ===
+lvl      sum_compile_mean_ms        sum_run_mean_ms
+O0                  3413.435                917.180
+O1                  3461.116                 85.636
+O2                  3785.449                 85.710
+O3                  3798.939                 90.005
+ALL_O              14458.939               1178.532
+test compile_mode_emits_rx_elf_artifacts_and_preserves_eof_semantics ... ok
+```
+
+更完整的测试可以使用 `cargo test --test compile_pipeline -- --ignored --nocapture` 命令
 
 ### 查看 CLI 帮助
 
@@ -173,18 +210,4 @@ cargo test --all
 - `.in`：输入（可选；缺失时按空输入处理）
 - `.out`：预期输出
 - `.md`：样例说明
-
-## 已知问题
-
-- `compile` 模式面向 Linux x86_64 后端
-- `dump` 模式目前会跑到 `AsmProgram`，但不会额外导出 HIR/LIR/ASM 可视化产物
-- 当前原生编译链路是手写的 `x86_64 ELF` 后端，**不再依赖 LLVM**
-- `src/backend/` 下有较完整的中文模块文档，适合继续作为后端开发入口
-- `compile` 产物的 ELF 代码段默认按只读可执行（RX）封装，运行时 tape 由匿名 `mmap` 单独提供
-
-## 适合继续演进的方向
-
-- 为 `cargo test` 补上真正的 CLI / IR / backend 测试
-- 让 `dump` 模式输出 HIR、LIR 或汇编中间结果
-- 在现有 LIR 基础上继续添加 peephole 或 loop 优化
 

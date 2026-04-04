@@ -1,9 +1,10 @@
 use assert_cmd::cargo::CommandCargoExt;
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+mod common;
 
 const CASES_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/cases");
 
@@ -53,22 +54,6 @@ fn case_paths() -> Vec<PathBuf> {
     paths
 }
 
-fn run_with_optional_input(mut cmd: Command, input_path: &Path) -> Output {
-    cmd.stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-
-    let mut child = cmd.spawn().unwrap();
-    if input_path.is_file() {
-        let input = fs::read(input_path).unwrap();
-        child.stdin.take().unwrap().write_all(&input).unwrap();
-    } else {
-        drop(child.stdin.take());
-    }
-
-    child.wait_with_output().unwrap()
-}
-
 #[test]
 fn interp_cases_match_expected_output() {
     let mut failures = Vec::new();
@@ -82,7 +67,7 @@ fn interp_cases_match_expected_output() {
         let mut cmd = Command::cargo_bin("AmazingBF").unwrap();
         cmd.arg(&bf_file).arg("-q");
 
-        let output = run_with_optional_input(cmd, &in_file);
+        let output = common::run_with_optional_input(cmd, &in_file);
         let expected = fs::read(&out_file).unwrap();
 
         if !output.status.success() {
@@ -147,7 +132,7 @@ fn compile_cases_match_expected_output_and_emit_artifacts() {
             continue;
         }
 
-        let runtime_output = run_with_optional_input(Command::new(&exe_file), &in_file);
+        let runtime_output = common::run_with_optional_input(Command::new(&exe_file), &in_file);
         let expected = fs::read(&out_file).unwrap();
 
         if !runtime_output.status.success() {

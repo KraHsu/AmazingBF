@@ -61,7 +61,7 @@ struct Args {
     #[arg(short, long, value_enum, default_value_t = RunMode::Interpret)]
     mode: RunMode,
 
-    /// 编译优化级别：`-O0` 仅合并连续位移/加减；`-O1` 额外做窥孔与 `[-]` 等循环化简；`-O3` 在 compile 模式下还启用整程序折叠
+    /// 编译优化级别：`-O0` 仅合并连续位移/加减；`-O1` 单次窥孔与 `[-]` 等循环化简；`-O2` 重复窥孔直至不动点；`-O3` 在 compile 模式下还启用整程序折叠（HIR 同 `-O2`）
     #[arg(short = 'O', long = "opt-level", value_enum, default_value_t = OptLevel::O0)]
     opt_level: OptLevel,
 

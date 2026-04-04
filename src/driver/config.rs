@@ -10,7 +10,7 @@ pub struct DriverConfig {
     pub output: PathBuf,
     /// When true in `interpret` mode, print tape statistics to stderr after the run.
     pub interp_debug: bool,
-    /// `-O` tier: HIR pipeline uses `optimize_o0` vs `optimize_o1`; `-O3` additionally enables whole-program `compile` folds.
+    /// `-O` tier: HIR uses `optimize_o0` / `optimize_o1` / `optimize_o2`; `-O3` additionally enables whole-program `compile` folds.
     pub opt_level: OptLevel,
 }
 
@@ -40,7 +40,7 @@ impl std::fmt::Display for RunMode {
     }
 }
 
-/// `-O` tier: selects the HIR optimization pass; `-O3` additionally enables whole-program folds in `compile` mode.
+/// `-O` tier: selects the HIR optimization pass; `-O2` repeats `-O1` to a fixed point; `-O3` additionally enables whole-program folds in `compile` mode (HIR same as `-O2`).
 #[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq, Default)]
 pub enum OptLevel {
     /// HIR: fuse consecutive `Move` / `Add` only (single pass).
@@ -51,8 +51,11 @@ pub enum OptLevel {
     /// loop simplification (e.g. `[-]` → `Zero`).
     #[value(name = "1")]
     O1,
+    /// HIR: repeat `-O1` until a fixed point (peephole / specialization until stable).
+    #[value(name = "2")]
+    O2,
     /// Strongest available compile optimizations (e.g. fold programs with no `.`,
-    /// or precompute stdout when there is no `,`).
+    /// or precompute stdout when there is no `,`). HIR tier matches `-O2`.
     #[value(name = "3")]
     O3,
 }
@@ -62,6 +65,7 @@ impl OptLevel {
         match self {
             Self::O0 => "0",
             Self::O1 => "1",
+            Self::O2 => "2",
             Self::O3 => "3",
         }
     }
