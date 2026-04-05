@@ -1,7 +1,9 @@
 [package]
 name = "AmazingBF"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
+rust-version = "1.94"
+description = "A Brainfuck interpreter and native x86_64 compiler with HIR/LIR pipeline stages."
 
 [dependencies]
 anyhow = "1.0.102"
@@ -12,4 +14,9 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 
 [dev-dependencies]
 assert_cmd = "2.2.0"
-predicates = "3.1.4"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+dbg_macro = "warn"

@@ -8,7 +8,8 @@ alwaysApply: true
 - Treat this repo as a library crate (`src/lib.rs`) with multiple binaries: default `AmazingBF` (`src/main.rs`), `bf-interpreter`, and `bf-compiler` (`src/bin/`).
 - Preserve the main pipeline: source -> lexer -> parser -> AST -> HIR -> optimize -> LIR.
 - `RunMode::Interpret` executes HIR in `src/interp/engine.rs`.
-- `RunMode::Compile` lowers LIR through `src/backend/codegen.rs` and `src/backend/x86_64/` into an ELF executable.
+- `RunMode::Dump` and `RunMode::Compile` are the only modes that continue past optimized HIR into LIR / backend assembly.
+- `RunMode::Compile` lowers LIR through `src/backend/codegen.rs` and `src/backend/x86_64/` into either a Linux ELF or Windows PE64 executable.
 - Keep user-facing behavior aligned across `src/cli.rs`, `src/driver/config.rs`, `src/driver/run.rs`, tests, and `README.md`.
-- The only native backend in this tree is the handwritten x86_64 ELF path under `src/backend/`.
+- The only native backend family in this tree is the handwritten x86_64 path under `src/backend/`, with Linux ELF and Windows PE64 outputs.
 - When compile output behavior changes, also update docs for generated artifacts such as `output.asm` and `output.lst`.
