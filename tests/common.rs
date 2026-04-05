@@ -1,3 +1,5 @@
+//! Shared helpers for integration tests that run binaries against fixture input/output files.
+
 use std::fs;
 use std::io::Write;
 use std::path::Path;
@@ -31,7 +33,10 @@ pub fn read_fixture_bytes(path: &Path) -> Vec<u8> {
     normalize_fixture_newlines(fs::read(path).expect("read fixture file"))
 }
 
-fn spawn_with_optional_input(mut cmd: Command, input_path: &Path) -> (Child, Option<JoinHandle<()>>) {
+fn spawn_with_optional_input(
+    mut cmd: Command,
+    input_path: &Path,
+) -> (Child, Option<JoinHandle<()>>) {
     cmd.stdin(Stdio::piped());
 
     let mut child = cmd.spawn().expect("spawn child");

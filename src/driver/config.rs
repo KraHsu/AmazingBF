@@ -2,21 +2,23 @@ use std::path::PathBuf;
 
 use clap::ValueEnum;
 
+pub(crate) const DEFAULT_INTERPRETER_TAPE_LEN: usize = 30_000;
+
 #[derive(Debug, Clone)]
-pub struct DriverConfig {
-    pub input: PathBuf,
-    pub source: String,
-    pub mode: RunMode,
-    pub target: CompileTarget,
-    pub output: PathBuf,
+pub(crate) struct DriverConfig {
+    pub(crate) input: PathBuf,
+    pub(crate) source: String,
+    pub(crate) mode: RunMode,
+    pub(crate) target: CompileTarget,
+    pub(crate) output: PathBuf,
     /// When true in `interpret` mode, print tape statistics to stderr after the run.
-    pub interp_debug: bool,
+    pub(crate) interp_debug: bool,
     /// `-O` tier: HIR uses `optimize_o0` / `optimize_o1` / `optimize_o2`; `-O3` additionally enables whole-program `compile` folds.
-    pub opt_level: OptLevel,
+    pub(crate) opt_level: OptLevel,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
-pub enum RunMode {
+pub(crate) enum RunMode {
     /// 跑通流水线并在日志中输出各阶段规模，不写 ELF 或 listing
     Dump,
     /// 在优化后的 HIR 上解释执行（默认）
@@ -26,7 +28,7 @@ pub enum RunMode {
 }
 
 impl RunMode {
-    pub fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Dump => "dump",
             Self::Interpret => "interpret",
@@ -42,7 +44,7 @@ impl std::fmt::Display for RunMode {
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
-pub enum CompileTarget {
+pub(crate) enum CompileTarget {
     /// Handwritten x86_64 Linux ELF backend.
     #[value(name = "x86_64-linux")]
     X86_64Linux,
@@ -52,7 +54,7 @@ pub enum CompileTarget {
 }
 
 impl CompileTarget {
-    pub const fn build_default() -> Self {
+    pub(crate) const fn build_default() -> Self {
         #[cfg(target_os = "windows")]
         {
             Self::X86_64Windows
@@ -63,14 +65,14 @@ impl CompileTarget {
         }
     }
 
-    pub const fn as_str(self) -> &'static str {
+    pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::X86_64Linux => "x86_64-linux",
             Self::X86_64Windows => "x86_64-windows",
         }
     }
 
-    pub const fn default_output_name(self) -> &'static str {
+    pub(crate) const fn default_output_name(self) -> &'static str {
         match self {
             Self::X86_64Linux => "a.out",
             Self::X86_64Windows => "a.exe",
@@ -86,7 +88,7 @@ impl std::fmt::Display for CompileTarget {
 
 /// `-O` tier: selects the HIR optimization pass; `-O2` repeats `-O1` to a fixed point; `-O3` additionally enables whole-program folds in `compile` mode (HIR same as `-O2`).
 #[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq, Default)]
-pub enum OptLevel {
+pub(crate) enum OptLevel {
     /// HIR: fuse consecutive `Move` / `Add` only (single pass).
     #[default]
     #[value(name = "0")]
@@ -105,7 +107,7 @@ pub enum OptLevel {
 }
 
 impl OptLevel {
-    pub fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::O0 => "0",
             Self::O1 => "1",

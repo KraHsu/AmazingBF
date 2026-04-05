@@ -4,7 +4,7 @@ use crate::frontend::lexer::Token;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
-pub enum ParseError {
+pub(crate) enum ParseError {
     #[error("unexpected loop end ']' at position {pos}")]
     UnexpectedLoopEnd { pos: usize },
 
@@ -12,21 +12,19 @@ pub enum ParseError {
     UnclosedLoop { pos: usize },
 }
 
-/// parse token list to ast
-pub fn parse(tokens: &[Token]) -> Result<Vec<AstNode>, ParseError> {
+/// Parse the Brainfuck token stream into the nested AST representation.
+pub(crate) fn parse(tokens: &[Token]) -> Result<Vec<AstNode>, ParseError> {
     let mut pos = 0;
     let ast = parse_block(tokens, &mut pos, false)?;
 
     if pos != tokens.len() {
-        return Err(ParseError::UnexpectedLoopEnd { pos: pos });
+        return Err(ParseError::UnexpectedLoopEnd { pos });
     }
 
     Ok(ast)
 }
 
-/// in_loop : Indicates whether parsing is currently inside a loop section
-/// - false: at the outermost level
-/// - true: inside the \[...\] section
+/// Parse one block, optionally inside a `[...]` loop body.
 fn parse_block(
     tokens: &[Token],
     pos: &mut usize,

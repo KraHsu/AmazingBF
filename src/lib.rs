@@ -1,9 +1,14 @@
-//! AmazingBF library crate: shared pipeline and CLI helpers for multiple binaries.
+//! AmazingBF library crate.
+//!
+//! The stable public entry points of this crate are the three `run_*` helpers used by
+//! the shipped binaries. Internal pipeline, CLI, IR, runtime, and backend modules stay
+//! crate-private so the implementation can evolve without exposing a large semver surface.
 
 #![allow(non_snake_case)] // package name `AmazingBF` is intentional for branding
 
 use anyhow::Result;
 
+mod app;
 mod backend;
 mod cli;
 mod driver;
@@ -12,24 +17,17 @@ mod interp;
 mod ir;
 mod runtime;
 
-fn run_with_parse(parse: fn() -> Result<cli::AppConfig>) -> Result<()> {
-    let config = parse()?;
-    driver::logging::init_logger(config.log_level)?;
-    driver::run::run(config.driver_cfg)?;
-    Ok(())
-}
-
 /// Default `AmazingBF` binary: full CLI including `-m` / `--mode`.
 pub fn run_amazingbf() -> Result<()> {
-    run_with_parse(cli::parse_cli)
+    app::run_with_parse(cli::parse_cli)
 }
 
 /// `bf-interpreter` binary: fixed interpret mode.
 pub fn run_bf_interpreter() -> Result<()> {
-    run_with_parse(cli::parse_interpreter_cli)
+    app::run_with_parse(cli::parse_interpreter_cli)
 }
 
 /// `bf-compiler` binary: fixed compile mode.
 pub fn run_bf_compiler() -> Result<()> {
-    run_with_parse(cli::parse_compiler_cli)
+    app::run_with_parse(cli::parse_compiler_cli)
 }

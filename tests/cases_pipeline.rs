@@ -1,3 +1,5 @@
+//! End-to-end fixture tests for interpreter and compiler behavior across `tests/cases/*.bf`.
+
 use assert_cmd::cargo::CommandCargoExt;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -125,9 +127,17 @@ fn compile_cases_match_expected_output_and_emit_artifacts() {
             continue;
         }
 
-        let artifacts_ok = [(&exe_file, "executable"), (&asm_file, "asm"), (&lst_file, "lst")]
-            .into_iter()
-            .all(|(path, _)| fs::metadata(path).map(|meta| meta.len() > 0).unwrap_or(false));
+        let artifacts_ok = [
+            (&exe_file, "executable"),
+            (&asm_file, "asm"),
+            (&lst_file, "lst"),
+        ]
+        .into_iter()
+        .all(|(path, _)| {
+            fs::metadata(path)
+                .map(|meta| meta.len() > 0)
+                .unwrap_or(false)
+        });
         if !artifacts_ok {
             failures.push(format!("[compile] {name}: missing compile artifacts"));
             continue;
@@ -191,9 +201,17 @@ fn compile_cases_match_expected_output_and_emit_artifacts() {
             continue;
         }
 
-        let artifacts_ok = [(&exe_file, "executable"), (&asm_file, "asm"), (&lst_file, "lst")]
-            .into_iter()
-            .all(|(path, _)| fs::metadata(path).map(|meta| meta.len() > 0).unwrap_or(false));
+        let artifacts_ok = [
+            (&exe_file, "executable"),
+            (&asm_file, "asm"),
+            (&lst_file, "lst"),
+        ]
+        .into_iter()
+        .all(|(path, _)| {
+            fs::metadata(path)
+                .map(|meta| meta.len() > 0)
+                .unwrap_or(false)
+        });
         if !artifacts_ok {
             failures.push(format!("[compile] {name}: missing compile artifacts"));
             continue;

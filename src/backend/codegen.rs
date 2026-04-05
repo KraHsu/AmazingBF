@@ -260,12 +260,6 @@ pub fn compile_lir_to_asm(lir: &LirProgram) -> AsmProgram {
                 out.push(AsmInst::CmpMem8Imm8(Reg64::R13, 0)); // 比较 *data_ptr 与 0
                 out.push(AsmInst::Jnz(map_label(*id))); // 如果非零则跳转
             }
-
-            // 兜底分支：如果 LIR 增加了新指令但后端未实现
-            #[allow(unreachable_patterns)]
-            _ => {
-                panic!("unsupported LIR instruction in backend");
-            }
         }
     }
 
@@ -300,7 +294,9 @@ pub fn compile_precomputed_stdout_asm(data: &[u8]) -> AsmProgram {
         return compile_trivial_exit_asm();
     }
     AsmProgram {
-        insts: vec![AsmInst::RawBytes(build_precomputed_stdout_machine_code(data))],
+        insts: vec![AsmInst::RawBytes(build_precomputed_stdout_machine_code(
+            data,
+        ))],
     }
 }
 

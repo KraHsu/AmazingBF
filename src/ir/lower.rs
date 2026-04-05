@@ -2,11 +2,8 @@ use crate::frontend::ast::AstNode;
 use crate::ir::hir::{HirInst, HirProgram};
 use crate::ir::lir::{LabelGen, LirInst, LirProgram};
 
-/// from ast to hir
-///
-/// - MoveRight / MoveLeft -> Move(+1/-1)
-/// - Inc / Dec            -> Add(+1/-1)
-pub fn lower_to_hir(ast: &[AstNode]) -> HirProgram {
+/// Lower the parsed AST into the high-level IR used by optimization and interpretation.
+pub(crate) fn lower_to_hir(ast: &[AstNode]) -> HirProgram {
     HirProgram {
         insts: lower_to_hir_block(ast),
     }
@@ -32,14 +29,8 @@ fn lower_to_hir_block(ast: &[AstNode]) -> Vec<HirInst> {
     out
 }
 
-/// from hir to lir
-///
-/// - Move(n)    -> PtrAdd(n)
-/// - Add(n)     -> CellAdd(n)
-/// - PutByte    -> PutByte
-/// - GetByte    -> GetByte
-/// - Loop(body) -> explicit labels and jumps
-pub fn lower_to_lir(hir: &HirProgram) -> LirProgram {
+/// Lower HIR into the backend-facing low-level IR with explicit loop labels and jumps.
+pub(crate) fn lower_to_lir(hir: &HirProgram) -> LirProgram {
     let mut labels = LabelGen::new();
 
     LirProgram {

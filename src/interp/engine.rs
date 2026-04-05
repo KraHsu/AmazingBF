@@ -6,7 +6,7 @@ use crate::runtime::tape::{Tape, TapeError};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
-pub enum RuntimeError {
+pub(crate) enum RuntimeError {
     #[error("tape error: {0}")]
     Tape(#[from] TapeError),
 
@@ -33,26 +33,22 @@ impl From<IoError> for RuntimeError {
 /// - `Tape`: the memory tape
 /// - `RuntimeIo`: input and output
 /// - `HostRuntime`: host extension calls
-pub struct Interpreter<I: RuntimeIo, H: HostRuntime> {
-    pub tape: Tape,
-    pub io: I,
+pub(crate) struct Interpreter<I: RuntimeIo, H: HostRuntime> {
+    pub(crate) tape: Tape,
+    pub(crate) io: I,
     #[allow(dead_code)] // used once host-call lowering reaches the interpreter
-    pub host: H,
+    pub(crate) host: H,
 }
 
 /// `(v * f)` reduced to a single `CellAdd`-style delta mod 256 (Brainfuck tape).
 fn mul_add_delta_u8(v: u8, f: i32) -> i32 {
     let p = (v as i32).wrapping_mul(f);
-    let m = p.rem_euclid(256) as i32;
-    if m <= 127 {
-        m
-    } else {
-        m - 256
-    }
+    let m = p.rem_euclid(256);
+    if m <= 127 { m } else { m - 256 }
 }
 
 impl<I: RuntimeIo, H: HostRuntime> Interpreter<I, H> {
-    pub fn new(tape_len: usize, io: I, host: H) -> Self {
+    pub(crate) fn new(tape_len: usize, io: I, host: H) -> Self {
         Self {
             tape: Tape::new(tape_len),
             io,
@@ -60,7 +56,7 @@ impl<I: RuntimeIo, H: HostRuntime> Interpreter<I, H> {
         }
     }
 
-    pub fn run(&mut self, program: &HirProgram) -> Result<(), RuntimeError> {
+    pub(crate) fn run(&mut self, program: &HirProgram) -> Result<(), RuntimeError> {
         self.exec_block(&program.insts)
     }
 

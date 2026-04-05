@@ -2,19 +2,19 @@
 #![allow(dead_code)] // public surface for the future host ABI
 
 #[derive(Debug, Clone)]
-pub enum HostArg {
+pub(crate) enum HostArg {
     Int(i64),
     Str(String),
 }
 
-pub trait HostRuntime {
+pub(crate) trait HostRuntime {
     fn call(&mut self, _name: &str, _args: &[HostArg]) -> Result<(), String>;
 }
 
-pub struct NullHost;
+pub(crate) struct NullHost;
 
 impl NullHost {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self
     }
 }

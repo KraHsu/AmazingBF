@@ -23,8 +23,11 @@ pub fn build_pe_executable(
     import_directory: DataDirectory,
     iat_directory: DataDirectory,
 ) -> Vec<u8> {
-    let headers_unaligned =
-        DOS_STUB_SIZE + PE_SIGNATURE_SIZE + COFF_HEADER_SIZE + OPTIONAL_HEADER_SIZE + SECTION_HEADER_SIZE;
+    let headers_unaligned = DOS_STUB_SIZE
+        + PE_SIGNATURE_SIZE
+        + COFF_HEADER_SIZE
+        + OPTIONAL_HEADER_SIZE
+        + SECTION_HEADER_SIZE;
     let size_of_headers = align_up(headers_unaligned as u32, FILE_ALIGNMENT);
     let size_of_code = encoded.text.len() as u32;
     let size_of_raw_data = align_up(size_of_code, FILE_ALIGNMENT);

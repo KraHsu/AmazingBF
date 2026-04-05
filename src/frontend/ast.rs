@@ -1,5 +1,5 @@
 #[derive(Debug, Clone)]
-pub enum AstNode {
+pub(crate) enum AstNode {
     /// >
     MoveRight,
     /// <

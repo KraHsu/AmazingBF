@@ -1,11 +1,13 @@
-//! # 后端模块 (backend/mod.rs)
+//! Backend stages after HIR lowering.
 //!
-//! 本模块组织了编译器后端的所有子模块：
+//! This layer is entered only by `dump` and `compile` flows. `interpret` stops at
+//! optimized HIR and executes in `src/interp/engine.rs`.
 //!
-//! - `asm`: 汇编 IR 定义（`AsmInst`, `AsmProgram` 等）
-//! - `codegen`: LIR → 汇编 IR 的代码生成器
-//! - `x86_64`: x86_64 目标平台（编码器 + ELF 生成器）
+//! Current backend structure:
+//! - `asm`: backend-local assembly IR (`AsmProgram`, `AsmInst`)
+//! - `codegen`: lower LIR into assembly IR
+//! - `x86_64`: encode assembly IR and package it as either Linux ELF or Windows PE64
 
-pub mod asm;
-pub mod codegen;
-pub mod x86_64;
+pub(crate) mod asm;
+pub(crate) mod codegen;
+pub(crate) mod x86_64;

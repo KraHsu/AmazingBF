@@ -7,12 +7,11 @@
 mod common;
 
 use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
-
 
 const CASES_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/cases");
 /// Repetitions per (case × `-O` level) for timing statistics.
@@ -132,6 +131,33 @@ fn mean_min_max(vals: &[f64]) -> (f64, f64, f64) {
     (mean, min, max)
 }
 
+/// Run `AmazingBF compile` and panic with stderr on failure (useful when the child panics or returns `Err`).
+fn assert_amazingbf_compile_ok(
+    amazingbf: &Path,
+    bf_file: &Path,
+    flag: &str,
+    output_path: &Path,
+    case_name: &str,
+) {
+    let out = Command::new(amazingbf)
+        .arg("-q")
+        .arg(bf_file)
+        .arg("-m")
+        .arg("compile")
+        .arg("-O")
+        .arg(flag)
+        .arg("-o")
+        .arg(output_path)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap_or_else(|e| panic!("failed to spawn AmazingBF: {e}"));
+    assert!(
+        out.status.success(),
+        "compile failed case {case_name} -O{flag}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 #[cfg(not(target_os = "windows"))]
 fn run_executable_gnu_time_rss_kb(
     gnu_time: &Path,
@@ -180,7 +206,10 @@ fn compile_mode_emits_rx_elf_artifacts_and_preserves_eof_semantics() {
         let name = bf_file.file_stem().unwrap().to_string_lossy().into_owned();
         let in_file = Path::new(CASES_DIR).join(format!("{name}.in"));
         let out_file = Path::new(CASES_DIR).join(format!("{name}.out"));
-        assert!(out_file.is_file(), "[compile_pipeline] {name}: missing .out");
+        assert!(
+            out_file.is_file(),
+            "[compile_pipeline] {name}: missing .out"
+        );
         let expected = common::read_fixture_bytes(&out_file);
 
         eprintln!();
@@ -223,22 +252,7 @@ fn compile_mode_emits_rx_elf_artifacts_and_preserves_eof_semantics() {
                     assert!(status.success(), "compile failed case {name} -O{flag}");
                     gnu_time_elapsed_and_rss_kb(&time_compile).map(|(_, r)| r)
                 } else {
-                    assert!(
-                        Command::new(amazingbf)
-                            .arg("-q")
-                            .arg(&bf_file)
-                            .arg("-m")
-                            .arg("compile")
-                            .arg("-O")
-                            .arg(flag)
-                            .arg("-o")
-                            .arg(&output_path)
-                            .stdin(Stdio::null())
-                            .status()
-                            .unwrap()
-                            .success(),
-                        "compile failed case {name} -O{flag}"
-                    );
+                    assert_amazingbf_compile_ok(amazingbf, &bf_file, flag, &output_path, &name);
                     None
                 };
                 compile_ms_samples.push(t_compile.elapsed().as_secs_f64() * 1000.0);
@@ -263,16 +277,17 @@ fn compile_mode_emits_rx_elf_artifacts_and_preserves_eof_semantics() {
                     assert_eq!(&elf[0..4], b"\x7FELF", "{label} {name}");
                     assert_eq!(read_u32(&elf, 64), 1, "{label} {name}");
                     assert_eq!(read_u32(&elf, 68), 0x5, "{label} {name}");
-                    assert!(
-                        metadata.permissions().mode() & 0o111 != 0,
-                        "{label} {name}"
-                    );
+                    assert!(metadata.permissions().mode() & 0o111 != 0, "{label} {name}");
                     assert!(asm_path.is_file(), "{label} {name}");
                     assert!(lst_path.is_file(), "{label} {name}");
                     assert!(!asm_listing.trim().is_empty(), "{label} {name}");
                     assert!(asm_listing.contains("; === Brainfuck x86_64 Assembly Listing ==="));
                     assert!(hex_listing.contains("; === Brainfuck x86_64 Hex Listing ==="));
-                    assert_eq!(parse_hex_listing_bytes(&hex_listing), elf_text, "{label} {name}");
+                    assert_eq!(
+                        parse_hex_listing_bytes(&hex_listing),
+                        elf_text,
+                        "{label} {name}"
+                    );
                     elf_len = elf.len();
                 }
 
@@ -353,10 +368,7 @@ fn compile_mode_emits_rx_elf_artifacts_and_preserves_eof_semantics() {
     }
     let grand_compile: f64 = sum_compile_mean_by_level.iter().sum();
     let grand_run: f64 = sum_run_mean_by_level.iter().sum();
-    eprintln!(
-        "{:<5} {:>22.3} {:>22.3}",
-        "ALL_O", grand_compile, grand_run
-    );
+    eprintln!("{:<5} {:>22.3} {:>22.3}", "ALL_O", grand_compile, grand_run);
 
     if !have_gnu_time {
         eprintln!(
@@ -390,7 +402,10 @@ fn compile_mode_emits_rx_pe_artifacts_and_preserves_eof_semantics() {
         let name = bf_file.file_stem().unwrap().to_string_lossy().into_owned();
         let in_file = Path::new(CASES_DIR).join(format!("{name}.in"));
         let out_file = Path::new(CASES_DIR).join(format!("{name}.out"));
-        assert!(out_file.is_file(), "[compile_pipeline] {name}: missing .out");
+        assert!(
+            out_file.is_file(),
+            "[compile_pipeline] {name}: missing .out"
+        );
         let expected = common::read_fixture_bytes(&out_file);
 
         eprintln!();
@@ -409,22 +424,7 @@ fn compile_mode_emits_rx_pe_artifacts_and_preserves_eof_semantics() {
 
             for trial in 0..TRIALS {
                 let t_compile = Instant::now();
-                assert!(
-                    Command::new(amazingbf)
-                        .arg("-q")
-                        .arg(&bf_file)
-                        .arg("-m")
-                        .arg("compile")
-                        .arg("-O")
-                        .arg(flag)
-                        .arg("-o")
-                        .arg(&output_path)
-                        .stdin(Stdio::null())
-                        .status()
-                        .unwrap()
-                        .success(),
-                    "compile failed case {name} -O{flag}"
-                );
+                assert_amazingbf_compile_ok(amazingbf, &bf_file, flag, &output_path, &name);
                 compile_ms_samples.push(t_compile.elapsed().as_secs_f64() * 1000.0);
 
                 let asm_path = output_path.with_extension("asm");
@@ -454,9 +454,14 @@ fn compile_mode_emits_rx_pe_artifacts_and_preserves_eof_semantics() {
                     assert!(!asm_listing.trim().is_empty(), "{label} {name}");
                     assert!(asm_listing.contains("; === Brainfuck x86_64 Assembly Listing ==="));
                     assert!(hex_listing.contains("; === Brainfuck x86_64 Hex Listing ==="));
-                    assert_eq!(listing_bytes[..import_off], text_bytes[..import_off], "{label} {name}");
+                    assert_eq!(
+                        listing_bytes[..import_off],
+                        text_bytes[..import_off],
+                        "{label} {name}"
+                    );
                     assert!(
-                        exe.windows(b"kernel32.dll".len()).any(|w| w == b"kernel32.dll"),
+                        exe.windows(b"kernel32.dll".len())
+                            .any(|w| w == b"kernel32.dll"),
                         "{label} {name}"
                     );
                     pe_len = exe.len();
@@ -496,16 +501,7 @@ fn compile_mode_emits_rx_pe_artifacts_and_preserves_eof_semantics() {
 
             eprintln!(
                 "{:<5} {:>7} {:>7} | compile_ms mean/min/max: {:>6.3} / {:>6.3} / {:>6.3} | run_ms mean/min/max: {:>6.3} / {:>6.3} / {:>6.3} | {}",
-                label,
-                pe_len,
-                asm_bytes,
-                c_mean,
-                c_min,
-                c_max,
-                r_mean,
-                r_min,
-                r_max,
-                hir_note,
+                label, pe_len, asm_bytes, c_mean, c_min, c_max, r_mean, r_min, r_max, hir_note,
             );
         }
 
@@ -528,8 +524,5 @@ fn compile_mode_emits_rx_pe_artifacts_and_preserves_eof_semantics() {
     }
     let grand_compile: f64 = sum_compile_mean_by_level.iter().sum();
     let grand_run: f64 = sum_run_mean_by_level.iter().sum();
-    eprintln!(
-        "{:<5} {:>22.3} {:>22.3}",
-        "ALL_O", grand_compile, grand_run
-    );
+    eprintln!("{:<5} {:>22.3} {:>22.3}", "ALL_O", grand_compile, grand_run);
 }

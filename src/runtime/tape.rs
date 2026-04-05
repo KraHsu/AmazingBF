@@ -2,26 +2,26 @@ use thiserror::Error;
 
 /// Statistics collected while a [`Tape`] is in use (pointer range, growth, move totals).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TapeStats {
+pub(crate) struct TapeStats {
     /// Length allocated at construction.
-    pub initial_len: usize,
+    pub(crate) initial_len: usize,
     /// Current backing store length (after any growth).
-    pub final_len: usize,
+    pub(crate) final_len: usize,
     /// Smallest index the pointer visited.
-    pub ptr_min: usize,
+    pub(crate) ptr_min: usize,
     /// Largest index the pointer visited.
-    pub ptr_max: usize,
+    pub(crate) ptr_max: usize,
     /// Cells added by automatic growth beyond `initial_len`.
-    pub right_growth: usize,
+    pub(crate) right_growth: usize,
     /// Sum of absolute pointer deltas when moving left (`<` / negative HIR `Move`).
-    pub move_left_units: u64,
+    pub(crate) move_left_units: u64,
     /// Sum of pointer deltas when moving right (`>` / positive HIR `Move`).
-    pub move_right_units: u64,
+    pub(crate) move_right_units: u64,
 }
 
 impl TapeStats {
     /// Number of indices covered from the leftmost to rightmost visit (inclusive).
-    pub fn visited_span(&self) -> usize {
+    pub(crate) fn visited_span(&self) -> usize {
         self.ptr_max.saturating_sub(self.ptr_min).saturating_add(1)
     }
 }
@@ -34,20 +34,20 @@ impl TapeStats {
 /// - the tape grows automatically when the pointer moves to the right
 /// - moving the pointer to the left of index 0 returns an error
 #[derive(Debug, Clone)]
-pub struct Tape {
+pub(crate) struct Tape {
     cells: Vec<u8>,
     ptr: usize,
     stats: TapeStats,
 }
 
 #[derive(Debug, Error)]
-pub enum TapeError {
+pub(crate) enum TapeError {
     #[error("pointer underflow at {pos}")]
     PointerUnderflow { pos: isize },
 }
 
 impl Tape {
-    pub fn new(initial_len: usize) -> Self {
+    pub(crate) fn new(initial_len: usize) -> Self {
         let len = initial_len.max(1);
         Self {
             cells: vec![0; len],
@@ -65,22 +65,22 @@ impl Tape {
     }
 
     /// Snapshot of tape usage statistics (updated by pointer moves and growth).
-    pub fn stats(&self) -> &TapeStats {
+    pub(crate) fn stats(&self) -> &TapeStats {
         &self.stats
     }
 
     /// Returns the value of the current cell.
-    pub fn current(&self) -> u8 {
+    pub(crate) fn current(&self) -> u8 {
         self.cells[self.ptr]
     }
 
     /// Sets the value of the current cell.
-    pub fn set_current(&mut self, value: u8) {
+    pub(crate) fn set_current(&mut self, value: u8) {
         self.cells[self.ptr] = value;
     }
 
     /// Applies wrapping addition or subtraction to the current cell.
-    pub fn add_current(&mut self, delta: i32) {
+    pub(crate) fn add_current(&mut self, delta: i32) {
         let cur = self.cells[self.ptr];
         self.cells[self.ptr] = if delta >= 0 {
             cur.wrapping_add(delta as u8)
@@ -90,16 +90,16 @@ impl Tape {
     }
 
     /// Moves the pointer.
-    pub fn move_ptr(&mut self, delta: isize) -> Result<(), TapeError> {
+    pub(crate) fn move_ptr(&mut self, delta: isize) -> Result<(), TapeError> {
         let next = self.ptr as isize + delta;
         if next < 0 {
             return Err(TapeError::PointerUnderflow { pos: next });
         }
 
-        if delta < 0 {
-            self.stats.move_left_units += (-delta) as u64;
-        } else if delta > 0 {
-            self.stats.move_right_units += delta as u64;
+        match delta.cmp(&0) {
+            std::cmp::Ordering::Less => self.stats.move_left_units += (-delta) as u64,
+            std::cmp::Ordering::Greater => self.stats.move_right_units += delta as u64,
+            std::cmp::Ordering::Equal => {}
         }
 
         self.ptr = next as usize;

@@ -4,7 +4,7 @@
 //!
 //! 在编译流水线中的位置：
 //! ```text
-//! BF 源码 → Token → AST → HIR → LIR → [AsmProgram] → 机器码 → ELF
+//! BF 源码 → Token → AST → HIR → LIR → [AsmProgram] → 机器码 → 目标可执行文件
 //!                                      ^^^^^^^^^^
 //!                                      本模块定义
 //! ```

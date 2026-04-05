@@ -3,7 +3,7 @@ use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
-pub fn init_logger(log_level: u8) -> Result<()> {
+pub(crate) fn init_logger(log_level: u8) -> Result<()> {
     let default_filter = default_env_filter(log_level)?;
     let env_filter = EnvFilter::try_from_default_env().unwrap_or(default_filter);
     let include_source_location = cfg!(debug_assertions);

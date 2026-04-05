@@ -1,3 +1,5 @@
+//! Windows-targeted regression tests for PE64 output and cross-target compiler behavior.
+
 use assert_cmd::cargo::CommandCargoExt;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -131,11 +133,25 @@ fn compile_windows_target_emits_pe_artifacts_and_imports_kernel32() {
     assert_eq!(listing_bytes[..import_off], text_bytes[..import_off]);
 
     assert!(asm_listing.contains("call    qword [rel"));
-    assert!(asm_listing.contains("ExitProcess") || exe.windows(b"ExitProcess".len()).any(|w| w == b"ExitProcess"));
-    assert!(exe.windows(b"kernel32.dll".len()).any(|w| w == b"kernel32.dll"));
-    assert!(exe.windows(b"GetStdHandle".len()).any(|w| w == b"GetStdHandle"));
+    assert!(
+        asm_listing.contains("ExitProcess")
+            || exe
+                .windows(b"ExitProcess".len())
+                .any(|w| w == b"ExitProcess")
+    );
+    assert!(
+        exe.windows(b"kernel32.dll".len())
+            .any(|w| w == b"kernel32.dll")
+    );
+    assert!(
+        exe.windows(b"GetStdHandle".len())
+            .any(|w| w == b"GetStdHandle")
+    );
     assert!(exe.windows(b"WriteFile".len()).any(|w| w == b"WriteFile"));
-    assert!(exe.windows(b"VirtualAlloc".len()).any(|w| w == b"VirtualAlloc"));
+    assert!(
+        exe.windows(b"VirtualAlloc".len())
+            .any(|w| w == b"VirtualAlloc")
+    );
 }
 
 #[test]

@@ -1,1 +1,3 @@
-pub mod engine;
+//! HIR interpreter implementation.
+
+pub(crate) mod engine;

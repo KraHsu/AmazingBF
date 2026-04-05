@@ -1,9 +1,10 @@
 use crate::driver::config::{CompileTarget, DriverConfig, OptLevel, RunMode};
 
 use anyhow::Result;
-use clap::{ArgAction, ColorChoice, Parser, error::ErrorKind};
+use clap::{ArgAction, ColorChoice, Parser};
 use std::io::Read;
 use std::path::PathBuf;
+use thiserror::Error;
 
 const LONG_ABOUT: &str = "\
 AmazingBF 将 Brainfuck 源码走完整前端与中间层：词法/语法 → AST → HIR（可优化）→ LIR → \
@@ -147,15 +148,29 @@ struct CompilerArgs {
 }
 
 #[derive(Debug, Clone)]
-pub struct AppConfig {
-    pub driver_cfg: DriverConfig,
+pub(crate) struct AppConfig {
+    pub(crate) driver_cfg: DriverConfig,
 
     /// 0 -> quiet
     /// 1 -> normal
     /// 2 -> v
     /// 3 -> vv
     /// _ -> vvv
-    pub log_level: u8,
+    pub(crate) log_level: u8,
+}
+
+#[derive(Debug, Error)]
+pub(crate) enum CliError {
+    #[error("clap error")]
+    Clap { err: clap::Error, quiet: bool },
+    #[error("{message}")]
+    Message {
+        message: String,
+        quiet: bool,
+        exit_code: i32,
+    },
+    #[error(transparent)]
+    Other(#[from] anyhow::Error),
 }
 
 fn load_source(input: &PathBuf) -> Result<String> {
@@ -172,23 +187,22 @@ fn quiet_requested() -> bool {
     std::env::args_os().any(|arg| arg == "-q" || arg == "--quiet")
 }
 
-fn handle_clap_error(err: clap::Error, quiet: bool) -> ! {
-    if !quiet {
-        let _ = err.print();
+fn validate_log_level(core: &CoreCli) -> std::result::Result<(), CliError> {
+    if core.verbose > 3 {
+        return Err(CliError::Message {
+            message: "错误: 详细级别最多为 3（即 -vvv）".to_string(),
+            quiet: core.quiet,
+            exit_code: 1,
+        });
     }
-    match err.kind() {
-        ErrorKind::DisplayHelp
-        | ErrorKind::DisplayVersion
-        | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand => {
-            std::process::exit(0);
-        }
-        _ => {
-            std::process::exit(2);
-        }
-    }
+    Ok(())
 }
 
-fn finish_config(core: CoreCli, mode: RunMode, interp_debug: bool) -> Result<AppConfig> {
+fn finish_config(
+    core: CoreCli,
+    mode: RunMode,
+    interp_debug: bool,
+) -> std::result::Result<AppConfig, CliError> {
     let target = CompileTarget::build_default();
     finish_config_with_target(core, mode, target, interp_debug)
 }
@@ -198,15 +212,9 @@ fn finish_config_with_target(
     mode: RunMode,
     target: CompileTarget,
     interp_debug: bool,
-) -> Result<AppConfig> {
+) -> std::result::Result<AppConfig, CliError> {
+    validate_log_level(&core)?;
     let source = load_source(&core.input)?;
-
-    if core.verbose > 3 {
-        if !core.quiet {
-            eprintln!("错误: 详细级别最多为 3（即 -vvv）");
-        }
-        std::process::exit(1);
-    }
 
     Ok(AppConfig {
         driver_cfg: DriverConfig {
@@ -224,22 +232,16 @@ fn finish_config_with_target(
     })
 }
 
-pub fn parse_cli() -> Result<AppConfig> {
+pub(crate) fn parse_cli() -> std::result::Result<AppConfig, CliError> {
     let quiet = quiet_requested();
-    let args = match FullArgs::try_parse() {
-        Ok(a) => a,
-        Err(e) => handle_clap_error(e, quiet),
-    };
+    let args = FullArgs::try_parse().map_err(|err| CliError::Clap { err, quiet })?;
     finish_config_with_target(args.core, args.mode, args.target, args.interp.interp_debug)
 }
 
 /// Fixed `RunMode::Interpret`; no `-m` / `--mode`.
-pub fn parse_interpreter_cli() -> Result<AppConfig> {
+pub(crate) fn parse_interpreter_cli() -> std::result::Result<AppConfig, CliError> {
     let quiet = quiet_requested();
-    let mut args = match InterpreterArgs::try_parse() {
-        Ok(a) => a,
-        Err(e) => handle_clap_error(e, quiet),
-    };
+    let mut args = InterpreterArgs::try_parse().map_err(|err| CliError::Clap { err, quiet })?;
     if args.core.verbose == 0 {
         args.core.quiet = true;
     }
@@ -247,11 +249,8 @@ pub fn parse_interpreter_cli() -> Result<AppConfig> {
 }
 
 /// Fixed `RunMode::Compile`; no `-m` / `--mode` (and no `--interp-debug`).
-pub fn parse_compiler_cli() -> Result<AppConfig> {
+pub(crate) fn parse_compiler_cli() -> std::result::Result<AppConfig, CliError> {
     let quiet = quiet_requested();
-    let args = match CompilerArgs::try_parse() {
-        Ok(a) => a,
-        Err(e) => handle_clap_error(e, quiet),
-    };
+    let args = CompilerArgs::try_parse().map_err(|err| CliError::Clap { err, quiet })?;
     finish_config_with_target(args.core, RunMode::Compile, args.target, false)
 }

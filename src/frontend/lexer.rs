@@ -1,5 +1,5 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Token {
+pub(crate) enum Token {
     MoveRight,
     MoveLeft,
     Inc,
@@ -10,7 +10,7 @@ pub enum Token {
     LoopEnd,
 }
 
-pub fn lex(input: &str) -> Vec<Token> {
+pub(crate) fn lex(input: &str) -> Vec<Token> {
     input
         .chars()
         .filter_map(|ch| match ch {

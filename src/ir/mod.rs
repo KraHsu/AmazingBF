@@ -1,4 +1,6 @@
-pub mod hir;
-pub mod lir;
-pub mod lower;
-pub mod optimize;
+//! Intermediate representations and lowering / optimization passes.
+
+pub(crate) mod hir;
+pub(crate) mod lir;
+pub(crate) mod lower;
+pub(crate) mod optimize;

@@ -280,16 +280,10 @@ pub fn compile_lir_to_windows_program(lir: &LirProgram) -> WindowsProgram {
                 out.push(AsmInst::CmpMem8Imm8(Reg64::R13, 0));
                 out.push(AsmInst::Jnz(map_label(*id)));
             }
-            #[allow(unreachable_patterns)]
-            _ => panic!("unsupported LIR instruction in windows backend"),
         }
     }
 
-    emit_exit_process(
-        &mut out,
-        imports.iat_label(Kernel32Import::ExitProcess),
-        0,
-    );
+    emit_exit_process(&mut out, imports.iat_label(Kernel32Import::ExitProcess), 0);
     emit_ensure_tape_contains_r15(
         &mut out,
         ensure_tape_label,
@@ -299,11 +293,7 @@ pub fn compile_lir_to_windows_program(lir: &LirProgram) -> WindowsProgram {
         imports.iat_label(Kernel32Import::VirtualFree),
     );
     out.push(AsmInst::Label(exit_one_label));
-    emit_exit_process(
-        &mut out,
-        imports.iat_label(Kernel32Import::ExitProcess),
-        1,
-    );
+    emit_exit_process(&mut out, imports.iat_label(Kernel32Import::ExitProcess), 1);
     let public_imports = imports.clone().into_public();
     let import_desc_label = imports.desc_label;
     let import_dir_size = imports.import_dir_size();
@@ -385,23 +375,19 @@ pub fn compile_precomputed_stdout_program(data: &[u8]) -> WindowsProgram {
     out.push(AsmInst::MovRegReg(Reg64::Rcx, Reg64::Rdi));
     out.push(AsmInst::LeaRegLabel(Reg64::Rdx, stdout_bytes_label));
     out.push(AsmInst::MovRegImm64(Reg64::R8, data.len() as i64));
-    out.push(AsmInst::LeaRegMem(Reg64::R9, Reg64::Rsp, IO_COUNT_SLOT_DISP));
+    out.push(AsmInst::LeaRegMem(
+        Reg64::R9,
+        Reg64::Rsp,
+        IO_COUNT_SLOT_DISP,
+    ));
     out.push(AsmInst::CallMemLabel(
         imports.iat_label(Kernel32Import::WriteFile),
     ));
     out.push(AsmInst::CmpRegImm32(Reg64::Rax, 0));
     out.push(AsmInst::Jz(exit_one_label));
-    emit_exit_process(
-        &mut out,
-        imports.iat_label(Kernel32Import::ExitProcess),
-        0,
-    );
+    emit_exit_process(&mut out, imports.iat_label(Kernel32Import::ExitProcess), 0);
     out.push(AsmInst::Label(exit_one_label));
-    emit_exit_process(
-        &mut out,
-        imports.iat_label(Kernel32Import::ExitProcess),
-        1,
-    );
+    emit_exit_process(&mut out, imports.iat_label(Kernel32Import::ExitProcess), 1);
     out.push(AsmInst::Label(stdout_bytes_label));
     out.push(AsmInst::RawBytes(data.to_vec()));
     let public_imports = imports.clone().into_public();
@@ -497,7 +483,11 @@ fn emit_put_byte(out: &mut Vec<AsmInst>, write_file_iat: AsmLabel, exit_one_labe
     out.push(AsmInst::MovRegReg(Reg64::Rcx, Reg64::Rdi));
     out.push(AsmInst::MovRegReg(Reg64::Rdx, Reg64::R13));
     out.push(AsmInst::MovRegImm64(Reg64::R8, 1));
-    out.push(AsmInst::LeaRegMem(Reg64::R9, Reg64::Rsp, IO_COUNT_SLOT_DISP));
+    out.push(AsmInst::LeaRegMem(
+        Reg64::R9,
+        Reg64::Rsp,
+        IO_COUNT_SLOT_DISP,
+    ));
     out.push(AsmInst::CallMemLabel(write_file_iat));
     out.push(AsmInst::CmpRegImm32(Reg64::Rax, 0));
     out.push(AsmInst::Jz(exit_one_label));
@@ -517,7 +507,11 @@ fn emit_get_byte(
     out.push(AsmInst::MovRegReg(Reg64::Rcx, Reg64::Rsi));
     out.push(AsmInst::MovRegReg(Reg64::Rdx, Reg64::R13));
     out.push(AsmInst::MovRegImm64(Reg64::R8, 1));
-    out.push(AsmInst::LeaRegMem(Reg64::R9, Reg64::Rsp, IO_COUNT_SLOT_DISP));
+    out.push(AsmInst::LeaRegMem(
+        Reg64::R9,
+        Reg64::Rsp,
+        IO_COUNT_SLOT_DISP,
+    ));
     out.push(AsmInst::CallMemLabel(read_file_iat));
     out.push(AsmInst::CmpRegImm32(Reg64::Rax, 0));
     out.push(AsmInst::Jnz(read_ok));
@@ -528,7 +522,11 @@ fn emit_get_byte(
     out.push(AsmInst::Jz(eof));
     out.push(AsmInst::Jmp(exit_one_label));
     out.push(AsmInst::Label(read_ok));
-    out.push(AsmInst::MovRegMem64(Reg64::Rax, Reg64::Rsp, IO_COUNT_SLOT_DISP));
+    out.push(AsmInst::MovRegMem64(
+        Reg64::Rax,
+        Reg64::Rsp,
+        IO_COUNT_SLOT_DISP,
+    ));
     out.push(AsmInst::CmpRegImm32(Reg64::Rax, 0));
     out.push(AsmInst::Jnz(done));
     out.push(AsmInst::Label(eof));
@@ -551,8 +549,16 @@ fn emit_ensure_tape_contains_r15(
 ) {
     out.push(AsmInst::Label(ensure_tape_label));
     out.push(AsmInst::AddRegImm32(Reg64::Rsp, -CALLEE_STACK_FRAME_BYTES));
-    out.push(AsmInst::MovMemReg64(Reg64::Rsp, STACK_SAVED_RDI, Reg64::Rdi));
-    out.push(AsmInst::MovMemReg64(Reg64::Rsp, STACK_SAVED_RSI, Reg64::Rsi));
+    out.push(AsmInst::MovMemReg64(
+        Reg64::Rsp,
+        STACK_SAVED_RDI,
+        Reg64::Rdi,
+    ));
+    out.push(AsmInst::MovMemReg64(
+        Reg64::Rsp,
+        STACK_SAVED_RSI,
+        Reg64::Rsi,
+    ));
     out.push(AsmInst::MovRegReg(Reg64::R10, Reg64::R14));
     out.push(AsmInst::SubRegReg(Reg64::R10, Reg64::R12));
     out.push(AsmInst::MovRegReg(Reg64::R9, Reg64::R15));
@@ -569,7 +575,11 @@ fn emit_ensure_tape_contains_r15(
     out.push(AsmInst::Jl(grow_loop));
     out.push(AsmInst::CmpRegReg(Reg64::Rax, Reg64::R11));
     out.push(AsmInst::Jge(grow_loop));
-    out.push(AsmInst::MovMemReg64(Reg64::Rsp, STACK_SAVED_NEW_LEN, Reg64::R11));
+    out.push(AsmInst::MovMemReg64(
+        Reg64::Rsp,
+        STACK_SAVED_NEW_LEN,
+        Reg64::R11,
+    ));
     out.push(AsmInst::MovRegImm64(Reg64::Rcx, 0));
     out.push(AsmInst::MovRegReg(Reg64::Rdx, Reg64::R11));
     out.push(AsmInst::MovRegImm64(Reg64::R8, MEM_COMMIT_RESERVE));
@@ -581,7 +591,11 @@ fn emit_ensure_tape_contains_r15(
     out.push(AsmInst::SubRegReg(Reg64::R10, Reg64::R12));
     out.push(AsmInst::MovRegReg(Reg64::R9, Reg64::R15));
     out.push(AsmInst::SubRegReg(Reg64::R9, Reg64::R12));
-    out.push(AsmInst::MovRegMem64(Reg64::R11, Reg64::Rsp, STACK_SAVED_NEW_LEN));
+    out.push(AsmInst::MovRegMem64(
+        Reg64::R11,
+        Reg64::Rsp,
+        STACK_SAVED_NEW_LEN,
+    ));
     out.push(AsmInst::MovRegReg(Reg64::R8, Reg64::R11));
     out.push(AsmInst::SubRegReg(Reg64::R8, Reg64::R10));
     out.push(AsmInst::ShrRegImm8(Reg64::R8, 1));
@@ -592,13 +606,21 @@ fn emit_ensure_tape_contains_r15(
     out.push(AsmInst::MovRegReg(Reg64::Rcx, Reg64::R10));
     out.push(AsmInst::Cld);
     out.push(AsmInst::RepMovsb);
-    out.push(AsmInst::MovMemReg64(Reg64::Rsp, STACK_SAVED_NEW_BASE, Reg64::Rdx));
+    out.push(AsmInst::MovMemReg64(
+        Reg64::Rsp,
+        STACK_SAVED_NEW_BASE,
+        Reg64::Rdx,
+    ));
     out.push(AsmInst::MovMemReg64(
         Reg64::Rsp,
         STACK_SAVED_COPY_START,
         Reg64::R8,
     ));
-    out.push(AsmInst::MovMemReg64(Reg64::Rsp, STACK_SAVED_NEW_LEN, Reg64::R11));
+    out.push(AsmInst::MovMemReg64(
+        Reg64::Rsp,
+        STACK_SAVED_NEW_LEN,
+        Reg64::R11,
+    ));
     out.push(AsmInst::MovMemReg64(
         Reg64::Rsp,
         STACK_SAVED_DESIRED_OFFSET,
@@ -636,8 +658,16 @@ fn emit_ensure_tape_contains_r15(
     out.push(AsmInst::AddRegReg(Reg64::R13, Reg64::R9));
     out.push(AsmInst::MovRegReg(Reg64::R14, Reg64::Rdx));
     out.push(AsmInst::AddRegReg(Reg64::R14, Reg64::R11));
-    out.push(AsmInst::MovRegMem64(Reg64::Rdi, Reg64::Rsp, STACK_SAVED_RDI));
-    out.push(AsmInst::MovRegMem64(Reg64::Rsi, Reg64::Rsp, STACK_SAVED_RSI));
+    out.push(AsmInst::MovRegMem64(
+        Reg64::Rdi,
+        Reg64::Rsp,
+        STACK_SAVED_RDI,
+    ));
+    out.push(AsmInst::MovRegMem64(
+        Reg64::Rsi,
+        Reg64::Rsp,
+        STACK_SAVED_RSI,
+    ));
     out.push(AsmInst::AddRegImm32(Reg64::Rsp, CALLEE_STACK_FRAME_BYTES));
     out.push(AsmInst::Ret);
 }

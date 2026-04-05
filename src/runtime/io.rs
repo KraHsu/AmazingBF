@@ -4,23 +4,23 @@ use thiserror::Error;
 const EOF_BYTE: u8 = 255;
 
 #[derive(Debug, Error)]
-pub enum IoError {
+pub(crate) enum IoError {
     #[error("read error: {0}")]
     ReadError(String),
     #[error("write error: {0}")]
     WriteError(String),
 }
 
-/// Runtime io abs
-pub trait RuntimeIo {
+/// Byte-oriented runtime IO used by the interpreter and compile-time folds.
+pub(crate) trait RuntimeIo {
     fn put_byte(&mut self, byte: u8) -> Result<(), IoError>;
     fn get_byte(&mut self) -> Result<u8, IoError>;
 }
 
-pub struct StdIo;
+pub(crate) struct StdIo;
 
 impl StdIo {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self
     }
 }
@@ -49,8 +49,8 @@ impl RuntimeIo for StdIo {
 
 /// Collects `PutByte` output into memory. `get_byte` returns EOF (255) like stdin EOF.
 #[derive(Debug, Default)]
-pub struct BufferOutputIo {
-    pub bytes: Vec<u8>,
+pub(crate) struct BufferOutputIo {
+    pub(crate) bytes: Vec<u8>,
 }
 
 impl RuntimeIo for BufferOutputIo {

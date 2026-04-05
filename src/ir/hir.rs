@@ -2,7 +2,7 @@
 ///
 /// Only a minimal instruction set for now.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum HirInst {
+pub(crate) enum HirInst {
     /// Moves the data pointer. Positive values move it to the right,
     /// while negative values move it to the left.
     Move(isize),
@@ -32,8 +32,8 @@ pub enum HirInst {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HirProgram {
-    pub insts: Vec<HirInst>,
+pub(crate) struct HirProgram {
+    pub(crate) insts: Vec<HirInst>,
 }
 
 fn block_has_put_byte(insts: &[HirInst]) -> bool {
@@ -68,12 +68,12 @@ fn block_has_get_byte(insts: &[HirInst]) -> bool {
 
 impl HirProgram {
     /// True if the program contains at least one `.` (possibly nested in a loop).
-    pub fn has_put_byte(&self) -> bool {
+    pub(crate) fn has_put_byte(&self) -> bool {
         block_has_put_byte(&self.insts)
     }
 
     /// True if the program contains at least one `,` (possibly nested in a loop).
-    pub fn has_get_byte(&self) -> bool {
+    pub(crate) fn has_get_byte(&self) -> bool {
         block_has_get_byte(&self.insts)
     }
 }

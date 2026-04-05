@@ -1,19 +1,13 @@
-//! # x86_64 后端模块 (x86_64/mod.rs)
+//! x86_64 native backend entry points.
 //!
-//! 本模块是 x86_64 目标平台的入口，包含：
-//! - `elf`: ELF64 可执行文件生成器
-//! - `encode`: x86_64 机器码编码器
-//! - `debug`: 调试输出工具（汇编 listing + hex dump）
-//! - `pe`: PE32+ 可执行文件生成器
-//! - `windows`: x86_64 Windows 代码生成辅助
-//!
-//! 提供 `compile_asm_to_elf` 作为后端落地入口，
-//! 将汇编 IR 编译到目标平台可执行文件。
+//! `compile` mode reaches this module after HIR has been lowered to LIR and then to
+//! backend assembly IR. The Linux path packages machine code as ELF64, while the
+//! Windows path packages machine code plus import tables as PE32+.
 
-pub mod elf;
-pub mod encode;
-pub mod pe;
-pub mod windows;
+pub(crate) mod elf;
+pub(crate) mod encode;
+pub(crate) mod pe;
+pub(crate) mod windows;
 
 /// 调试输出模块。
 ///
@@ -31,14 +25,14 @@ pub mod windows;
 /// // 输出 hex listing 到文件
 /// std::fs::write("hello_bf.lst", debug::dump_hex_listing(&asm))?;
 /// ```
-pub mod debug;
+pub(crate) mod debug;
 
 use crate::backend::asm::AsmProgram;
 use tracing::debug;
 
-/// 将汇编 IR 编译为 ELF64 可执行文件。
+/// Compile backend assembly IR into a Linux ELF64 executable.
 ///
-/// 这是 x86_64 后端的顶层入口，串联了编译流水线的最后几步：
+/// This is the Linux x86_64 backend entry point for the final stages:
 ///
 /// ```text
 /// AsmProgram
@@ -47,10 +41,10 @@ use tracing::debug;
 /// ```
 ///
 /// # 参数
-/// - `asm`: 要编码的汇编程序
+/// - `asm`: assembly program to encode
 ///
 /// # 返回值
-/// 完整的 ELF 文件内容，可写入磁盘并执行
+/// Full ELF file bytes ready to write to disk.
 pub fn compile_asm_to_elf(asm: &AsmProgram) -> Vec<u8> {
     let encoded = encode::encode_program(asm);
     debug!(
@@ -62,6 +56,7 @@ pub fn compile_asm_to_elf(asm: &AsmProgram) -> Vec<u8> {
     elf::build_elf_executable(&encoded)
 }
 
+/// Compile a Windows-specific backend program into a PE32+ executable.
 pub fn compile_windows_program_to_pe(program: &windows::WindowsProgram) -> Vec<u8> {
     let (mut encoded, labels) = encode::encode_program_with_labels(&program.asm);
     debug!(
@@ -80,7 +75,11 @@ pub fn compile_windows_program_to_pe(program: &windows::WindowsProgram) -> Vec<u
         0x1000 + u32::try_from(label_offset(label)).expect("label offset exceeded u32")
     };
 
-    patch_u32(&mut encoded.text, label_offset(program.import_desc_label), label_rva(program.imports[0].ilt_entry_label));
+    patch_u32(
+        &mut encoded.text,
+        label_offset(program.import_desc_label),
+        label_rva(program.imports[0].ilt_entry_label),
+    );
     patch_u32(
         &mut encoded.text,
         label_offset(program.import_desc_label) + 12,

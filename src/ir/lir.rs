@@ -1,17 +1,17 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct LabelId(pub u32);
+pub(crate) struct LabelId(pub(crate) u32);
 
 #[derive(Debug, Default)]
-pub struct LabelGen {
+pub(crate) struct LabelGen {
     next: u32,
 }
 
 impl LabelGen {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self { next: 0 }
     }
 
-    pub fn fresh(&mut self) -> LabelId {
+    pub(crate) fn fresh(&mut self) -> LabelId {
         let id = LabelId(self.next);
         self.next += 1;
         id
@@ -20,7 +20,7 @@ impl LabelGen {
 
 /// LIR: Low-level IR
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum LirInst {
+pub(crate) enum LirInst {
     /// data pointer += n
     PtrAdd(isize),
 
@@ -53,12 +53,12 @@ pub enum LirInst {
 }
 
 #[derive(Debug, Clone, Default)]
-pub struct LirProgram {
-    pub insts: Vec<LirInst>,
+pub(crate) struct LirProgram {
+    pub(crate) insts: Vec<LirInst>,
 }
 
 impl LirProgram {
-    pub fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.insts.len()
     }
 }

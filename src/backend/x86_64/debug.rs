@@ -87,7 +87,7 @@ fn label_name(label: AsmLabel) -> String {
         INTERNAL_LABEL_GROW_LOOP_RAW => "__grow_loop".to_string(),
         // 固定语义的内部标签已经在上面单独匹配。
         // 剩余高位编号视为临时内部标签。
-        raw if raw >= 0xFFFF_0000 && raw < INTERNAL_LABEL_RESERVED_MIN_RAW => {
+        raw if (0xFFFF_0000..INTERNAL_LABEL_RESERVED_MIN_RAW).contains(&raw) => {
             format!("__internal_{:08x}", raw)
         }
         // 普通用户标签（来自 LIR 的 LabelId）
@@ -231,7 +231,13 @@ fn format_inst_asm(out: &mut String, inst: &AsmInst) {
         }
 
         AsmInst::LeaRegLabel(dst, label) => {
-            writeln!(out, "    lea     {}, [rel {}]", reg_name(*dst), label_name(*label)).unwrap();
+            writeln!(
+                out,
+                "    lea     {}, [rel {}]",
+                reg_name(*dst),
+                label_name(*label)
+            )
+            .unwrap();
         }
 
         AsmInst::MovMemReg64(base, disp, src) => {
@@ -412,7 +418,7 @@ pub fn dump_hex_listing(program: &AsmProgram) -> String {
     )
     .unwrap();
     writeln!(out).unwrap();
-    writeln!(out, "{:<9} {:<44} {}", "Offset", "Hex", "Assembly").unwrap();
+    writeln!(out, "{:<9} {:<44} Assembly", "Offset", "Hex").unwrap();
     writeln!(
         out,
         "{} {} {}",

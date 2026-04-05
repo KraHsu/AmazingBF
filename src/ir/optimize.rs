@@ -1,9 +1,16 @@
 use std::collections::BTreeMap;
 
 use crate::ir::hir::{HirInst, HirProgram};
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+pub(crate) enum OptimizeError {
+    #[error("optimization did not converge within {max_iters} iterations")]
+    DidNotConverge { max_iters: usize },
+}
 
 /// Baseline HIR cleanup: fuse consecutive `Add` / `Move` (single forward pass per block).
-pub fn optimize_o0(program: HirProgram) -> HirProgram {
+pub(crate) fn optimize_o0(program: HirProgram) -> HirProgram {
     HirProgram {
         insts: optimize_block_o0(program.insts),
     }
@@ -11,24 +18,31 @@ pub fn optimize_o0(program: HirProgram) -> HirProgram {
 
 /// `-O1`: single pass over each block — fusion, affine / scan / clear loops, peephole on `Zero`,
 /// constant propagation for dead empty-loop removal, and local `Zero`/`Add` simplification.
-pub fn optimize_o1(program: HirProgram) -> HirProgram {
+pub(crate) fn optimize_o1(program: HirProgram) -> HirProgram {
     HirProgram {
         insts: optimize_block_o1(program.insts),
     }
 }
 
 /// `-O2`: repeat the `-O1` pipeline until the HIR reaches a fixed point (no further changes).
-pub fn optimize_o2(program: HirProgram) -> HirProgram {
+#[cfg(test)]
+pub(crate) fn optimize_o2(program: HirProgram) -> HirProgram {
+    try_optimize_o2(program).expect("optimize_o2: fixed-point optimization should converge")
+}
+
+pub(crate) fn try_optimize_o2(program: HirProgram) -> Result<HirProgram, OptimizeError> {
     const MAX_ITERS: usize = 4096;
     let mut current = program;
     for _ in 0..MAX_ITERS {
         let next = optimize_o1(current.clone());
         if next == current {
-            return next;
+            return Ok(next);
         }
         current = next;
     }
-    panic!("optimize_o2: did not converge within {MAX_ITERS} iterations");
+    Err(OptimizeError::DidNotConverge {
+        max_iters: MAX_ITERS,
+    })
 }
 
 fn optimize_block_o0(insts: Vec<HirInst>) -> Vec<HirInst> {
@@ -121,10 +135,7 @@ fn try_linear_loop(body: &[HirInst]) -> Option<Vec<(isize, i32)>> {
         return None;
     }
 
-    let mut factors: Vec<(isize, i32)> = delta
-        .into_iter()
-        .filter(|(off, _)| *off != 0)
-        .collect();
+    let mut factors: Vec<(isize, i32)> = delta.into_iter().filter(|(off, _)| *off != 0).collect();
     factors.sort_by_key(|(o, _)| *o);
     Some(factors)
 }
