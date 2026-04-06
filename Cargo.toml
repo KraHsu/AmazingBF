@@ -1,6 +1,6 @@
 [package]
 name = "AmazingBF"
-version = "0.3.0"
+version = "0.3.0+10code"
 edition = "2024"
 rust-version = "1.94"
 description = "A Brainfuck interpreter and native x86_64 compiler with HIR/LIR pipeline stages."
