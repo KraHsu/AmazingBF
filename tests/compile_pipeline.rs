@@ -10,8 +10,9 @@ use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::process::{Command, Output, Stdio};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const CASES_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/cases");
 /// Repetitions per (case × `-O` level) for timing statistics.
@@ -132,15 +133,14 @@ fn mean_min_max(vals: &[f64]) -> (f64, f64, f64) {
     (mean, min, max)
 }
 
-/// Run `AmazingBF compile` and panic with stderr on failure (useful when the child panics or returns `Err`).
-fn assert_amazingbf_compile_ok(
+/// Run `AmazingBF compile` once (`-q` keeps huge-case logs off during the benchmark loop).
+fn amazingbf_compile_output(
     amazingbf: &Path,
     bf_file: &Path,
     flag: &str,
     output_path: &Path,
-    case_name: &str,
-) {
-    let out = Command::new(amazingbf)
+) -> Output {
+    Command::new(amazingbf)
         .arg("-q")
         .arg(bf_file)
         .arg("-m")
@@ -151,10 +151,40 @@ fn assert_amazingbf_compile_ok(
         .arg(output_path)
         .stdin(Stdio::null())
         .output()
-        .unwrap_or_else(|e| panic!("failed to spawn AmazingBF: {e}"));
+        .unwrap_or_else(|e| panic!("failed to spawn AmazingBF: {e}"))
+}
+
+/// Large PE writes right after multi‑GB compiler work occasionally fail on Windows (AV indexing,
+/// transient `ERROR_SHARING_VIOLATION`). One short retry makes the ignored benchmark less flaky.
+fn amazingbf_compile_output_resilient(
+    amazingbf: &Path,
+    bf_file: &Path,
+    flag: &str,
+    output_path: &Path,
+) -> Output {
+    let out = amazingbf_compile_output(amazingbf, bf_file, flag, output_path);
+    #[cfg(target_os = "windows")]
+    if !out.status.success() {
+        thread::sleep(Duration::from_millis(200));
+        return amazingbf_compile_output(amazingbf, bf_file, flag, output_path);
+    }
+    out
+}
+
+/// Run `AmazingBF compile` and panic with diagnostics on failure.
+fn assert_amazingbf_compile_ok(
+    amazingbf: &Path,
+    bf_file: &Path,
+    flag: &str,
+    output_path: &Path,
+    case_name: &str,
+) {
+    let out = amazingbf_compile_output_resilient(amazingbf, bf_file, flag, output_path);
     assert!(
         out.status.success(),
-        "compile failed case {case_name} -O{flag}\nstderr:\n{}",
+        "compile failed case {case_name} -O{flag}\nexit code: {:?}\nstdout:\n{}\nstderr:\n{}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
 }
