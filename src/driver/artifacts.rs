@@ -3,8 +3,9 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
-use tracing::info;
+use crate::error::Result;
+use crate::error::io_err;
+use crate::logging::log_info;
 
 use crate::driver::config::CompileTarget;
 
@@ -34,15 +35,13 @@ pub(crate) fn compile_executable_output_path(target: CompileTarget, output: &Pat
 
 pub(crate) fn write_artifact(path: impl AsRef<Path>, contents: String) -> Result<()> {
     let path = path.as_ref();
-    fs::write(path, contents)
-        .with_context(|| format!("failed to write debug artifact {}", path.display()))?;
-    info!(artifact = %path.display(), "wrote debug artifact");
+    fs::write(path, contents).map_err(|e| io_err(path, "write", e))?;
+    log_info(format!("wrote debug artifact {}", path.display()));
     Ok(())
 }
 
 pub(crate) fn write_executable(path: &Path, bytes: &[u8]) -> Result<()> {
-    fs::write(path, bytes)
-        .with_context(|| format!("failed to write executable to {}", path.display()))?;
+    fs::write(path, bytes).map_err(|e| io_err(path, "write executable to", e))?;
     set_executable_permissions(path)?;
     Ok(())
 }
@@ -52,11 +51,11 @@ fn set_executable_permissions(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
     let mut perms = fs::metadata(path)
-        .with_context(|| format!("failed to read metadata for {}", path.display()))?
+        .map_err(|e| io_err(path, "read metadata for", e))?
         .permissions();
     perms.set_mode(0o755);
     fs::set_permissions(path, perms)
-        .with_context(|| format!("failed to set executable permissions on {}", path.display()))?;
+        .map_err(|e| io_err(path, "set executable permissions on", e))?;
     Ok(())
 }
 

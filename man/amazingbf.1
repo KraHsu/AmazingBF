@@ -111,22 +111,8 @@ bf\-interpreter tests/cases/1.bf
 bf\-compiler \-o ./hello_bf tests/cases/1.bf
 .fi
 .SH ENVIRONMENT
-.TP
-.B RUST_LOG
-If set to a single level token (\fBerror\fR, \fBwarn\fR, \fBinfo\fR, \fBdebug\fR, \fBtrace\fR, \fBoff\fR), applies that level globally. Values containing `\fB=\fR` or `\fB,\fR` are ignored (no per-module filter strings).
-.TP
-.B AMAZINGBF_LOG_FORMAT
-Set to
-.B json
-for JSON logs (only when the binary was built with Cargo feature
-.BR json-logs ).
-.TP
-.B AMAZINGBF_LOG_JSON
-If set to
-.BR 1 ,
-enables JSON log format (compatibility switch; same
-.B json-logs
-build requirement).
+AmazingBF does not read logging-related environment variables; verbosity is controlled only by
+.BR \-q ", " \-v ", " \-vv ", " and \-vvv .
 .SH SEE ALSO
 Project README and
 .B cargo run \-\- \-\-help

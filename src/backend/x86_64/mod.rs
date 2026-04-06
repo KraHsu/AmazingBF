@@ -28,7 +28,7 @@ pub(crate) mod windows;
 pub(crate) mod debug;
 
 use crate::backend::asm::AsmProgram;
-use tracing::debug;
+use crate::logging::log_debug;
 
 /// Compile backend assembly IR into a Linux ELF64 executable.
 ///
@@ -47,24 +47,22 @@ use tracing::debug;
 /// Full ELF file bytes ready to write to disk.
 pub fn compile_asm_to_elf(asm: &AsmProgram) -> Vec<u8> {
     let encoded = encode::encode_program(asm);
-    debug!(
-        target: "AmazingBF::backend::x86_64",
-        asm_insts = asm.insts.len(),
-        text_bytes = encoded.text.len(),
-        "encoded x86_64 machine code"
-    );
+    log_debug(format!(
+        "encoded x86_64 machine code (asm_insts={} text_bytes={})",
+        asm.insts.len(),
+        encoded.text.len()
+    ));
     elf::build_elf_executable(&encoded)
 }
 
 /// Compile a Windows-specific backend program into a PE32+ executable.
 pub fn compile_windows_program_to_pe(program: &windows::WindowsProgram) -> Vec<u8> {
     let (mut encoded, labels) = encode::encode_program_with_labels(&program.asm);
-    debug!(
-        target: "AmazingBF::backend::x86_64",
-        asm_insts = program.asm.insts.len(),
-        text_bytes = encoded.text.len(),
-        "encoded x86_64 windows machine code"
-    );
+    log_debug(format!(
+        "encoded x86_64 windows machine code (asm_insts={} text_bytes={})",
+        program.asm.insts.len(),
+        encoded.text.len()
+    ));
 
     let label_offset = |label| -> usize {
         *labels

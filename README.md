@@ -23,7 +23,7 @@ The latter two are **specifically designed for ten-line code benchmarks**, and b
 * Layered intermediate representations: `HIR -> optimize -> LIR`
 * Interpreter executes based on `HIR`
 * Native backend generates `Linux ELF` or `Windows PE64`, and outputs `.asm` / `.lst` debug files with the same basename as the target
-* Structured logging via `tracing`, with support for `RUST_LOG` overrides; JSON log lines require building with `--features json-logs`
+* Optional stderr progress text via `-q` / `-v` flags only (no `tracing` or extra logging crates)
 
 ---
 
@@ -43,7 +43,7 @@ The latter two are **specifically designed for ten-line code benchmarks**, and b
 cargo build --release
 ```
 
-The release profile in `Cargo.toml` favors a smaller binary (`opt-level = "z"`, LTO, `strip`, `panic = "abort"`). To restore JSON stderr logging (pulls in `serde_json`), use `cargo build --release --features json-logs`.
+The release profile in `Cargo.toml` favors a smaller binary (`opt-level = "z"`, LTO, `strip`, `panic = "abort"`). Runtime dependencies are empty beyond `std`.
 
 ---
 
@@ -132,15 +132,13 @@ A man page source is included:
 
 ### Logging
 
-* Default: human-readable terminal output
-* `-v/-vv/-vvv`: increase verbosity
-* `-q`: silence logs
+Pipeline messages go to **stderr** as plain text:
 
-Environment variables:
+* Default: short progress lines (e.g. start/finish, compile summary)
+* `-v` / `-vv` / `-vvv`: add more detailed diagnostics
+* `-q`: silence those messages (errors from the program under interpretation still use normal stdin/stdout)
 
-* `RUST_LOG`: optional global override when set to a single level token (`error`, `warn`, `info`, `debug`, `trace`, `off`); strings with `=` or `,` are ignored (no per-module `env-filter` syntax in release builds)
-* `AMAZINGBF_LOG_FORMAT=json`: enable JSON logging (only if built with `--features json-logs`)
-* `AMAZINGBF_LOG_JSON=1`: compatibility switch (same build requirement)
+There are no `RUST_LOG`-style environment overrides.
 
 ---
 
@@ -179,6 +177,8 @@ src/
   bin/bf-compiler.rs
   cli.rs
   app.rs
+  logging.rs
+  error.rs
   driver/
   frontend/
   ir/
@@ -197,7 +197,7 @@ tests/
 * `main.rs`: default entry → calls `AmazingBF::run_amazingbf()`
 * `app.rs`: CLI parsing, logging init, driver dispatch
 * `cli.rs`: minimal argv parser (no `clap`); converts flags into `DriverConfig`
-* `driver/logging.rs`: tracing setup; JSON format when crate feature `json-logs` is enabled
+* `logging.rs`: verbosity level from CLI; `log_info` / `log_debug` use `eprintln!`
 * `driver/run.rs`: mode dispatch and output handling
 * `interp/engine.rs`: HIR interpreter
 * `backend/codegen.rs`: LIR → assembly IR
@@ -243,7 +243,85 @@ Test categories:
 
 ---
 
-Development workflow and conventions are described in `CONTRIBUTING.md`.
+## Appendix
+
+### Sample `.lst` excerpt (`tests/cases/1.bf`, `-O3`, `x86_64-linux`)
+
+At **O3**, programs with `.` but no `,` may be folded into a minimal `write` + `exit` binary. Below is a representative fragment from the generated `.lst` (formatting may vary slightly by toolchain version).
+
+```text
+; === Brainfuck x86_64 Hex Listing ===
+; 1 instruction(s), 130 bytes encoded
+
+Offset    Hex                                          Assembly
+--------- -------------------------------------------- ----------------------------------------
+0x0000:   48 83 ec 10                                  sub rsp, 0x10                ; 16-byte stack buffer
+          c6 44 24 00 48                               mov byte ptr [rsp+0x00],0x48 ; 'H'
+          c6 44 24 01 65                               mov byte ptr [rsp+0x01],0x65 ; 'e'
+          c6 44 24 02 6c                               mov byte ptr [rsp+0x02],0x6c ; 'l'
+          c6 44 24 03 6c                               mov byte ptr [rsp+0x03],0x6c ; 'l'
+          c6 44 24 04 6f                               mov byte ptr [rsp+0x04],0x6f ; 'o'
+          c6 44 24 05 20                               mov byte ptr [rsp+0x05],0x20 ; ' '
+          c6 44 24 06 57                               mov byte ptr [rsp+0x06],0x57 ; 'W'
+          c6 44 24 07 6f                               mov byte ptr [rsp+0x07],0x6f ; 'o'
+          c6 44 24 08 72                               mov byte ptr [rsp+0x08],0x72 ; 'r'
+          c6 44 24 09 6c                               mov byte ptr [rsp+0x09],0x6c ; 'l'
+          c6 44 24 0a 64                               mov byte ptr [rsp+0x0a],0x64 ; 'd'
+          c6 44 24 0b 21                               mov byte ptr [rsp+0x0b],0x21 ; '!'
+          c6 44 24 0c 0a                               mov byte ptr [rsp+0x0c],0x0a ; '\n'
+
+          48 b8 01 00 00 00 00 00 00 00                mov rax, 1                   ; sys_write
+          48 bf 01 00 00 00 00 00 00 00                mov rdi, 1                   ; stdout
+          48 89 e6                                     mov rsi, rsp                 ; buffer
+          48 ba 0d 00 00 00 00 00 00 00                mov rdx, 13                  ; length
+          0f 05                                        syscall
+
+          48 83 c4 10                                  add rsp, 0x10
+          48 b8 3c 00 00 00 00 00 00 00                mov rax, 60                  ; sys_exit
+          48 bf 00 00 00 00 00 00 00 00                mov rdi, 0                   ; status
+          0f 05                                        syscall
+
+; total 130 bytes machine code
+```
+
+### Reference timings (`compile_pipeline`, 9 cases)
+
+Each table is the **sum of per-case mean times** in milliseconds (compile time rises with optimization; run time usually drops). Recorded on an Intel Core i9-14900K; treat as indicative only.
+
+**Linux (`x86_64-linux`):**
+
+```text
+=== TOTALS (sum of per-case mean times over 9 cases) ===
+lvl      sum_compile_mean_ms        sum_run_mean_ms
+O0                  3429.332                918.855
+O1                  3484.395                 88.178
+O2                  3799.838                 87.838
+O3                  3809.176                 85.724
+ALL_O              14522.741               1180.596
+```
+
+**Windows (`x86_64-windows`):**
+
+```text
+=== TOTALS (sum of per-case mean times over 9 cases) ===
+lvl      sum_compile_mean_ms        sum_run_mean_ms
+O0                  4652.539               1403.737
+O1                  4711.792                197.599
+O2                  5098.319                202.331
+O3                  5068.148                196.842
+ALL_O              19530.798               2000.509
+```
+
+Approximate reproduction:
+
+```bash
+cargo test --test compile_pipeline -- --ignored --nocapture
+```
+
+---
+
+Development workflow and conventions are described in `CONTRIBUTING.md` ([简体中文](./docs/CONTRIBUTING_CN.md)).
+
 CI runs:
 
 ```bash

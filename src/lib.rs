@@ -6,16 +6,18 @@
 
 #![allow(non_snake_case)] // package name `AmazingBF` is intentional for branding
 
-use anyhow::Result;
-
 mod app;
 mod backend;
 mod cli;
 mod driver;
+pub mod error;
 mod frontend;
 mod interp;
 mod ir;
+mod logging;
 mod runtime;
+
+pub use error::{Error, Result};
 
 /// Default `AmazingBF` binary: full CLI including `-m` / `--mode`.
 pub fn run_amazingbf() -> Result<()> {

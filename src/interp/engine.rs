@@ -3,19 +3,38 @@ use crate::runtime::host::HostRuntime;
 use crate::runtime::io::{IoError, RuntimeIo};
 use crate::runtime::tape::{Tape, TapeError};
 
-use thiserror::Error;
-
-#[derive(Debug, Error)]
-pub(crate) enum RuntimeError {
-    #[error("tape error: {0}")]
-    Tape(#[from] TapeError),
-
-    #[error("io error: {0}")]
+#[derive(Debug)]
+pub enum RuntimeError {
+    Tape(TapeError),
     Io(String),
-
-    #[error("host error: {0}")]
-    #[allow(dead_code)] // constructed when host calls are implemented
+    /// Reserved for future host-call support in the interpreter.
+    #[allow(dead_code)]
     Host(String),
+}
+
+impl std::fmt::Display for RuntimeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RuntimeError::Tape(e) => write!(f, "tape error: {e}"),
+            RuntimeError::Io(msg) => write!(f, "io error: {msg}"),
+            RuntimeError::Host(msg) => write!(f, "host error: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for RuntimeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            RuntimeError::Tape(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+impl From<TapeError> for RuntimeError {
+    fn from(value: TapeError) -> Self {
+        RuntimeError::Tape(value)
+    }
 }
 
 impl From<IoError> for RuntimeError {

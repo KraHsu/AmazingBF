@@ -1,10 +1,8 @@
 use crate::driver::config::{CompileTarget, DriverConfig, OptLevel, RunMode};
 
-use anyhow::Result;
 use std::ffi::{OsStr, OsString};
 use std::io::Read;
 use std::path::PathBuf;
-use thiserror::Error;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -89,25 +87,47 @@ pub(crate) struct AppConfig {
     pub(crate) log_level: u8,
 }
 
-#[derive(Debug, Error)]
+#[derive(Debug)]
 pub(crate) enum CliError {
-    #[error("help")]
     Help(BinKind),
-    #[error("version")]
     Version(BinKind),
-    #[error("{message}")]
     Usage {
         message: String,
         quiet: bool,
     },
-    #[error("{message}")]
     Message {
         message: String,
         quiet: bool,
         exit_code: i32,
     },
-    #[error(transparent)]
-    Other(#[from] anyhow::Error),
+    Io {
+        path: String,
+        source: std::io::Error,
+    },
+}
+
+impl std::fmt::Display for CliError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CliError::Help(_) => f.write_str("help"),
+            CliError::Version(_) => f.write_str("version"),
+            CliError::Usage { message, .. } | CliError::Message { message, .. } => {
+                f.write_str(message)
+            }
+            CliError::Io { path, source } => {
+                write!(f, "错误: 无法读取源 `{path}`: {source}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for CliError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            CliError::Io { source, .. } => Some(source),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -139,13 +159,21 @@ fn is_positional(arg: &OsStr) -> bool {
     !s.starts_with('-')
 }
 
-fn load_source(input: &PathBuf) -> Result<String> {
+fn load_source(input: &PathBuf) -> std::result::Result<String, CliError> {
     if input.as_os_str() == "-" {
         let mut buf = String::new();
-        std::io::stdin().read_to_string(&mut buf)?;
+        std::io::stdin()
+            .read_to_string(&mut buf)
+            .map_err(|source| CliError::Io {
+                path: "-".to_string(),
+                source,
+            })?;
         Ok(buf)
     } else {
-        Ok(std::fs::read_to_string(input)?)
+        std::fs::read_to_string(input).map_err(|source| CliError::Io {
+            path: input.display().to_string(),
+            source,
+        })
     }
 }
 
@@ -170,22 +198,23 @@ fn finish_from_partial(
 ) -> std::result::Result<AppConfig, CliError> {
     let (mode, target, interp_debug) = match flavor {
         Flavor::Full => (core.mode, core.target, core.interp_debug),
-        Flavor::Interpreter => (RunMode::Interpret, CompileTarget::build_default(), core.interp_debug),
+        Flavor::Interpreter => (
+            RunMode::Interpret,
+            CompileTarget::build_default(),
+            core.interp_debug,
+        ),
         Flavor::Compiler => (RunMode::Compile, core.target, false),
     };
 
     validate_log_level(core.verbose, core.quiet)?;
-    let input = core
-        .input
-        .ok_or_else(|| CliError::Usage {
-            message: "错误: 缺少输入文件（或使用 `-` 表示标准输入）".to_string(),
-            quiet: core.quiet,
-        })?;
+    let input = core.input.ok_or_else(|| CliError::Usage {
+        message: "错误: 缺少输入文件（或使用 `-` 表示标准输入）".to_string(),
+        quiet: core.quiet,
+    })?;
     let source = load_source(&input)?;
 
     Ok(AppConfig {
         driver_cfg: DriverConfig {
-            input,
             source,
             mode,
             target,
@@ -531,7 +560,9 @@ pub(crate) fn print_help(kind: BinKind) {
             eprintln!("{INTERP_AFTER_HELP}");
         }
         BinKind::Compiler => {
-            eprintln!("{title} {VERSION}\nBrainfuck → x86_64 原生编译器\n\n{COMPILER_LONG_ABOUT}\n");
+            eprintln!(
+                "{title} {VERSION}\nBrainfuck → x86_64 原生编译器\n\n{COMPILER_LONG_ABOUT}\n"
+            );
             eprintln!(
                 "用法:\n  {title} [选项] <FILE>\n\n\
                  参数:\n  <FILE>  Brainfuck 源文件路径；`-` 表示从标准输入读取\n\n\

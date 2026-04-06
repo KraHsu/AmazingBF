@@ -1,10 +1,9 @@
 //! Binary startup glue: convert CLI parsing outcomes into process behavior, then run the driver.
 
-use anyhow::Result;
-
+use crate::Result;
 use crate::cli::{self, CliError};
 
-type ParseFn = fn() -> Result<cli::AppConfig, CliError>;
+type ParseFn = fn() -> std::result::Result<cli::AppConfig, CliError>;
 
 pub(crate) fn run_with_parse(parse: ParseFn) -> Result<()> {
     let config = match parse() {
@@ -33,9 +32,12 @@ pub(crate) fn run_with_parse(parse: ParseFn) -> Result<()> {
             }
             std::process::exit(exit_code);
         }
-        Err(CliError::Other(err)) => return Err(err),
+        Err(CliError::Io { path, source }) => {
+            eprintln!("错误: 无法读取源 `{path}`: {source}");
+            std::process::exit(1);
+        }
     };
 
-    crate::driver::logging::init_logger(config.log_level)?;
+    crate::logging::init_logger(config.log_level)?;
     crate::driver::run::run(config.driver_cfg)
 }

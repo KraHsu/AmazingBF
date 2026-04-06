@@ -1,15 +1,23 @@
 use std::io::{Read, Write};
-use thiserror::Error;
 
 const EOF_BYTE: u8 = 255;
 
-#[derive(Debug, Error)]
+#[derive(Debug)]
 pub(crate) enum IoError {
-    #[error("read error: {0}")]
     ReadError(String),
-    #[error("write error: {0}")]
     WriteError(String),
 }
+
+impl std::fmt::Display for IoError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            IoError::ReadError(msg) => write!(f, "read error: {msg}"),
+            IoError::WriteError(msg) => write!(f, "write error: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for IoError {}
 
 /// Byte-oriented runtime IO used by the interpreter and compile-time folds.
 pub(crate) trait RuntimeIo {

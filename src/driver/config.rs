@@ -4,7 +4,6 @@ pub(crate) const DEFAULT_INTERPRETER_TAPE_LEN: usize = 30_000;
 
 #[derive(Debug, Clone)]
 pub(crate) struct DriverConfig {
-    pub(crate) input: PathBuf,
     pub(crate) source: String,
     pub(crate) mode: RunMode,
     pub(crate) target: CompileTarget,

@@ -1,5 +1,3 @@
-use anyhow::Result;
-
-fn main() -> Result<()> {
+fn main() -> AmazingBF::Result<()> {
     AmazingBF::run_amazingbf()
 }

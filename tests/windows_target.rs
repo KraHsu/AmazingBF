@@ -97,6 +97,9 @@ fn compile_windows_target_emits_pe_artifacts_and_imports_kernel32() {
         .arg(&source_path)
         .arg("-m")
         .arg("compile")
+        // Default -O3 folds stdin-less programs to a tiny import set (no VirtualAlloc); use -O0
+        // so this test exercises the full Windows LIR backend and kernel32 import table.
+        .arg("-O0")
         .arg("--target")
         .arg("x86_64-windows")
         .arg("-o")

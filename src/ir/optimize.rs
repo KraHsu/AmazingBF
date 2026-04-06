@@ -1,13 +1,24 @@
 use std::collections::BTreeMap;
 
 use crate::ir::hir::{HirInst, HirProgram};
-use thiserror::Error;
 
-#[derive(Debug, Error)]
-pub(crate) enum OptimizeError {
-    #[error("optimization did not converge within {max_iters} iterations")]
+#[derive(Debug)]
+pub enum OptimizeError {
     DidNotConverge { max_iters: usize },
 }
+
+impl std::fmt::Display for OptimizeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OptimizeError::DidNotConverge { max_iters } => write!(
+                f,
+                "optimization did not converge within {max_iters} iterations"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for OptimizeError {}
 
 /// Baseline HIR cleanup: fuse consecutive `Add` / `Move` (single forward pass per block).
 pub(crate) fn optimize_o0(program: HirProgram) -> HirProgram {

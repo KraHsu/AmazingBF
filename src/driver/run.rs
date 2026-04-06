@@ -1,3 +1,4 @@
+use crate::Result;
 use crate::backend::asm::AsmProgram;
 use crate::backend::codegen::{
     compile_lir_to_asm, compile_precomputed_stdout_asm, compile_trivial_exit_asm,
@@ -19,32 +20,21 @@ use crate::driver::pipeline::build_frontend;
 use crate::interp::engine::Interpreter;
 use crate::ir::hir::HirProgram;
 use crate::ir::lower::lower_to_lir;
+use crate::logging::{log_debug, log_info};
 use crate::runtime::host::NullHost;
 use crate::runtime::io::{BufferOutputIo, StdIo};
-use anyhow::Result;
-use tracing::{debug, info, info_span};
 
 /// Execute the configured pipeline after CLI / logging setup has completed.
 pub(crate) fn run(config: DriverConfig) -> Result<()> {
-    let run_span = info_span!(
-        "driver.run",
-        mode = config.mode.as_str(),
-        target = config.target.as_str(),
-        input = %config.input.display(),
-        output = %config.output.display(),
-        source_bytes = config.source.len()
-    );
-    let _run_guard = run_span.enter();
-
-    info!("starting pipeline");
+    log_info("starting pipeline");
 
     let frontend = build_frontend(&config)?;
-    debug!(
-        token_count = frontend.token_count,
-        ast_nodes = frontend.ast_nodes,
-        hir_insts = frontend.hir.insts.len(),
-        "frontend pipeline completed"
-    );
+    log_debug(format!(
+        "frontend pipeline completed (tokens={} ast_nodes={} hir_insts={})",
+        frontend.token_count,
+        frontend.ast_nodes,
+        frontend.hir.insts.len()
+    ));
 
     match config.mode {
         RunMode::Interpret => run_interpret(&config, &frontend.hir)?,
@@ -52,7 +42,7 @@ pub(crate) fn run(config: DriverConfig) -> Result<()> {
         RunMode::Dump => run_dump(&frontend.hir),
     }
 
-    info!("pipeline finished");
+    log_info("pipeline finished");
 
     Ok(())
 }
@@ -60,7 +50,10 @@ pub(crate) fn run(config: DriverConfig) -> Result<()> {
 fn run_interpret(config: &DriverConfig, hir: &HirProgram) -> Result<()> {
     let mut interp = Interpreter::new(DEFAULT_INTERPRETER_TAPE_LEN, StdIo::new(), NullHost::new());
     interp.run(hir)?;
-    info!(hir_insts = hir.insts.len(), "interpreter finished");
+    log_info(format!(
+        "interpreter finished (hir_insts={})",
+        hir.insts.len()
+    ));
 
     if config.interp_debug {
         let s = interp.tape.stats();
@@ -98,46 +91,52 @@ fn run_compile(config: &DriverConfig, hir: &HirProgram) -> Result<()> {
             (program.asm, executable)
         }
     };
-    debug!(asm_insts = asm.insts.len(), "generated asm program");
+    log_debug(format!(
+        "generated asm program (asm_insts={})",
+        asm.insts.len()
+    ));
     write_executable(&output, &executable)?;
     write_artifact(&asm_listing_path, debug::dump_asm_listing(&asm))?;
     write_artifact(&hex_listing_path, debug::dump_hex_listing(&asm))?;
 
-    info!(
-        executable_target = config.target.as_str(),
-        executable = %output.display(),
-        executable_bytes = executable.len(),
-        asm_insts = asm.insts.len(),
-        asm_listing = %asm_listing_path.display(),
-        hex_listing = %hex_listing_path.display(),
-        "compile artifacts written"
-    );
+    log_info(format!(
+        "compile artifacts written (target={} executable={} bytes={} asm_insts={} asm_listing={} hex_listing={})",
+        config.target.as_str(),
+        output.display(),
+        executable.len(),
+        asm.insts.len(),
+        asm_listing_path.display(),
+        hex_listing_path.display()
+    ));
 
     Ok(())
 }
 
 fn run_dump(hir: &HirProgram) {
     let lir = lower_to_lir(hir);
-    debug!(lir_insts = lir.len(), "lowered lir");
+    log_debug(format!("lowered lir (lir_insts={})", lir.len()));
     let asm = compile_lir_to_asm(&lir);
-    debug!(asm_insts = asm.insts.len(), "generated asm program");
+    log_debug(format!(
+        "generated asm program (asm_insts={})",
+        asm.insts.len()
+    ));
 
-    info!(
-        hir_insts = hir.insts.len(),
-        lir_insts = lir.len(),
-        asm_insts = asm.insts.len(),
-        "dump mode completed without emitting files"
-    );
+    log_info(format!(
+        "dump mode completed without emitting files (hir_insts={} lir_insts={} asm_insts={})",
+        hir.insts.len(),
+        lir.len(),
+        asm.insts.len()
+    ));
 }
 
 fn compile_linux_asm(hir: &HirProgram, opt_level: OptLevel) -> Result<AsmProgram> {
     if opt_level == OptLevel::O3 {
         if !hir.has_put_byte() {
-            info!("compile -O3: no output ops; emitting trivial exit(0) ELF");
+            log_info("compile -O3: no output ops; emitting trivial exit(0) ELF");
             return Ok(compile_trivial_exit_asm());
         }
         if !hir.has_get_byte() {
-            info!("compile -O3: no input; folding stdout to precomputed write+exit");
+            log_info("compile -O3: no input; folding stdout to precomputed write+exit");
             let io = BufferOutputIo::default();
             let mut interp = Interpreter::new(DEFAULT_INTERPRETER_TAPE_LEN, io, NullHost::new());
             interp.run(hir)?;
@@ -146,18 +145,18 @@ fn compile_linux_asm(hir: &HirProgram, opt_level: OptLevel) -> Result<AsmProgram
     }
 
     let lir = lower_to_lir(hir);
-    debug!(lir_insts = lir.len(), "lowered lir");
+    log_debug(format!("lowered lir (lir_insts={})", lir.len()));
     Ok(compile_lir_to_asm(&lir))
 }
 
 fn compile_windows_program(hir: &HirProgram, opt_level: OptLevel) -> Result<WindowsProgram> {
     if opt_level == OptLevel::O3 {
         if !hir.has_put_byte() {
-            info!("compile -O3: no output ops; emitting trivial exit(0) PE");
+            log_info("compile -O3: no output ops; emitting trivial exit(0) PE");
             return Ok(compile_trivial_exit_program(0));
         }
         if !hir.has_get_byte() {
-            info!("compile -O3: no input; folding stdout to precomputed WriteFile+ExitProcess");
+            log_info("compile -O3: no input; folding stdout to precomputed WriteFile+ExitProcess");
             let io = BufferOutputIo::default();
             let mut interp = Interpreter::new(DEFAULT_INTERPRETER_TAPE_LEN, io, NullHost::new());
             interp.run(hir)?;
@@ -166,6 +165,6 @@ fn compile_windows_program(hir: &HirProgram, opt_level: OptLevel) -> Result<Wind
     }
 
     let lir = lower_to_lir(hir);
-    debug!(lir_insts = lir.len(), "lowered lir");
+    log_debug(format!("lowered lir (lir_insts={})", lir.len()));
     Ok(compile_lir_to_windows_program(&lir))
 }

@@ -1,5 +1,3 @@
-use thiserror::Error;
-
 /// Statistics collected while a [`Tape`] is in use (pointer range, growth, move totals).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TapeStats {
@@ -40,11 +38,22 @@ pub(crate) struct Tape {
     stats: TapeStats,
 }
 
-#[derive(Debug, Error)]
-pub(crate) enum TapeError {
-    #[error("pointer underflow at {pos}")]
+#[derive(Debug)]
+pub enum TapeError {
     PointerUnderflow { pos: isize },
 }
+
+impl std::fmt::Display for TapeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TapeError::PointerUnderflow { pos } => {
+                write!(f, "pointer underflow at {pos}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for TapeError {}
 
 impl Tape {
     pub(crate) fn new(initial_len: usize) -> Self {

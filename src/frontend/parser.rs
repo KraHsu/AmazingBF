@@ -1,16 +1,26 @@
 use crate::frontend::ast::AstNode;
 use crate::frontend::lexer::Token;
 
-use thiserror::Error;
-
-#[derive(Debug, Error)]
-pub(crate) enum ParseError {
-    #[error("unexpected loop end ']' at position {pos}")]
+#[derive(Debug)]
+pub enum ParseError {
     UnexpectedLoopEnd { pos: usize },
-
-    #[error("unclosed loop '[' starting at position {pos}")]
     UnclosedLoop { pos: usize },
 }
+
+impl std::fmt::Display for ParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ParseError::UnexpectedLoopEnd { pos } => {
+                write!(f, "unexpected loop end ']' at position {pos}")
+            }
+            ParseError::UnclosedLoop { pos } => {
+                write!(f, "unclosed loop '[' starting at position {pos}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ParseError {}
 
 /// Parse the Brainfuck token stream into the nested AST representation.
 pub(crate) fn parse(tokens: &[Token]) -> Result<Vec<AstNode>, ParseError> {
