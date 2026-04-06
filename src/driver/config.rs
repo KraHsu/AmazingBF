@@ -1,7 +1,5 @@
 use std::path::PathBuf;
 
-use clap::ValueEnum;
-
 pub(crate) const DEFAULT_INTERPRETER_TAPE_LEN: usize = 30_000;
 
 #[derive(Debug, Clone)]
@@ -17,7 +15,7 @@ pub(crate) struct DriverConfig {
     pub(crate) opt_level: OptLevel,
 }
 
-#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RunMode {
     /// 跑通流水线并在日志中输出各阶段规模，不写 ELF 或 listing
     Dump,
@@ -28,6 +26,15 @@ pub(crate) enum RunMode {
 }
 
 impl RunMode {
+    pub(crate) fn parse(s: &str) -> Option<Self> {
+        match s {
+            "dump" => Some(Self::Dump),
+            "interpret" => Some(Self::Interpret),
+            "compile" => Some(Self::Compile),
+            _ => None,
+        }
+    }
+
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Dump => "dump",
@@ -43,17 +50,23 @@ impl std::fmt::Display for RunMode {
     }
 }
 
-#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CompileTarget {
     /// Handwritten x86_64 Linux ELF backend.
-    #[value(name = "x86_64-linux")]
     X86_64Linux,
     /// Handwritten x86_64 Windows PE backend.
-    #[value(name = "x86_64-windows")]
     X86_64Windows,
 }
 
 impl CompileTarget {
+    pub(crate) fn parse(s: &str) -> Option<Self> {
+        match s {
+            "x86_64-linux" => Some(Self::X86_64Linux),
+            "x86_64-windows" => Some(Self::X86_64Windows),
+            _ => None,
+        }
+    }
+
     pub(crate) const fn build_default() -> Self {
         #[cfg(target_os = "windows")]
         {
@@ -87,26 +100,32 @@ impl std::fmt::Display for CompileTarget {
 }
 
 /// `-O` tier: selects the HIR optimization pass; `-O2` repeats `-O1` to a fixed point; `-O3` additionally enables whole-program folds in `compile` mode (HIR same as `-O2`).
-#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum OptLevel {
     /// HIR: fuse consecutive `Move` / `Add` only (single pass).
     #[default]
-    #[value(name = "0")]
     O0,
     /// HIR: one pass of peephole (`Move`/`Add` fusion, `Zero`/`Add` simplification) and
     /// loop simplification (e.g. `[-]` → `Zero`).
-    #[value(name = "1")]
     O1,
     /// HIR: repeat `-O1` until a fixed point (peephole / specialization until stable).
-    #[value(name = "2")]
     O2,
     /// Strongest available compile optimizations (e.g. fold programs with no `.`,
     /// or precompute stdout when there is no `,`). HIR tier matches `-O2`.
-    #[value(name = "3")]
     O3,
 }
 
 impl OptLevel {
+    pub(crate) fn parse(s: &str) -> Option<Self> {
+        match s {
+            "0" => Some(Self::O0),
+            "1" => Some(Self::O1),
+            "2" => Some(Self::O2),
+            "3" => Some(Self::O3),
+            _ => None,
+        }
+    }
+
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::O0 => "0",

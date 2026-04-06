@@ -1,10 +1,12 @@
 use crate::driver::config::{CompileTarget, DriverConfig, OptLevel, RunMode};
 
 use anyhow::Result;
-use clap::{ArgAction, ColorChoice, Parser};
+use std::ffi::{OsStr, OsString};
 use std::io::Read;
 use std::path::PathBuf;
 use thiserror::Error;
+
+const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 const LONG_ABOUT: &str = "\
 AmazingBF 将 Brainfuck 源码走完整前端与中间层：词法/语法 → AST → HIR（可优化）→ LIR → \
@@ -58,93 +60,21 @@ const COMPILER_AFTER_HELP: &str = "\
   # 交叉编译为 Windows PE64
   bf-compiler path/to/hello.bf --target x86_64-windows -o ./hello_bf.exe";
 
-/// Shared flags for every frontend (input, logging, optimization, output path).
-#[derive(Parser, Debug)]
-struct CoreCli {
-    /// Brainfuck 源文件路径；使用 `-` 表示从标准输入读取
-    #[arg(value_name = "FILE")]
-    input: PathBuf,
-
-    /// 编译输出路径（`compile` / `bf-compiler`）；会生成同基名的 .asm / .lst；解释模式下忽略。默认随 target：Linux 为 `a.out`，Windows 为 `a.exe`
-    #[arg(short, long, value_name = "PATH")]
-    output: Option<PathBuf>,
-
-    /// 提高日志详细度（可重复：-v / -vv / -vvv）
-    #[arg(short, long, action = ArgAction::Count, group = "log_level")]
-    verbose: u8,
-
-    /// 静默日志（与 -v 互斥）
-    #[arg(short, long, action = ArgAction::SetTrue, group = "log_level")]
-    quiet: bool,
-
-    /// 编译优化级别：`-O0` 仅合并连续位移/加减；`-O1` 单次窥孔与 `[-]` 等循环化简；`-O2` 重复窥孔直至不动点；`-O3` 在 compile 模式下还启用整程序折叠（HIR 同 `-O2`）
-    #[arg(short = 'O', long = "opt-level", value_enum, default_value_t = OptLevel::O0)]
-    opt_level: OptLevel,
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum BinKind {
+    AmazingBF,
+    Interpreter,
+    Compiler,
 }
 
-#[derive(Parser, Debug)]
-struct InterpFlags {
-    /// 解释执行结束后在 stderr 输出 tape 统计（指针范围、向右扩容、左右移动量等）
-    #[arg(long = "interp-debug")]
-    interp_debug: bool,
-}
-
-#[derive(Parser, Debug)]
-#[command(
-    name = "AmazingBF",
-    version,
-    about = "Brainfuck 编译器与解释器（HIR / x86_64 native backend）",
-    long_about = LONG_ABOUT,
-    after_long_help = AFTER_LONG_HELP,
-    arg_required_else_help = true,
-    color = ColorChoice::Auto
-)]
-struct FullArgs {
-    #[command(flatten)]
-    core: CoreCli,
-    #[command(flatten)]
-    interp: InterpFlags,
-    /// 运行模式
-    #[arg(short, long, value_enum, default_value_t = RunMode::Interpret)]
-    mode: RunMode,
-    /// 编译目标平台（仅 compile 模式生效）
-    #[arg(long, value_enum, default_value_t = CompileTarget::build_default())]
-    target: CompileTarget,
-}
-
-#[derive(Parser, Debug)]
-#[command(
-    name = "bf-interpreter",
-    version,
-    about = "Brainfuck HIR 解释器",
-    long_about = INTERP_LONG_ABOUT,
-    after_long_help = INTERP_AFTER_HELP,
-    arg_required_else_help = true,
-    color = ColorChoice::Auto
-)]
-struct InterpreterArgs {
-    #[command(flatten)]
-    core: CoreCli,
-    #[command(flatten)]
-    interp: InterpFlags,
-}
-
-#[derive(Parser, Debug)]
-#[command(
-    name = "bf-compiler",
-    version,
-    about = "Brainfuck → 构建目标对应的 x86_64 原生编译器",
-    long_about = COMPILER_LONG_ABOUT,
-    after_long_help = COMPILER_AFTER_HELP,
-    arg_required_else_help = true,
-    color = ColorChoice::Auto
-)]
-struct CompilerArgs {
-    #[command(flatten)]
-    core: CoreCli,
-    /// 编译目标平台；默认跟随构建本二进制时的目标平台，可通过该参数交叉编译
-    #[arg(long, value_enum, default_value_t = CompileTarget::build_default())]
-    target: CompileTarget,
+impl BinKind {
+    pub(crate) fn title(self) -> &'static str {
+        match self {
+            Self::AmazingBF => "AmazingBF",
+            Self::Interpreter => "bf-interpreter",
+            Self::Compiler => "bf-compiler",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -161,8 +91,15 @@ pub(crate) struct AppConfig {
 
 #[derive(Debug, Error)]
 pub(crate) enum CliError {
-    #[error("clap error")]
-    Clap { err: clap::Error, quiet: bool },
+    #[error("help")]
+    Help(BinKind),
+    #[error("version")]
+    Version(BinKind),
+    #[error("{message}")]
+    Usage {
+        message: String,
+        quiet: bool,
+    },
     #[error("{message}")]
     Message {
         message: String,
@@ -171,6 +108,35 @@ pub(crate) enum CliError {
     },
     #[error(transparent)]
     Other(#[from] anyhow::Error),
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Flavor {
+    Full,
+    Interpreter,
+    Compiler,
+}
+
+#[derive(Debug)]
+struct PartialCore {
+    input: Option<PathBuf>,
+    output: Option<PathBuf>,
+    verbose: u8,
+    quiet: bool,
+    opt_level: OptLevel,
+    mode: RunMode,
+    target: CompileTarget,
+    interp_debug: bool,
+}
+
+fn is_positional(arg: &OsStr) -> bool {
+    if arg == "-" {
+        return true;
+    }
+    let Some(s) = arg.to_str() else {
+        return true;
+    };
+    !s.starts_with('-')
 }
 
 fn load_source(input: &PathBuf) -> Result<String> {
@@ -187,38 +153,39 @@ fn quiet_requested() -> bool {
     std::env::args_os().any(|arg| arg == "-q" || arg == "--quiet")
 }
 
-fn validate_log_level(core: &CoreCli) -> std::result::Result<(), CliError> {
-    if core.verbose > 3 {
+fn validate_log_level(verbose: u8, quiet: bool) -> std::result::Result<(), CliError> {
+    if verbose > 3 {
         return Err(CliError::Message {
             message: "错误: 详细级别最多为 3（即 -vvv）".to_string(),
-            quiet: core.quiet,
+            quiet,
             exit_code: 1,
         });
     }
     Ok(())
 }
 
-fn finish_config(
-    core: CoreCli,
-    mode: RunMode,
-    interp_debug: bool,
+fn finish_from_partial(
+    core: PartialCore,
+    flavor: Flavor,
 ) -> std::result::Result<AppConfig, CliError> {
-    let target = CompileTarget::build_default();
-    finish_config_with_target(core, mode, target, interp_debug)
-}
+    let (mode, target, interp_debug) = match flavor {
+        Flavor::Full => (core.mode, core.target, core.interp_debug),
+        Flavor::Interpreter => (RunMode::Interpret, CompileTarget::build_default(), core.interp_debug),
+        Flavor::Compiler => (RunMode::Compile, core.target, false),
+    };
 
-fn finish_config_with_target(
-    core: CoreCli,
-    mode: RunMode,
-    target: CompileTarget,
-    interp_debug: bool,
-) -> std::result::Result<AppConfig, CliError> {
-    validate_log_level(&core)?;
-    let source = load_source(&core.input)?;
+    validate_log_level(core.verbose, core.quiet)?;
+    let input = core
+        .input
+        .ok_or_else(|| CliError::Usage {
+            message: "错误: 缺少输入文件（或使用 `-` 表示标准输入）".to_string(),
+            quiet: core.quiet,
+        })?;
+    let source = load_source(&input)?;
 
     Ok(AppConfig {
         driver_cfg: DriverConfig {
-            input: core.input,
+            input,
             source,
             mode,
             target,
@@ -232,25 +199,357 @@ fn finish_config_with_target(
     })
 }
 
-pub(crate) fn parse_cli() -> std::result::Result<AppConfig, CliError> {
-    let quiet = quiet_requested();
-    let args = FullArgs::try_parse().map_err(|err| CliError::Clap { err, quiet })?;
-    finish_config_with_target(args.core, args.mode, args.target, args.interp.interp_debug)
+fn take_value<'a>(
+    i: &mut usize,
+    args: &'a [OsString],
+    flag: &str,
+) -> std::result::Result<&'a OsStr, CliError> {
+    *i += 1;
+    let v = args.get(*i).ok_or_else(|| CliError::Usage {
+        message: format!("错误: `{flag}` 需要参数"),
+        quiet: quiet_requested(),
+    })?;
+    Ok(v.as_os_str())
 }
 
-/// Fixed `RunMode::Interpret`; no `-m` / `--mode`.
-pub(crate) fn parse_interpreter_cli() -> std::result::Result<AppConfig, CliError> {
-    let quiet = quiet_requested();
-    let mut args = InterpreterArgs::try_parse().map_err(|err| CliError::Clap { err, quiet })?;
-    if args.core.verbose == 0 {
-        args.core.quiet = true;
+fn parse_opt_level_value(raw: &str) -> std::result::Result<OptLevel, CliError> {
+    OptLevel::parse(raw).ok_or_else(|| CliError::Usage {
+        message: format!("错误: 无效的优化级别 `{raw}`（应为 0、1、2 或 3）"),
+        quiet: quiet_requested(),
+    })
+}
+
+fn parse_short_cluster(
+    cluster: &str,
+    flavor: Flavor,
+    i: &mut usize,
+    args: &[OsString],
+    core: &mut PartialCore,
+    bin: BinKind,
+) -> std::result::Result<(), CliError> {
+    let mut chars = cluster.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            'h' => return Err(CliError::Help(bin)),
+            'V' => return Err(CliError::Version(bin)),
+            'v' => core.verbose = core.verbose.saturating_add(1),
+            'q' => core.quiet = true,
+            'm' => {
+                if !matches!(flavor, Flavor::Full) {
+                    return Err(CliError::Usage {
+                        message: "错误: 此入口不支持 `-m`".to_string(),
+                        quiet: quiet_requested(),
+                    });
+                }
+                let tail: String = chars.collect();
+                let raw = if tail.is_empty() {
+                    take_value(i, args, "-m")?.to_string_lossy().into_owned()
+                } else {
+                    tail
+                };
+                let Some(m) = RunMode::parse(&raw) else {
+                    return Err(CliError::Usage {
+                        message: format!("错误: 无效的运行模式 `{raw}`"),
+                        quiet: quiet_requested(),
+                    });
+                };
+                core.mode = m;
+                return Ok(());
+            }
+            'o' => {
+                let tail: String = chars.collect();
+                if tail.is_empty() {
+                    let p = take_value(i, args, "-o")?;
+                    core.output = Some(PathBuf::from(p));
+                } else {
+                    core.output = Some(PathBuf::from(tail));
+                }
+                return Ok(());
+            }
+            'O' => {
+                let tail: String = chars.collect();
+                let raw = if tail.is_empty() {
+                    take_value(i, args, "-O")?.to_string_lossy().into_owned()
+                } else {
+                    tail
+                };
+                core.opt_level = parse_opt_level_value(&raw)?;
+                return Ok(());
+            }
+            _ => {
+                return Err(CliError::Usage {
+                    message: format!("错误: 未知短选项 `-{c}`"),
+                    quiet: quiet_requested(),
+                });
+            }
+        }
     }
-    finish_config(args.core, RunMode::Interpret, args.interp.interp_debug)
+    Ok(())
 }
 
-/// Fixed `RunMode::Compile`; no `-m` / `--mode` (and no `--interp-debug`).
-pub(crate) fn parse_compiler_cli() -> std::result::Result<AppConfig, CliError> {
+fn parse_long(
+    name: &str,
+    value: Option<&str>,
+    flavor: Flavor,
+    i: &mut usize,
+    args: &[OsString],
+    core: &mut PartialCore,
+    bin: BinKind,
+) -> std::result::Result<(), CliError> {
     let quiet = quiet_requested();
-    let args = CompilerArgs::try_parse().map_err(|err| CliError::Clap { err, quiet })?;
-    finish_config_with_target(args.core, RunMode::Compile, args.target, false)
+    match name {
+        "help" => Err(CliError::Help(bin)),
+        "version" => Err(CliError::Version(bin)),
+        "verbose" => {
+            core.verbose = core.verbose.saturating_add(1);
+            Ok(())
+        }
+        "quiet" => {
+            core.quiet = true;
+            Ok(())
+        }
+        "output" => {
+            let raw = if let Some(v) = value {
+                v
+            } else {
+                take_value(i, args, "--output")?
+                    .to_str()
+                    .ok_or_else(|| CliError::Usage {
+                        message: "错误: `--output` 路径须为有效 UTF-8".to_string(),
+                        quiet,
+                    })?
+            };
+            core.output = Some(PathBuf::from(raw));
+            Ok(())
+        }
+        "opt-level" => {
+            let raw = if let Some(v) = value {
+                v
+            } else {
+                take_value(i, args, "--opt-level")?
+                    .to_str()
+                    .ok_or_else(|| CliError::Usage {
+                        message: "错误: `--opt-level` 参数须为有效 UTF-8".to_string(),
+                        quiet,
+                    })?
+            };
+            core.opt_level = parse_opt_level_value(raw)?;
+            Ok(())
+        }
+        "mode" if matches!(flavor, Flavor::Full) => {
+            let raw = if let Some(v) = value {
+                v
+            } else {
+                take_value(i, args, "--mode")?
+                    .to_str()
+                    .ok_or_else(|| CliError::Usage {
+                        message: "错误: `--mode` 参数须为有效 UTF-8".to_string(),
+                        quiet,
+                    })?
+            };
+            let Some(m) = RunMode::parse(raw) else {
+                return Err(CliError::Usage {
+                    message: format!("错误: 无效的运行模式 `{raw}`"),
+                    quiet,
+                });
+            };
+            core.mode = m;
+            Ok(())
+        }
+        "target" if matches!(flavor, Flavor::Full | Flavor::Compiler) => {
+            let raw = if let Some(v) = value {
+                v
+            } else {
+                take_value(i, args, "--target")?
+                    .to_str()
+                    .ok_or_else(|| CliError::Usage {
+                        message: "错误: `--target` 参数须为有效 UTF-8".to_string(),
+                        quiet,
+                    })?
+            };
+            let Some(t) = CompileTarget::parse(raw) else {
+                return Err(CliError::Usage {
+                    message: format!("错误: 无效的编译目标 `{raw}`"),
+                    quiet,
+                });
+            };
+            core.target = t;
+            Ok(())
+        }
+        "interp-debug" if matches!(flavor, Flavor::Full | Flavor::Interpreter) => {
+            if value == Some("false") {
+                core.interp_debug = false;
+            } else {
+                core.interp_debug = true;
+            }
+            Ok(())
+        }
+        _ => Err(CliError::Usage {
+            message: format!("错误: 未知选项 `--{name}`"),
+            quiet,
+        }),
+    }
+}
+
+fn parse_args(flavor: Flavor) -> std::result::Result<AppConfig, CliError> {
+    let bin = match flavor {
+        Flavor::Full => BinKind::AmazingBF,
+        Flavor::Interpreter => BinKind::Interpreter,
+        Flavor::Compiler => BinKind::Compiler,
+    };
+
+    let args: Vec<OsString> = std::env::args_os().skip(1).collect();
+    let mut core = PartialCore {
+        input: None,
+        output: None,
+        verbose: 0,
+        quiet: false,
+        opt_level: OptLevel::O3,
+        mode: RunMode::Interpret,
+        target: CompileTarget::build_default(),
+        interp_debug: false,
+    };
+
+    let mut i = 0usize;
+    let mut after_dd = false;
+
+    while i < args.len() {
+        let arg_os = &args[i];
+        if after_dd || is_positional(arg_os.as_os_str()) {
+            let path = PathBuf::from(arg_os);
+            if core.input.is_some() {
+                return Err(CliError::Usage {
+                    message: "错误: 多余的输入路径（只接受一个 FILE）".to_string(),
+                    quiet: quiet_requested(),
+                });
+            }
+            core.input = Some(path);
+            i += 1;
+            continue;
+        }
+
+        let Some(s) = arg_os.to_str() else {
+            return Err(CliError::Usage {
+                message: "错误: 无法解析的命令行参数（非 UTF-8）".to_string(),
+                quiet: quiet_requested(),
+            });
+        };
+
+        if s == "--" {
+            after_dd = true;
+            i += 1;
+            continue;
+        }
+
+        if let Some(rest) = s.strip_prefix("--") {
+            if rest.is_empty() {
+                return Err(CliError::Usage {
+                    message: "错误: 无效的 `--`".to_string(),
+                    quiet: quiet_requested(),
+                });
+            }
+            let (name, eq_val) = rest
+                .split_once('=')
+                .map(|(a, b)| (a, Some(b)))
+                .unwrap_or((rest, None));
+
+            match (name, flavor) {
+                ("mode", Flavor::Interpreter | Flavor::Compiler) => {
+                    return Err(CliError::Usage {
+                        message: "错误: 此入口不支持 `--mode`".to_string(),
+                        quiet: quiet_requested(),
+                    });
+                }
+                ("target", Flavor::Interpreter) => {
+                    return Err(CliError::Usage {
+                        message: "错误: `bf-interpreter` 不支持 `--target`".to_string(),
+                        quiet: quiet_requested(),
+                    });
+                }
+                ("interp-debug", Flavor::Compiler) => {
+                    return Err(CliError::Usage {
+                        message: "错误: `bf-compiler` 不支持 `--interp-debug`".to_string(),
+                        quiet: quiet_requested(),
+                    });
+                }
+                _ => {}
+            }
+
+            parse_long(name, eq_val, flavor, &mut i, &args, &mut core, bin)?;
+            i += 1;
+            continue;
+        }
+
+        // Short flags
+        let body = &s[1..];
+        if body.is_empty() {
+            return Err(CliError::Usage {
+                message: "错误: 单独的 `-` 请用作输入文件（stdin）".to_string(),
+                quiet: quiet_requested(),
+            });
+        }
+
+        parse_short_cluster(body, flavor, &mut i, &args, &mut core, bin)?;
+        i += 1;
+    }
+
+    if core.quiet && core.verbose > 0 {
+        return Err(CliError::Usage {
+            message: "错误: 不能同时使用 `-q` 与 `-v`".to_string(),
+            quiet: true,
+        });
+    }
+
+    if matches!(flavor, Flavor::Interpreter) && core.verbose == 0 {
+        core.quiet = true;
+    }
+
+    finish_from_partial(core, flavor)
+}
+
+pub(crate) fn print_help(kind: BinKind) {
+    let title = kind.title();
+    match kind {
+        BinKind::AmazingBF => {
+            eprintln!(
+                "{title} {VERSION}\nBrainfuck 编译器与解释器（HIR / x86_64 native backend）\n\n{LONG_ABOUT}\n"
+            );
+            eprintln!(
+                "用法:\n  {title} [选项] <FILE>\n\n\
+                 参数:\n  <FILE>  Brainfuck 源文件路径；`-` 表示从标准输入读取\n\n\
+                 选项:\n  -h, --help              显示帮助\n  -V, --version           显示版本\n  -v, --verbose           提高日志详细度（可重复，最多 -vvv）\n  -q, --quiet             静默日志\n  -o, --output <PATH>     编译输出路径（compile 模式）\n  -O, --opt-level <0-3>   优化级别（默认 3）\n  -m, --mode <MODE>       运行模式: dump | interpret | compile（默认 interpret）\n      --target <T>        编译目标: x86_64-linux | x86_64-windows\n      --interp-debug      解释模式下输出 tape 统计\n"
+            );
+            eprintln!("{AFTER_LONG_HELP}");
+        }
+        BinKind::Interpreter => {
+            eprintln!("{title} {VERSION}\nBrainfuck HIR 解释器\n\n{INTERP_LONG_ABOUT}\n");
+            eprintln!(
+                "用法:\n  {title} [选项] <FILE>\n\n\
+                 参数:\n  <FILE>  Brainfuck 源文件路径；`-` 表示从标准输入读取\n\n\
+                 选项:\n  -h, --help              显示帮助\n  -V, --version           显示版本\n  -v, --verbose           提高日志详细度（默认同 `-q`）\n  -q, --quiet             静默日志\n  -o, --output <PATH>     （解释模式下忽略）\n  -O, --opt-level <0-3>   优化级别（默认 3）\n      --interp-debug      运行结束后输出 tape 统计\n"
+            );
+            eprintln!("{INTERP_AFTER_HELP}");
+        }
+        BinKind::Compiler => {
+            eprintln!("{title} {VERSION}\nBrainfuck → x86_64 原生编译器\n\n{COMPILER_LONG_ABOUT}\n");
+            eprintln!(
+                "用法:\n  {title} [选项] <FILE>\n\n\
+                 参数:\n  <FILE>  Brainfuck 源文件路径；`-` 表示从标准输入读取\n\n\
+                 选项:\n  -h, --help              显示帮助\n  -V, --version           显示版本\n  -v, --verbose           提高日志详细度\n  -q, --quiet             静默日志\n  -o, --output <PATH>     编译输出路径\n  -O, --opt-level <0-3>   优化级别（默认 3）\n      --target <T>        x86_64-linux | x86_64-windows\n"
+            );
+            eprintln!("{COMPILER_AFTER_HELP}");
+        }
+    }
+}
+
+pub(crate) fn parse_cli() -> std::result::Result<AppConfig, CliError> {
+    parse_args(Flavor::Full)
+}
+
+pub(crate) fn parse_interpreter_cli() -> std::result::Result<AppConfig, CliError> {
+    parse_args(Flavor::Interpreter)
+}
+
+pub(crate) fn parse_compiler_cli() -> std::result::Result<AppConfig, CliError> {
+    parse_args(Flavor::Compiler)
 }

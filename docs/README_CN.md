@@ -15,7 +15,7 @@
 - 中间表示分层：`HIR -> optimize -> LIR`
 - 解释器基于 `HIR` 执行
 - 原生后端可生成 `Linux ELF` 或 `Windows PE64`，并输出与目标路径同 `basename` 的 `.asm` / `.lst` 调试文件
-- 提供基于 `tracing` 的结构化日志，支持 `RUST_LOG` 覆盖和 JSON 输出
+- 提供基于 `tracing` 的结构化日志，支持 `RUST_LOG` 覆盖；JSON 行日志需在构建时启用 `--features json-logs`
 
 ## 快速开始
 
@@ -30,6 +30,8 @@
 ```bash
 cargo build --release
 ```
+
+`Cargo.toml` 中的 `release` 配置偏向缩小体积（`opt-level = "z"`、LTO、`strip`、`panic = "abort"`）。若需要 JSON 格式的 stderr 日志（会引入 `serde_json`），请使用 `cargo build --release --features json-logs`。
 
 ### 解释执行
 
@@ -150,9 +152,9 @@ cargo run -- -h
 
 默认日志输出为适合终端阅读的文本格式，`-v/-vv/-vvv` 会提升默认详细度，`-q` 会把默认过滤级别降为静默。
 
-- `RUST_LOG`：覆盖默认过滤规则，例如 `RUST_LOG=debug cargo run -- tests/cases/1.bf`
-- `AMAZINGBF_LOG_FORMAT=json`：切换为 JSON 日志
-- `AMAZINGBF_LOG_JSON=1`：JSON 日志的兼容开关
+- `RUST_LOG`：若设为**单个**级别关键字（`error` / `warn` / `info` / `debug` / `trace` / `off`），则作为全局级别覆盖默认规则；含 `=` 或 `,` 的写法会被忽略（release 体积优化，未嵌入完整 `env-filter` 解析）
+- `AMAZINGBF_LOG_FORMAT=json`：切换为 JSON 日志（须使用 `--features json-logs` 构建）
+- `AMAZINGBF_LOG_JSON=1`：JSON 日志的兼容开关（同上）
 
 ## 项目架构
 
@@ -185,7 +187,7 @@ src/
   main.rs              # `AmazingBF` 默认二进制入口
   bin/bf-interpreter.rs
   bin/bf-compiler.rs   # 固定模式的前端，调用 lib 中对应 `run_*`
-  cli.rs               # Clap CLI，构造 AppConfig / DriverConfig
+  cli.rs               # 手写 argv 解析，构造 AppConfig / DriverConfig
   app.rs               # 二进制入口复用的启动逻辑（解析 CLI、初始化日志、调用 driver）
   driver/              # 配置、前端流水线与运行模式分发
   frontend/            # lexer / parser / AST
@@ -207,7 +209,7 @@ tests/
 - `src/cli.rs`
   负责把命令行参数解析成 `DriverConfig`，并把帮助/版本/参数错误显式返回给启动层处理
 - `src/driver/logging.rs`
-  负责统一 tracing subscriber、默认过滤级别和 JSON 日志切换
+  负责统一 tracing subscriber、默认过滤级别；在启用 `json-logs` 特性时支持 JSON 日志
 - `src/driver/run.rs`
   负责按 mode 分发解释执行或落盘编译产物；前端阶段与产物写出逻辑拆分在 `driver/` 内部子模块
 - `src/interp/engine.rs`

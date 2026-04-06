@@ -23,7 +23,7 @@ The latter two are **specifically designed for ten-line code benchmarks**, and b
 * Layered intermediate representations: `HIR -> optimize -> LIR`
 * Interpreter executes based on `HIR`
 * Native backend generates `Linux ELF` or `Windows PE64`, and outputs `.asm` / `.lst` debug files with the same basename as the target
-* Structured logging via `tracing`, with support for `RUST_LOG` overrides and JSON output
+* Structured logging via `tracing`, with support for `RUST_LOG` overrides; JSON log lines require building with `--features json-logs`
 
 ---
 
@@ -42,6 +42,8 @@ The latter two are **specifically designed for ten-line code benchmarks**, and b
 ```bash
 cargo build --release
 ```
+
+The release profile in `Cargo.toml` favors a smaller binary (`opt-level = "z"`, LTO, `strip`, `panic = "abort"`). To restore JSON stderr logging (pulls in `serde_json`), use `cargo build --release --features json-logs`.
 
 ---
 
@@ -136,9 +138,9 @@ A man page source is included:
 
 Environment variables:
 
-* `RUST_LOG`: override filters
-* `AMAZINGBF_LOG_FORMAT=json`: enable JSON logging
-* `AMAZINGBF_LOG_JSON=1`: compatibility switch
+* `RUST_LOG`: optional global override when set to a single level token (`error`, `warn`, `info`, `debug`, `trace`, `off`); strings with `=` or `,` are ignored (no per-module `env-filter` syntax in release builds)
+* `AMAZINGBF_LOG_FORMAT=json`: enable JSON logging (only if built with `--features json-logs`)
+* `AMAZINGBF_LOG_JSON=1`: compatibility switch (same build requirement)
 
 ---
 
@@ -194,8 +196,8 @@ tests/
 
 * `main.rs`: default entry → calls `AmazingBF::run_amazingbf()`
 * `app.rs`: CLI parsing, logging init, driver dispatch
-* `cli.rs`: converts CLI args into `DriverConfig`
-* `driver/logging.rs`: tracing setup and JSON switching
+* `cli.rs`: minimal argv parser (no `clap`); converts flags into `DriverConfig`
+* `driver/logging.rs`: tracing setup; JSON format when crate feature `json-logs` is enabled
 * `driver/run.rs`: mode dispatch and output handling
 * `interp/engine.rs`: HIR interpreter
 * `backend/codegen.rs`: LIR → assembly IR

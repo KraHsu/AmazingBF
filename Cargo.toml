@@ -5,12 +5,23 @@ edition = "2024"
 rust-version = "1.94"
 description = "A Brainfuck interpreter and native x86_64 compiler with HIR/LIR pipeline stages."
 
+[features]
+default = []
+# JSON stderr logging (serde_json + tracing-subscriber json); omitted from default release for size.
+json-logs = ["tracing-subscriber/json"]
+
 [dependencies]
 anyhow = "1.0.102"
 thiserror = "2.0.18"
-clap = { version = "4.6.0", features = ["derive"] }
-tracing = "0.1.44"
-tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
+tracing = { version = "0.1.44", default-features = false, features = [
+    "std",
+    "release_max_level_debug",
+] }
+tracing-subscriber = { version = "0.3.23", default-features = false, features = [
+    "fmt",
+    "registry",
+    "std",
+] }
 
 [dev-dependencies]
 assert_cmd = "2.2.0"
@@ -20,3 +31,10 @@ unsafe_code = "forbid"
 
 [lints.clippy]
 dbg_macro = "warn"
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "z"
+panic = "abort"
+strip = true

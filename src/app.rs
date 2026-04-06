@@ -9,16 +9,19 @@ type ParseFn = fn() -> Result<cli::AppConfig, CliError>;
 pub(crate) fn run_with_parse(parse: ParseFn) -> Result<()> {
     let config = match parse() {
         Ok(config) => config,
-        Err(CliError::Clap { err, quiet }) => {
+        Err(CliError::Help(kind)) => {
+            cli::print_help(kind);
+            std::process::exit(0);
+        }
+        Err(CliError::Version(kind)) => {
+            eprintln!("{} {}", kind.title(), env!("CARGO_PKG_VERSION"));
+            std::process::exit(0);
+        }
+        Err(CliError::Usage { message, quiet }) => {
             if !quiet {
-                let _ = err.print();
+                eprintln!("{message}");
             }
-            std::process::exit(match err.kind() {
-                clap::error::ErrorKind::DisplayHelp
-                | clap::error::ErrorKind::DisplayVersion
-                | clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand => 0,
-                _ => 2,
-            });
+            std::process::exit(2);
         }
         Err(CliError::Message {
             message,

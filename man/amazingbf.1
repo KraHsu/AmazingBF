@@ -113,17 +113,20 @@ bf\-compiler \-o ./hello_bf tests/cases/1.bf
 .SH ENVIRONMENT
 .TP
 .B RUST_LOG
-Overrides tracing filter (e.g. \fCRUST_LOG=debug\fR).
+If set to a single level token (\fBerror\fR, \fBwarn\fR, \fBinfo\fR, \fBdebug\fR, \fBtrace\fR, \fBoff\fR), applies that level globally. Values containing `\fB=\fR` or `\fB,\fR` are ignored (no per-module filter strings).
 .TP
 .B AMAZINGBF_LOG_FORMAT
 Set to
 .B json
-for JSON logs.
+for JSON logs (only when the binary was built with Cargo feature
+.BR json-logs ).
 .TP
 .B AMAZINGBF_LOG_JSON
 If set to
 .BR 1 ,
-enables JSON log format (compatibility switch).
+enables JSON log format (compatibility switch; same
+.B json-logs
+build requirement).
 .SH SEE ALSO
 Project README and
 .B cargo run \-\- \-\-help
