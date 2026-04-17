@@ -5,13 +5,16 @@
 * **Interpretation**: parses the source code and runs it on HIR
 * **Native compilation**: compiles LIR into x86_64 native executables (Linux ELF and Windows PE64 backends implemented)
 
-Running `cargo build` produces three entry points:
+It also includes `bfsc`, a compiler for the **BFS (Brainf Script)** domain-specific language that transpiles `.bfs` source to Brainfuck.
+
+Running `cargo build` produces four entry points:
 
 * `AmazingBF` (full CLI with `-m` / `--mode` / `--target`)
 * `bf-interpreter` (fixed interpretation mode)
 * `bf-compiler` (fixed compilation mode, default target follows build target, also supports cross-compilation via `--target`)
+* `bfsc` (BFS → BF compiler)
 
-The latter two are **specifically designed for ten-line code benchmarks**, and behave the same as `AmazingBF -m interpret -q` and `AmazingBF -m compile`.
+The second and third are **specifically designed for ten-line code benchmarks**, and behave the same as `AmazingBF -m interpret -q` and `AmazingBF -m compile`.
 
 ---
 
@@ -92,6 +95,70 @@ Debug artifact paths follow Rust’s `Path::with_extension()` rules:
 
 ---
 
+### BFS (Brainf Script) Compiler
+
+`bfsc` compiles `.bfs` source files to Brainfuck text, which can then be run through `AmazingBF`.
+
+**Supported types:**
+
+| Type  | BF cells | Representation                    |
+|-------|----------|------------------------------------|
+| `u8`  | 1        | wrapping mod 256                  |
+| `u16` | 2        | little-endian (lo byte first)     |
+| `u32` | 4        | little-endian (lo byte first)     |
+
+**Language features:** variable declarations, arrays, `while`, `if/else`, arithmetic (`+ - * / %`), comparisons (`< > <= >= == !=`), boolean operators (`&& ||`), `scan()`, `print()`, `putchar()`.
+
+```bfs
+// Example: bubble sort
+let n: u8 = 0;
+let arr: [u8; 10];
+let i: u8 = 0;
+
+scan(n);
+i = 0;
+while i < n { scan(arr[i]); i = i + 1; }
+// ... sort body ...
+```
+
+**Usage:**
+
+```bash
+# Compile .bfs to BF text (stdout)
+bfsc tests/utils/sort.bfs
+
+# Save BF text to a file, then run it
+bfsc tests/utils/sort.bfs -o /tmp/sort.bf
+echo "3 2 1" | tr ' ' '\n' | cat <(echo 3) - | AmazingBF /tmp/sort.bf -q
+
+# Compile .bfs directly to a native executable (no intermediate .bf file needed)
+bfsc tests/utils/sort.bfs -c -o sort
+
+# Compile for a specific target platform
+bfsc tests/utils/sort.bfs -c --target x86_64-linux -o sort
+
+# Pipe directly (only when the BF program does not read stdin)
+bfsc tests/utils/linear_eq.bfs | AmazingBF - -q
+```
+
+**`bfsc` CLI flags:**
+
+| Flag | Description |
+|------|-------------|
+| `-o, --output <PATH>` | Without `-c`: write BF text to file (default: stdout). With `-c`: executable output path (default: `a.out` / `a.exe`). |
+| `-c, --compile` | Compile all the way to a native x86_64 executable via the AmazingBF backend. Without this flag, only BF text is output. |
+| `--target <T>` | Compilation target (only with `-c`): `x86_64-linux` \| `x86_64-windows`. Default follows build target. |
+| `-O, --opt-level <0-3>` | Optimization level passed to the AmazingBF backend (only with `-c`, default `3`). |
+| `-q, --quiet` | Suppress backend progress messages (only with `-c`). |
+| `-h, --help` | Print help. |
+| `-V, --version` | Print version. |
+
+> **Note:** When the BF program reads from stdin (e.g. `scan`), always write the compiled BF to a file first and pass it as an argument to `AmazingBF`. Piping both the BF code and program input through stdin simultaneously does not work.
+
+Fixture files for `bfsc` live in `tests/utils/` as `.bfs` / `.in` / `.out` triplets.
+
+---
+
 ### Optimization Levels
 
 Set via `-O` / `--opt-level` (default: `0`):
@@ -125,8 +192,9 @@ cargo run -- --help
 cargo run -- -h
 ```
 
-A man page source is included:
+Man page sources are included:
 `man/amazingbf.1` → preview with `man -l man/amazingbf.1`
+`man/bfsc.1` → preview with `man -l man/bfsc.1`
 
 ---
 
@@ -157,6 +225,11 @@ Brainfuck source
   -> AsmProgram
   -> machine code
   -> target-specific executable
+
+BFS source (.bfs)
+  -> bfsc (lexer -> parser -> typeck -> layout -> codegen)
+  -> Brainfuck text
+  -> AmazingBF (interpret or compile)
 ```
 
 Driver behavior:
@@ -175,6 +248,7 @@ src/
   main.rs
   bin/bf-interpreter.rs
   bin/bf-compiler.rs
+  bin/bfsc.rs
   cli.rs
   app.rs
   logging.rs
@@ -185,8 +259,10 @@ src/
   interp/
   runtime/
   backend/
+  bfsc/          (lexer, parser, typeck, layout, codegen)
 tests/
-  cases/
+  cases/         (BF fixtures for AmazingBF)
+  utils/         (BFS fixtures for bfsc)
   *.rs
 ```
 
@@ -202,6 +278,7 @@ tests/
 * `interp/engine.rs`: HIR interpreter
 * `backend/codegen.rs`: LIR → assembly IR
 * `backend/x86_64/`: machine code + ELF/PE generation
+* `bfsc/`: BFS compiler — `lexer`, `parser`, `typeck`, `layout`, `codegen` modules
 
 ---
 
@@ -238,6 +315,7 @@ Located in `tests/cases/`, each case may include:
 Test categories:
 
 * `cases_pipeline.rs`: interpreter vs compiler output validation
+* `bfsc_pipeline.rs`: BFS compiler end-to-end — `.bfs` → `bfsc` → `AmazingBF` → compare `.out`
 * `windows_target.rs`: PE64 structure and cross-compilation
 * `compile_pipeline.rs`: slower compile benchmarks (`#[ignore]`)
 

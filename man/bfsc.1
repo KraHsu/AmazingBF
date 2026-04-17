@@ -1,0 +1,122 @@
+.TH BFSC 1
+.SH NAME
+bfsc \- BFS (Brainf Script) to Brainfuck compiler
+.SH SYNOPSIS
+.B bfsc
+.RI [ options ]
+.I FILE
+.SH DESCRIPTION
+.B bfsc
+compiles BFS (Brainf Script) source files to Brainfuck.
+BFS is a typed domain-specific language with variables, arrays, arithmetic, comparisons,
+and control flow that lowers to plain Brainfuck text.
+.PP
+By default,
+.B bfsc
+writes the generated Brainfuck to standard output (or to a file with
+.BR \-o ).
+With
+.BR \-c / \-\-compile ,
+it continues through the
+.B AmazingBF
+backend to produce a native x86_64 executable directly.
+.PP
+If
+.I FILE
+is
+.BR \- ,
+source is read from standard input.
+.SS Supported types
+.TS
+l l l.
+Type	Cells	Representation
+\fBu8\fR	1	wrapping mod 256
+\fBu16\fR	2	little-endian (lo byte first)
+\fBu32\fR	4	little-endian (lo byte first)
+.TE
+.SS Language features
+Variable declarations, fixed-size arrays, \fBwhile\fR, \fBif\fR/\fBelse\fR,
+arithmetic (\fB+ \- * / %\fR), comparisons (\fB< > <= >= == !=\fR),
+boolean operators (\fB&& ||\fR), \fBscan()\fR, \fBprint()\fR, \fBputchar()\fR.
+.SH OPTIONS
+.TP
+.BR \-o ", " \-\-output " " \fIPATH\fR
+Output path.
+Without
+.BR \-c :
+write BF text to
+.I PATH
+instead of standard output.
+With
+.BR \-c :
+write the compiled executable to
+.IR PATH .
+Default executable names are
+.B a.out
+(Linux) and
+.B a.exe
+(Windows).
+.TP
+.BR \-c ", " \-\-compile
+Compile the BFS source all the way to a native x86_64 executable via the
+.B AmazingBF
+backend.
+Without this flag,
+.B bfsc
+only outputs Brainfuck text.
+.TP
+.BR \-\-target " " \fIx86_64\-linux|x86_64\-windows\fR
+Native compilation target (only meaningful with
+.BR \-c ).
+Linux targets emit ELF executables; Windows targets emit PE32+ console executables.
+The default follows the build target of
+.BR bfsc .
+.TP
+.BR \-O ", " \-\-opt\-level " " \fI0|1|2|3\fR
+Optimization level passed to the
+.B AmazingBF
+backend (only meaningful with
+.BR \-c ,
+default
+.BR 3 ).
+See
+.BR amazingbf (1)
+for a description of each level.
+.TP
+.BR \-q ", " \-\-quiet
+Suppress backend progress messages to stderr (only meaningful with
+.BR \-c ).
+.TP
+.BR \-h ", " \-\-help
+Print help.
+.TP
+.BR \-V ", " \-\-version
+Print version.
+.SH EXAMPLES
+.nf
+# Compile .bfs to BF text on stdout
+bfsc tests/utils/sort.bfs
+
+# Save BF text to a file, then run it
+bfsc tests/utils/sort.bfs \-o /tmp/sort.bf
+echo "3 2 1" | AmazingBF /tmp/sort.bf \-q
+
+# Compile .bfs directly to a native Linux executable
+bfsc tests/utils/sort.bfs \-c \-o sort
+
+# Compile for Windows (cross-compile)
+bfsc tests/utils/sort.bfs \-c \-\-target x86_64\-windows \-o sort.exe
+
+# Pipe BF to AmazingBF when the program does not read stdin
+bfsc tests/utils/linear_eq.bfs | AmazingBF \- \-q
+.fi
+.SH NOTES
+When the generated Brainfuck program reads from standard input (e.g.\& the BFS source
+uses
+.BR scan() ),
+write the BF text to a file first and pass it as a path argument to
+.BR AmazingBF .
+Piping both the BF code and program input through stdin simultaneously does not work.
+.SH SEE ALSO
+.BR amazingbf (1),
+.B cargo run \-\-bin bfsc \-\- \-\-help

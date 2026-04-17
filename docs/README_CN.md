@@ -5,13 +5,16 @@
 * **解释执行**：解析源码后在 HIR 上运行
 * **原生编译**：将 LIR 编译为 x86_64 原生可执行文件（已实现 Linux ELF 与 Windows PE64 后端）
 
-`cargo build` 会生成三个入口：
+此外还包含 `bfsc`，一个 **BFS（Brainf Script）** 领域特定语言编译器，可将 `.bfs` 源文件转译为 Brainfuck。
+
+`cargo build` 会生成四个入口：
 
 * `AmazingBF`（完整 CLI，含 `-m` / `--mode` / `--target`）
 * `bf-interpreter`（固定解释模式）
 * `bf-compiler`（固定编译模式，默认 target 跟随构建目标，也支持 `--target` 交叉编译）
+* `bfsc`（BFS → BF 编译器）
 
-后两者**专为十行代码测评设计**，行为分别与 `AmazingBF -m interpret -q` 和 `AmazingBF -m compile` 一致。
+第二、三个入口**专为十行代码测评设计**，行为分别与 `AmazingBF -m interpret -q` 和 `AmazingBF -m compile` 一致。
 
 ---
 
@@ -91,6 +94,70 @@ cargo run --bin bf-compiler -- tests/cases/1.bf --target x86_64-windows -o hello
 
 ---
 
+### BFS（Brainf Script）编译器
+
+`bfsc` 将 `.bfs` 源文件编译为 Brainfuck 文本，再交由 `AmazingBF` 解释或编译执行。
+
+**支持的类型：**
+
+| 类型  | BF 格数 | 表示方式                          |
+|-------|---------|----------------------------------|
+| `u8`  | 1       | 模 256 循环                      |
+| `u16` | 2       | 小端序（低字节在前）              |
+| `u32` | 4       | 小端序（低字节在前）              |
+
+**语言特性：** 变量声明、数组、`while`、`if/else`、算术（`+ - * / %`）、比较（`< > <= >= == !=`）、布尔运算（`&& ||`）、`scan()`、`print()`、`putchar()`。
+
+```bfs
+// 示例：冒泡排序
+let n: u8 = 0;
+let arr: [u8; 10];
+let i: u8 = 0;
+
+scan(n);
+i = 0;
+while i < n { scan(arr[i]); i = i + 1; }
+// ... 排序主体 ...
+```
+
+**使用方法：**
+
+```bash
+# 将 .bfs 编译为 BF 文本（输出到 stdout）
+bfsc tests/utils/sort.bfs
+
+# 保存 BF 文本到文件，再运行
+bfsc tests/utils/sort.bfs -o /tmp/sort.bf
+printf "3\n2\n1\n" | AmazingBF /tmp/sort.bf -q
+
+# 将 .bfs 直接编译为原生可执行文件（无需生成中间 .bf 文件）
+bfsc tests/utils/sort.bfs -c -o sort
+
+# 指定目标平台
+bfsc tests/utils/sort.bfs -c --target x86_64-linux -o sort
+
+# 若 BF 程序不读取 stdin，可直接管道
+bfsc tests/utils/linear_eq.bfs | AmazingBF - -q
+```
+
+**`bfsc` CLI 选项：**
+
+| 选项 | 说明 |
+|------|------|
+| `-o, --output <PATH>` | 不加 `-c`：将 BF 文本写入文件（默认 stdout）；加 `-c`：可执行文件输出路径（默认 `a.out` / `a.exe`）。 |
+| `-c, --compile` | 将 .bfs 直接编译为原生 x86_64 可执行文件（通过 AmazingBF 后端）。不加此选项时只输出 BF 文本。 |
+| `--target <T>` | 编译目标（仅 `-c`）：`x86_64-linux` \| `x86_64-windows`，默认跟随构建目标。 |
+| `-O, --opt-level <0-3>` | 传给 AmazingBF 后端的优化级别（仅 `-c`，默认 `3`）。 |
+| `-q, --quiet` | 静默后端进度日志（仅 `-c`）。 |
+| `-h, --help` | 显示帮助。 |
+| `-V, --version` | 显示版本。 |
+
+> **注意：** 当 BF 程序需要读取 stdin（例如含 `scan`）时，必须先将编译结果写入文件再以参数形式传给 `AmazingBF`。通过管道同时传入 BF 代码和程序输入不可行。
+
+`bfsc` 的测试固件以 `.bfs` / `.in` / `.out` 三件套形式存放在 `tests/utils/`。
+
+---
+
 ### 优化级别
 
 通过 `-O` / `--opt-level` 设置（默认 `0`）：
@@ -124,7 +191,9 @@ cargo run -- --help
 cargo run -- -h
 ```
 
-仓库内提供手册页源文件 `man/amazingbf.1`，可本地预览：`man -l man/amazingbf.1`
+仓库内提供手册页源文件：
+`man/amazingbf.1` 可本地预览：`man -l man/amazingbf.1`
+`man/bfsc.1` 可本地预览：`man -l man/bfsc.1`
 
 ---
 
@@ -155,6 +224,11 @@ Brainfuck source
   -> AsmProgram
   -> machine code
   -> target-specific executable
+
+BFS source (.bfs)
+  -> bfsc（lexer -> parser -> typeck -> layout -> codegen）
+  -> Brainfuck 文本
+  -> AmazingBF（解释执行或编译）
 ```
 
 Driver 行为：
@@ -173,6 +247,7 @@ src/
   main.rs
   bin/bf-interpreter.rs
   bin/bf-compiler.rs
+  bin/bfsc.rs
   cli.rs
   app.rs
   logging.rs
@@ -183,8 +258,10 @@ src/
   interp/
   runtime/
   backend/
+  bfsc/          （lexer、parser、typeck、layout、codegen）
 tests/
-  cases/
+  cases/         （AmazingBF 的 BF 固件）
+  utils/         （bfsc 的 BFS 固件）
   *.rs
 ```
 
@@ -200,6 +277,7 @@ tests/
 * `interp/engine.rs`：HIR 解释器
 * `backend/codegen.rs`：LIR → 汇编 IR
 * `backend/x86_64/`：机器码与 ELF/PE 生成
+* `bfsc/`：BFS 编译器，含 `lexer`、`parser`、`typeck`、`layout`、`codegen` 子模块
 
 ---
 
@@ -236,6 +314,7 @@ cargo test
 测试分类：
 
 * `cases_pipeline.rs`：解释器与编译器输出对照
+* `bfsc_pipeline.rs`：BFS 编译器端到端测试——`.bfs` → `bfsc` → `AmazingBF` → 与 `.out` 比对
 * `windows_target.rs`：PE64 结构与交叉编译
 * `compile_pipeline.rs`：较慢的编译基准（`#[ignore]`）
 
