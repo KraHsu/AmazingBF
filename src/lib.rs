@@ -8,6 +8,7 @@
 
 mod app;
 mod backend;
+mod bfsc;
 mod cli;
 mod driver;
 pub mod error;
@@ -32,4 +33,9 @@ pub fn run_bf_interpreter() -> Result<()> {
 /// `bf-compiler` binary: fixed compile mode.
 pub fn run_bf_compiler() -> Result<()> {
     app::run_with_parse(cli::parse_compiler_cli)
+}
+
+/// `bfsc` binary: BFS (Brainf Script) → BF compiler.
+pub fn run_bfsc() -> Result<()> {
+    bfsc::run().map_err(|e| crate::error::Error::Other(e.to_string()))
 }

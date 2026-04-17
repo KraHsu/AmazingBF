@@ -17,6 +17,7 @@ pub enum Error {
     Parse(crate::frontend::parser::ParseError),
     Optimize(crate::ir::optimize::OptimizeError),
     Runtime(crate::interp::engine::RuntimeError),
+    Other(String),
 }
 
 impl std::fmt::Display for Error {
@@ -29,6 +30,7 @@ impl std::fmt::Display for Error {
             Error::Parse(e) => write!(f, "{e}"),
             Error::Optimize(e) => write!(f, "{e}"),
             Error::Runtime(e) => write!(f, "{e}"),
+            Error::Other(s) => f.write_str(s),
         }
     }
 }
