@@ -1,0 +1,15 @@
+// Test u16 arithmetic: read two u16 values, print their sum and difference.
+let a: u16 = 0;
+let b: u16 = 0;
+let s: u16 = 0;
+
+scan(a);
+scan(b);
+
+s = a + b;
+print(s);
+putchar(10);
+
+s = a - b;
+print(s);
+putchar(10);

@@ -1,0 +1,26 @@
+// Solve: a*x + b*y = e,  c*x + d*y = f
+// Inputs a,b,e,c,d,f as decimal numbers
+let a: u8 = 0;
+let b: u8 = 0;
+let e: u8 = 0;
+let c: u8 = 0;
+let d: u8 = 0;
+let f: u8 = 0;
+let det: u8 = 0;
+let xn: u8 = 0;
+let yn: u8 = 0;
+let x: u8 = 0;
+let y: u8 = 0;
+
+scan(a); scan(b); scan(e);
+scan(c); scan(d); scan(f);
+
+det = a * d - b * c;
+xn  = e * d - b * f;
+yn  = a * f - e * c;
+x   = xn / det;
+y   = yn / det;
+
+putchar(120); putchar(61); print(x);
+putchar(121); putchar(61); print(y);
+putchar(10);
