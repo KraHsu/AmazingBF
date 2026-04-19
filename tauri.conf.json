@@ -1,0 +1,27 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "bf-gui",
+  "version": "0.3.0",
+  "identifier": "dev.amazingbf.gui",
+  "build": {
+    "frontendDist": "./gui-assets"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "title": "BF GUI",
+        "width": 512,
+        "height": 512,
+        "resizable": false
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": false,
+    "icon": []
+  }
+}

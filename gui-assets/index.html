@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>BF GUI</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body { width: 512px; height: 512px; background: #000; overflow: hidden; }
+    canvas {
+      display: block;
+      width: 512px;
+      height: 512px;
+      image-rendering: pixelated;
+      image-rendering: crisp-edges;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="screen" width="256" height="256"></canvas>
+  <script>
+    // Special key codes > 127 (BF programs check these with ,)
+    // Key mapping: regular printable characters use their ASCII codes.
+    // Special keys:
+    //   ArrowUp=128, ArrowDown=129, ArrowLeft=130, ArrowRight=131
+    //   F1=132, F2=133, F3=134, F4=135, F5=136, F6=137, F7=138, F8=139
+    //   Enter=13, Escape=27, Backspace=8, Tab=9, Delete=127
+    const SPECIAL_KEYS = {
+      ArrowUp: 128, ArrowDown: 129, ArrowLeft: 130, ArrowRight: 131,
+      F1: 132, F2: 133, F3: 134, F4: 135,
+      F5: 136, F6: 137, F7: 138, F8: 139,
+    };
+
+    const canvas = document.getElementById('screen');
+    const ctx = canvas.getContext('2d');
+
+    function start(invoke) {
+      const imgData = ctx.createImageData(256, 256);
+      const px = imgData.data;
+
+      async function render() {
+        const buf = await invoke('get_screen');
+        for (let i = 0; i < 65536; i++) {
+          const b = buf[i];
+          const j = i << 2;
+          px[j]     = (b >> 5) * 36;          // R: 3 bits → 0..252
+          px[j + 1] = ((b >> 2) & 7) * 36;    // G: 3 bits → 0..252
+          px[j + 2] = (b & 3) * 85;           // B: 2 bits → 0..255
+          px[j + 3] = 255;
+        }
+        ctx.putImageData(imgData, 0, 0);
+        requestAnimationFrame(render);
+      }
+
+      document.addEventListener('keydown', (e) => {
+        let code = 0;
+        if (e.key.length === 1) {
+          const c = e.key.charCodeAt(0);
+          if (c < 256) code = c;
+        } else {
+          code = SPECIAL_KEYS[e.key] ?? 0;
+        }
+        if (code > 0) {
+          invoke('send_key', { key: code });
+          e.preventDefault();
+        }
+      });
+
+      requestAnimationFrame(render);
+    }
+
+    // Tauri injects window.__TAURI__ synchronously before DOMContentLoaded
+    // when withGlobalTauri is true.
+    window.addEventListener('DOMContentLoaded', () => {
+      const invoke = window.__TAURI__.core.invoke;
+      start(invoke);
+    });
+  </script>
+</body>
+</html>

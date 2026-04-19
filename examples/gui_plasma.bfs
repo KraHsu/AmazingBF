@@ -1,0 +1,45 @@
+// @gui
+// gui_plasma.bfs — concentric square gradient on the 256×256 BFS GUI screen.
+//
+// Each pixel's colour is determined by its Chebyshev distance from the
+// centre (128, 128).  Distance 0 (centre) → black; distance 127 → white;
+// the colour cycles through the full RGB332 palette as the distance grows,
+// producing concentric square rings that shift colour band by band.
+//
+// Run with:  bfsc gui_plasma.bfs -o gui_plasma.bf && bf-gui gui_plasma.bf
+
+let x: u16 = 0;
+let y: u16 = 0;
+let dx: u16 = 0;
+let dy: u16 = 0;
+let dist: u16 = 0;
+let color: u8 = 0;
+let key: u8 = 0;
+
+y = 0;
+while y < 256 {
+    x = 0;
+    while x < 256 {
+        if x >= 128 {
+            dx = x - 128;
+        } else {
+            dx = 128 - x;
+        }
+        if y >= 128 {
+            dy = y - 128;
+        } else {
+            dy = 128 - y;
+        }
+        if dx > dy {
+            dist = dx;
+        } else {
+            dist = dy;
+        }
+        color = dist * 2;
+        setpixel(x, y, color);
+        x = x + 1;
+    }
+    y = y + 1;
+}
+
+getchar(key);
