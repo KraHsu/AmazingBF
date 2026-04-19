@@ -86,6 +86,12 @@ fn check_stmt(stmt: &Stmt, sym: &HashMap<String, TypeAnn>) -> Result<(), BfscErr
         }
         Stmt::Scan(lval) => check_lval(lval, sym)?,
         Stmt::Print(expr) | Stmt::Putchar(expr) => check_expr(expr, sym)?,
+        Stmt::Setpixel { x, y, color } => {
+            check_expr(x, sym)?;
+            check_expr(y, sym)?;
+            check_expr(color, sym)?;
+        }
+        Stmt::Getchar(lval) => check_lval(lval, sym)?,
     }
     Ok(())
 }

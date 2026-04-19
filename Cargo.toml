@@ -5,10 +5,22 @@ edition = "2024"
 rust-version = "1.94"
 description = "A Brainfuck interpreter and native x86_64 compiler with HIR/LIR pipeline stages."
 
+[features]
+gui = ["dep:tauri", "dep:tauri-build"]
+
+[[bin]]
+name = "bf-gui"
+path = "src/bin/bf-gui.rs"
+required-features = ["gui"]
+
 [dependencies]
+tauri = { version = "2", optional = true }
 
 [dev-dependencies]
 assert_cmd = "2.2.0"
+
+[build-dependencies]
+tauri-build = { version = "2", optional = true }
 
 [lints.rust]
 unsafe_code = "forbid"

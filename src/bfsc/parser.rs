@@ -122,6 +122,8 @@ impl<'a> Parser<'a> {
             Token::Scan => self.parse_scan(),
             Token::Print => self.parse_print(),
             Token::Putchar => self.parse_putchar(),
+            Token::Setpixel => self.parse_setpixel(),
+            Token::Getchar => self.parse_getchar(),
             Token::Ident(_) => self.parse_assign(),
             tok => Err(BfscError::Parse(format!(
                 "unexpected token {tok:?} at byte {}", self.cur_pos()
@@ -190,6 +192,28 @@ impl<'a> Parser<'a> {
         self.expect(&Token::RParen)?;
         self.expect(&Token::Semi)?;
         Ok(Stmt::Putchar(expr))
+    }
+
+    fn parse_setpixel(&mut self) -> Result<Stmt, BfscError> {
+        self.bump(); // setpixel
+        self.expect(&Token::LParen)?;
+        let x = self.parse_expr()?;
+        self.expect(&Token::Comma)?;
+        let y = self.parse_expr()?;
+        self.expect(&Token::Comma)?;
+        let color = self.parse_expr()?;
+        self.expect(&Token::RParen)?;
+        self.expect(&Token::Semi)?;
+        Ok(Stmt::Setpixel { x, y, color })
+    }
+
+    fn parse_getchar(&mut self) -> Result<Stmt, BfscError> {
+        self.bump(); // getchar
+        self.expect(&Token::LParen)?;
+        let lval = self.parse_lvalue()?;
+        self.expect(&Token::RParen)?;
+        self.expect(&Token::Semi)?;
+        Ok(Stmt::Getchar(lval))
     }
 
     fn parse_assign(&mut self) -> Result<Stmt, BfscError> {

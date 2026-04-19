@@ -13,6 +13,8 @@ pub(crate) enum Token {
     Scan,
     Print,
     Putchar,
+    Setpixel,
+    Getchar,
     // Types
     U8,
     I8,
@@ -65,6 +67,8 @@ fn keyword(s: &str) -> Option<Token> {
         "scan" => Some(Token::Scan),
         "print" => Some(Token::Print),
         "putchar" => Some(Token::Putchar),
+        "setpixel" => Some(Token::Setpixel),
+        "getchar" => Some(Token::Getchar),
         "u8" => Some(Token::U8),
         "i8" => Some(Token::I8),
         "u16" => Some(Token::U16),

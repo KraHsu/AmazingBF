@@ -979,6 +979,33 @@ impl<'a> BfEmitter<'a> {
                 let v = self.eval_expr_1(expr);
                 self.out(v); self.tfree(v);
             }
+            Stmt::Setpixel { x, y, color } => {
+                let xc = self.eval_expr_1(x);
+                let yc = self.eval_expr_1(y);
+                let cc = self.eval_expr_1(color);
+                let cmd = self.talloc(); self.setv(cmd, 0xFE); self.out(cmd); self.tfree(cmd);
+                self.out(xc); self.tfree(xc);
+                self.out(yc); self.tfree(yc);
+                self.out(cc); self.tfree(cc);
+            }
+            Stmt::Getchar(lval) => {
+                match lval {
+                    LValue::Var(name) => {
+                        let layout = self.layout.get(name).unwrap().clone();
+                        self.inp(layout.base);
+                        for i in 1..layout.width { self.clear(layout.base + i); }
+                    }
+                    LValue::Index(name, idx_expr) => {
+                        let layout = self.layout.get(name).unwrap().clone();
+                        let ew = layout.elem_width();
+                        let t = self.talloc_n(ew);
+                        self.inp(t);
+                        for i in 1..ew { self.clear(t + i); }
+                        self.arr_write(&layout, idx_expr, t, ew);
+                        // arr_write already calls tfree_n(val, ew) internally
+                    }
+                }
+            }
             Stmt::Scan(lval) => {
                 match lval {
                     LValue::Var(name) => {
