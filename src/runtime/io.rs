@@ -20,9 +20,12 @@ impl std::fmt::Display for IoError {
 impl std::error::Error for IoError {}
 
 /// Byte-oriented runtime IO used by the interpreter and compile-time folds.
+///
+/// `ptr` is the current tape pointer at the time of the call, allowing
+/// implementations to route I/O based on memory address (e.g. screen buffer).
 pub(crate) trait RuntimeIo {
-    fn put_byte(&mut self, byte: u8) -> Result<(), IoError>;
-    fn get_byte(&mut self) -> Result<u8, IoError>;
+    fn put_byte(&mut self, ptr: isize, byte: u8) -> Result<(), IoError>;
+    fn get_byte(&mut self, ptr: isize) -> Result<u8, IoError>;
 }
 
 pub(crate) struct StdIo;
@@ -34,7 +37,7 @@ impl StdIo {
 }
 
 impl RuntimeIo for StdIo {
-    fn put_byte(&mut self, byte: u8) -> Result<(), IoError> {
+    fn put_byte(&mut self, _ptr: isize, byte: u8) -> Result<(), IoError> {
         let mut out = std::io::stdout();
         out.write_all(&[byte])
             .map_err(|e| IoError::WriteError(e.to_string()))?;
@@ -43,7 +46,7 @@ impl RuntimeIo for StdIo {
         Ok(())
     }
 
-    fn get_byte(&mut self) -> Result<u8, IoError> {
+    fn get_byte(&mut self, _ptr: isize) -> Result<u8, IoError> {
         let mut input = std::io::stdin();
         let mut buf = [0u8; 1];
 
@@ -62,12 +65,12 @@ pub(crate) struct BufferOutputIo {
 }
 
 impl RuntimeIo for BufferOutputIo {
-    fn put_byte(&mut self, byte: u8) -> Result<(), IoError> {
+    fn put_byte(&mut self, _ptr: isize, byte: u8) -> Result<(), IoError> {
         self.bytes.push(byte);
         Ok(())
     }
 
-    fn get_byte(&mut self) -> Result<u8, IoError> {
+    fn get_byte(&mut self, _ptr: isize) -> Result<u8, IoError> {
         Ok(EOF_BYTE)
     }
 }

@@ -13,6 +13,8 @@ mod cli;
 mod driver;
 pub mod error;
 mod frontend;
+#[cfg(feature = "gui")]
+mod gui;
 mod interp;
 mod ir;
 mod logging;
@@ -38,4 +40,10 @@ pub fn run_bf_compiler() -> Result<()> {
 /// `bfsc` binary: BFS (Brainf Script) → BF compiler.
 pub fn run_bfsc() -> Result<()> {
     bfsc::run().map_err(|e| crate::error::Error::Other(e.to_string()))
+}
+
+/// `bf-gui` binary: Brainfuck interpreter with Tauri GUI (screen buffer + keypress input).
+#[cfg(feature = "gui")]
+pub fn run_bf_gui() -> Result<()> {
+    gui::run()
 }

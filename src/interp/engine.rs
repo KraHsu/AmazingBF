@@ -1,11 +1,10 @@
 use crate::ir::hir::{HirInst, HirProgram};
 use crate::runtime::host::HostRuntime;
 use crate::runtime::io::{IoError, RuntimeIo};
-use crate::runtime::tape::{Tape, TapeError};
+use crate::runtime::tape::Tape;
 
 #[derive(Debug)]
 pub enum RuntimeError {
-    Tape(TapeError),
     Io(String),
     /// Reserved for future host-call support in the interpreter.
     #[allow(dead_code)]
@@ -15,27 +14,13 @@ pub enum RuntimeError {
 impl std::fmt::Display for RuntimeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            RuntimeError::Tape(e) => write!(f, "tape error: {e}"),
             RuntimeError::Io(msg) => write!(f, "io error: {msg}"),
             RuntimeError::Host(msg) => write!(f, "host error: {msg}"),
         }
     }
 }
 
-impl std::error::Error for RuntimeError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            RuntimeError::Tape(e) => Some(e),
-            _ => None,
-        }
-    }
-}
-
-impl From<TapeError> for RuntimeError {
-    fn from(value: TapeError) -> Self {
-        RuntimeError::Tape(value)
-    }
-}
+impl std::error::Error for RuntimeError {}
 
 impl From<IoError> for RuntimeError {
     fn from(err: IoError) -> Self {
@@ -83,17 +68,19 @@ impl<I: RuntimeIo, H: HostRuntime> Interpreter<I, H> {
         for inst in insts {
             match inst {
                 HirInst::Move(delta) => {
-                    self.tape.move_ptr(*delta)?;
+                    self.tape.move_ptr(*delta);
                 }
                 HirInst::Add(delta) => {
                     self.tape.add_current(*delta);
                 }
                 HirInst::PutByte => {
+                    let ptr = self.tape.ptr();
                     let byte = self.tape.current();
-                    self.io.put_byte(byte)?;
+                    self.io.put_byte(ptr, byte)?;
                 }
                 HirInst::GetByte => {
-                    let byte = self.io.get_byte()?;
+                    let ptr = self.tape.ptr();
+                    let byte = self.io.get_byte(ptr)?;
                     self.tape.set_current(byte);
                 }
                 HirInst::Zero => {
@@ -103,10 +90,10 @@ impl<I: RuntimeIo, H: HostRuntime> Interpreter<I, H> {
                     let v = self.tape.current();
                     self.tape.set_current(0);
                     for (off, f) in factors {
-                        self.tape.move_ptr(*off)?;
+                        self.tape.move_ptr(*off);
                         let delta = mul_add_delta_u8(v, *f);
                         self.tape.add_current(delta);
-                        self.tape.move_ptr(-*off)?;
+                        self.tape.move_ptr(-*off);
                     }
                 }
                 HirInst::Scan(dir) => {
@@ -115,7 +102,7 @@ impl<I: RuntimeIo, H: HostRuntime> Interpreter<I, H> {
                         _ => dir.signum(),
                     };
                     while self.tape.current() != 0 {
-                        self.tape.move_ptr(step)?;
+                        self.tape.move_ptr(step);
                     }
                 }
                 HirInst::Loop(body) => {
