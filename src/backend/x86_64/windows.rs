@@ -1,3 +1,10 @@
+//! Windows (PE64) codegen: lower LIR to x86_64 with `kernel32.dll` I/O.
+//!
+//! Produces an `AsmProgram` that performs tape allocation, read/write via
+//! `ReadFile` / `WriteFile`, growth via `VirtualAlloc`, and exit via
+//! `ExitProcess`. Also tracks which `Kernel32Import` entries the generated
+//! code references so the PE builder can emit a minimal import table.
+
 use crate::backend::asm::{AsmInst, AsmLabel, AsmProgram, Reg64};
 use crate::ir::lir::{LabelId, LirInst, LirProgram};
 
@@ -20,14 +27,22 @@ const STACK_SAVED_DESIRED_OFFSET: i32 = 64;
 const STACK_SAVED_RDI: i32 = 72;
 const STACK_SAVED_RSI: i32 = 80;
 
+/// A kernel32.dll symbol that the Windows backend may import.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kernel32Import {
+    /// `ExitProcess(UINT)` — terminate the current process.
     ExitProcess,
+    /// `GetLastError()` — last thread-local Win32 error code.
     GetLastError,
+    /// `GetStdHandle(DWORD)` — fetch the stdin / stdout handle.
     GetStdHandle,
+    /// `ReadFile(...)` — synchronous byte read used by `,`.
     ReadFile,
+    /// `WriteFile(...)` — synchronous byte write used by `.`.
     WriteFile,
+    /// `VirtualAlloc(...)` — reserve / commit pages during tape growth.
     VirtualAlloc,
+    /// `VirtualFree(...)` — release pages from the previous tape after growth.
     VirtualFree,
 }
 
@@ -45,23 +60,38 @@ impl Kernel32Import {
     }
 }
 
+/// A single import-table record referenced by the generated PE32+ image.
 #[derive(Debug, Clone)]
 pub struct WindowsImport {
+    /// Human-readable import name (used when writing the hint/name entry).
     pub name: &'static str,
+    /// Label of the IMAGE_IMPORT_BY_NAME hint/name entry in the import table.
     pub hint_name_label: AsmLabel,
+    /// Label of the corresponding ILT (Import Lookup Table) slot.
     pub ilt_entry_label: AsmLabel,
+    /// Label of the corresponding IAT (Import Address Table) slot.
     pub iat_entry_label: AsmLabel,
 }
 
+/// Complete backend artifact for the Windows target: ASM IR plus the labels
+/// the PE32+ writer needs to patch into the optional header.
 #[derive(Debug, Clone)]
 pub struct WindowsProgram {
+    /// Generated x86_64 assembly (code and data) in a single AsmProgram.
     pub asm: AsmProgram,
+    /// Label of the Windows entry point (jumped to by the PE header).
     pub entry_label: AsmLabel,
+    /// Label of the first IMAGE_IMPORT_DESCRIPTOR entry.
     pub import_desc_label: AsmLabel,
+    /// Byte size of the import directory placed at `import_desc_label`.
     pub import_dir_size: u32,
+    /// Label of the IAT block emitted alongside the import descriptor.
     pub iat_label: AsmLabel,
+    /// Byte size of the IAT block at `iat_label`.
     pub iat_size: u32,
+    /// Label of the imported DLL name string (`"kernel32.dll\0"`).
     pub dll_name_label: AsmLabel,
+    /// One `WindowsImport` record per referenced kernel32 symbol.
     pub imports: Vec<WindowsImport>,
 }
 
@@ -178,6 +208,9 @@ impl LabelAllocator {
     }
 }
 
+/// Lower a [`LirProgram`] into a [`WindowsProgram`]: generate the prologue,
+/// tape management, `ReadFile`/`WriteFile` helpers, and the main LIR-to-ASM
+/// translation with kernel32 imports.
 pub fn compile_lir_to_windows_program(lir: &LirProgram) -> WindowsProgram {
     let mut labels = LabelAllocator::new();
     let entry_label = labels.fresh();
@@ -314,6 +347,8 @@ pub fn compile_lir_to_windows_program(lir: &LirProgram) -> WindowsProgram {
     }
 }
 
+/// Emit a minimal Windows executable that calls `ExitProcess(exit_code)`. Used
+/// by `-O3` when the input Brainfuck program has no side effects.
 pub fn compile_trivial_exit_program(exit_code: u32) -> WindowsProgram {
     let mut labels = LabelAllocator::new();
     let entry_label = labels.fresh();
@@ -344,6 +379,8 @@ pub fn compile_trivial_exit_program(exit_code: u32) -> WindowsProgram {
     }
 }
 
+/// Emit a Windows executable that writes `data` to stdout then exits. Used by
+/// `-O3` when the Brainfuck program is input-free so output can be precomputed.
 pub fn compile_precomputed_stdout_program(data: &[u8]) -> WindowsProgram {
     if data.is_empty() {
         return compile_trivial_exit_program(0);

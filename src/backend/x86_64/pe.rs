@@ -1,3 +1,11 @@
+//! PE64 (x86_64 Windows) executable layout.
+//!
+//! Writes a minimal single-section PE image: DOS stub, PE signature,
+//! COFF header, optional header, one `.text` section header, then the encoded
+//! code. Alignment constants follow the PE/COFF spec (`FileAlignment = 0x200`,
+//! `SectionAlignment = 0x1000`); the import and IAT directories are produced
+//! by the Windows backend and handed in via `DataDirectory`.
+
 use crate::backend::x86_64::encode::EncodedProgram;
 
 const DOS_STUB_SIZE: usize = 0x80;
@@ -11,12 +19,17 @@ const IMAGE_BASE: u64 = 0x1_4000_0000;
 const SECTION_RVA: u32 = 0x1000;
 const SUBSYSTEM_WINDOWS_CUI: u16 = 3;
 
+/// PE32+ data-directory entry describing an RVA / size tuple in the optional header.
 #[derive(Debug, Clone, Copy)]
 pub struct DataDirectory {
+    /// Relative virtual address of the directory inside the loaded image.
     pub rva: u32,
+    /// Size in bytes of the directory's payload.
     pub size: u32,
 }
 
+/// Assemble a complete PE32+ executable around `encoded.text`, using the
+/// supplied entry point offset (inside `.text`) and import / IAT directories.
 pub fn build_pe_executable(
     encoded: &EncodedProgram,
     entry_offset: u32,

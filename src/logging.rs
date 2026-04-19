@@ -11,6 +11,8 @@ fn active_level() -> u8 {
     LOG_LEVEL.load(Ordering::Relaxed)
 }
 
+/// Initialise the process-wide log verbosity. Returns [`Error::InvalidLogLevel`]
+/// when `log_level` is outside `0..=4`.
 pub(crate) fn init_logger(log_level: u8) -> Result<()> {
     if log_level > 4 {
         return Err(Error::InvalidLogLevel(log_level));

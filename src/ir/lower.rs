@@ -1,3 +1,10 @@
+//! Lowering passes: AST → HIR and HIR → LIR.
+//!
+//! `lower_to_hir` flattens the parsed AST into the HIR instruction list used
+//! by optimization and interpretation. `lower_to_lir` then linearises HIR
+//! loops into labelled jumps so the backend can emit native conditional
+//! branches directly.
+
 use crate::frontend::ast::AstNode;
 use crate::ir::hir::{HirInst, HirProgram};
 use crate::ir::lir::{LabelGen, LirInst, LirProgram};

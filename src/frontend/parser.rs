@@ -1,10 +1,25 @@
+//! Brainfuck parser.
+//!
+//! Builds a nested `Vec<AstNode>` from a flat token stream, balancing `[` / `]`
+//! into `AstNode::Loop` subtrees. The returned tree is consumed by HIR lowering
+//! and is the last place where source positions (byte offsets) are tracked.
+
 use crate::frontend::ast::AstNode;
 use crate::frontend::lexer::Token;
 
+/// Errors raised by [`parse`] when a Brainfuck token stream is structurally invalid.
 #[derive(Debug)]
 pub enum ParseError {
-    UnexpectedLoopEnd { pos: usize },
-    UnclosedLoop { pos: usize },
+    /// A `]` appeared without a matching `[`.
+    UnexpectedLoopEnd {
+        /// Token index of the offending `]`.
+        pos: usize,
+    },
+    /// A `[` was never closed by a matching `]`.
+    UnclosedLoop {
+        /// Token index at which parsing reached end-of-input while still inside a loop.
+        pos: usize,
+    },
 }
 
 impl std::fmt::Display for ParseError {

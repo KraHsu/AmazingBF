@@ -9,9 +9,12 @@ use crate::logging::log_info;
 
 use crate::driver::config::CompileTarget;
 
+/// File extension used for the assembly-text listing written beside the executable.
 pub(crate) const ASM_LISTING_EXT: &str = "asm";
+/// File extension used for the hex/machine-code listing written beside the executable.
 pub(crate) const HEX_LISTING_EXT: &str = "lst";
 
+/// Derive a sibling artifact path by swapping the output file's extension.
 pub(crate) fn artifact_path(output: &Path, extension: &str) -> PathBuf {
     output.with_extension(extension)
 }
@@ -33,6 +36,7 @@ pub(crate) fn compile_executable_output_path(target: CompileTarget, output: &Pat
     }
 }
 
+/// Write a textual compile-mode artefact (e.g. `.asm`, `.lst`) to disk.
 pub(crate) fn write_artifact(path: impl AsRef<Path>, contents: String) -> Result<()> {
     let path = path.as_ref();
     fs::write(path, contents).map_err(|e| io_err(path, "write", e))?;
@@ -40,6 +44,7 @@ pub(crate) fn write_artifact(path: impl AsRef<Path>, contents: String) -> Result
     Ok(())
 }
 
+/// Write the native executable bytes to disk and apply the `0o755` bit on Unix.
 pub(crate) fn write_executable(path: &Path, bytes: &[u8]) -> Result<()> {
     fs::write(path, bytes).map_err(|e| io_err(path, "write executable to", e))?;
     set_executable_permissions(path)?;

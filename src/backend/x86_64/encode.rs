@@ -1,132 +1,138 @@
-//! # x86_64 机器码编码器 (encode.rs)
+//! x86_64 machine-code encoder (encode.rs).
 //!
-//! 本模块负责将 `AsmProgram`（汇编 IR）编码为实际的 x86_64 机器码字节序列。
+//! Converts an `AsmProgram` (assembly IR) into the actual byte sequence of
+//! x86_64 machine code.
 //!
-//! ## 编码流程
+//! ## Encoding flow
 //!
-//! 1. **顺序编码**：遍历每条 `AsmInst`，按 x86_64 指令格式写入字节。
-//!    跳转/调用指令的目标偏移暂时填入 0，并记录一个 fixup。
+//! 1. **Sequential encoding**: iterate over every `AsmInst` and append the
+//!    corresponding x86_64 bytes. Jump / call targets are first written as
+//!    zero placeholders with a recorded `Fixup`.
 //!
-//! 2. **标签绑定**：遇到 `Label` 伪指令时，记录该标签对应的字节偏移。
+//! 2. **Label binding**: when a `Label` pseudo-instruction is encountered,
+//!    record its byte offset.
 //!
-//! 3. **Fixup 回填**：所有指令编码完成后，遍历 fixup 列表：
-//!    - 查找目标标签的偏移
-//!    - 计算相对偏移 `rel = target - next_ip`
-//!    - 将 rel32 写回之前预留的 4 字节占位符
+//! 3. **Fixup resolution**: after every instruction is emitted, walk the
+//!    fixup list and for each entry:
+//!    - look up the target label's offset,
+//!    - compute the relative displacement `rel = target - next_ip`,
+//!    - overwrite the 4-byte placeholder with the little-endian `rel32`.
 //!
-//! ## x86_64 指令编码基础
+//! ## x86_64 encoding primer
 //!
-//! 一条典型的 x86_64 指令由以下部分组成（非所有部分都必须存在）：
+//! A typical x86_64 instruction has up to six optional components:
 //!
 //! ```text
-//! [前缀] [REX] [操作码(1-3字节)] [ModRM] [SIB] [偏移量] [立即数]
+//! [prefix] [REX] [opcode (1-3 bytes)] [ModRM] [SIB] [displacement] [immediate]
 //! ```
 //!
-//! ### REX 前缀 (0x40 ~ 0x4F)
+//! ### REX prefix (0x40..=0x4F)
 //!
-//! 格式：`0100 WRXB`
-//! - W：操作数宽度为 64 位
-//! - R：扩展 ModRM.reg（从 3 位扩展到 4 位，支持 R8-R15）
-//! - X：扩展 SIB.index
-//! - B：扩展 ModRM.rm 或操作码的寄存器字段
+//! Format: `0100 WRXB`.
+//! - W: 64-bit operand width.
+//! - R: extend ModRM.reg (3 → 4 bits, enabling R8..=R15).
+//! - X: extend SIB.index.
+//! - B: extend ModRM.rm (or the register baked into the opcode).
 //!
-//! ### ModRM 字节
+//! ### ModRM byte
 //!
-//! 格式：`mm_rrr_mmm`（2+3+3 位）
-//! - mod (mm)：寻址模式
-//!   - 00 = 寄存器间接（[reg]，特殊情况：rm=101 → [RIP+disp32]）
-//!   - 01 = 寄存器间接 + 8 位偏移（[reg+disp8]）
-//!   - 10 = 寄存器间接 + 32 位偏移（[reg+disp32]）
-//!   - 11 = 寄存器直接（reg 本身）
-//! - reg (rrr)：寄存器操作数或操作码扩展（subcode）
-//! - rm (mmm)：寄存器/内存操作数（特殊情况：rm=100 → 后接 SIB 字节）
+//! Format: `mm_rrr_mmm` (2 + 3 + 3 bits).
+//! - `mod` (mm): addressing mode.
+//!   - 00 = register indirect (`[reg]`; special case: `rm=101` → `[RIP+disp32]`).
+//!   - 01 = register indirect + 8-bit displacement (`[reg+disp8]`).
+//!   - 10 = register indirect + 32-bit displacement (`[reg+disp32]`).
+//!   - 11 = register direct (the register itself).
+//! - `reg` (rrr): register operand or opcode extension (subcode).
+//! - `rm` (mmm): register / memory operand (special case: `rm=100` → SIB
+//!   byte follows).
 
 use std::collections::HashMap;
 
 use crate::backend::asm::{AsmInst, AsmLabel, AsmProgram, Reg64};
 
-/// 编码后的程序，包含最终的机器码字节序列。
+/// Encoded program, carrying the finished machine-code byte sequence.
 #[derive(Debug, Clone)]
 pub struct EncodedProgram {
-    /// .text 段的机器码字节，可直接写入 ELF 文件
+    /// `.text` bytes, ready to be written into an ELF / PE image.
     pub text: Vec<u8>,
 }
 
-/// 单条 `AsmInst` 在最终 `.text` 中对应的字节范围。
+/// Byte range that a single `AsmInst` occupies inside the emitted `.text`.
 ///
-/// `dump_hex_listing()` 使用这份元数据直接从生产编码结果切片，
-/// 避免再维护一套独立的调试编码器。
+/// `dump_hex_listing()` slices directly into the real encoder output using
+/// this metadata, so there is no need for a parallel debug-only encoder.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct EncodedInst {
-    /// 指令在 `.text` 中的起始偏移。
+    /// Start offset of the instruction inside `.text`.
     pub offset: usize,
-    /// 指令编码后的字节长度。标签等伪指令长度为 0。
+    /// Encoded byte length. Labels and other pseudo-instructions have length 0.
     pub len: usize,
 }
 
-/// Fixup 的种类。
+/// Kind of a fixup.
 ///
-/// 目前仅支持一种：从下一条指令的 IP 计算的 32 位相对偏移。
-/// 这覆盖了 x86_64 中所有近跳转（JMP/Jcc）和近调用（CALL）的需求。
+/// Only one variant today: a 32-bit relative displacement whose base point is
+/// the next instruction's IP. This covers every near jump (JMP / Jcc) and
+/// near CALL that the Brainfuck backend emits.
 #[derive(Debug, Clone, Copy)]
 enum FixupKind {
-    /// 32 位相对偏移，基准点为 fixup 位置之后 4 字节处（即下一条指令的 IP）。
+    /// 32-bit signed relative displacement, relative to the four bytes that
+    /// follow the fixup site (i.e. the IP of the next instruction).
     ///
-    /// 计算公式：`rel32 = target_offset - (fixup_at + 4)`
+    /// `rel32 = target_offset - (fixup_at + 4)`
     ///
-    /// 之所以 +4，是因为 CPU 在执行跳转时，IP 已经指向了 rel32 字段之后。
+    /// The `+4` reflects that by the time the CPU executes the jump, RIP has
+    /// already advanced past the `rel32` field.
     Rel32FromNextInsn,
 }
 
-/// 一个待回填的记录。
+/// A record of a placeholder that still needs to be patched.
 ///
-/// 在编码阶段，当遇到跳转/调用指令时，目标偏移还不确定
-/// （可能是前向引用），所以先写入 4 字节零占位符，
-/// 并记录一个 Fixup，留待所有指令编码完成后再回填。
+/// During encoding, jump and call targets are not yet known (forward refs),
+/// so four zero bytes are emitted and a `Fixup` is queued. The fixup is
+/// resolved once the whole program has been encoded.
 #[derive(Debug, Clone, Copy)]
 struct Fixup {
-    /// 跳转/调用的目标标签
+    /// Target label of the jump or call.
     label: AsmLabel,
 
-    /// 占位符在 `bytes` 缓冲区中的起始偏移
+    /// Offset of the placeholder inside `bytes`.
     at: usize,
 
-    /// fixup 的种类（决定如何计算回填值）
+    /// Fixup kind, which determines how the patched value is computed.
     kind: FixupKind,
 }
 
-/// 机器码编码缓冲区。
+/// Machine-code encoding buffer.
 ///
-/// 提供了一组底层方法用于：
-/// - 写入字节/整数到缓冲区
-/// - 绑定标签到当前偏移
-/// - 记录 fixup
-/// - 最终回填所有 fixup 并输出完整的机器码
+/// Exposes low-level helpers that:
+/// - append bytes and integers,
+/// - bind labels to the current offset,
+/// - record fixups,
+/// - resolve all fixups and hand back the finished machine-code buffer.
 ///
-/// 使用流程：
+/// Intended usage:
 /// ```text
-/// 1. 创建 CodeBuffer
-/// 2. 对每条指令：调用 encode_inst 写入字节
-/// 3. 调用 finish() 回填 fixup 并取出 bytes
+/// 1. Construct a CodeBuffer.
+/// 2. For each instruction: call encode_inst to append its bytes.
+/// 3. Call finish() to resolve fixups and obtain bytes + label map.
 /// ```
 struct CodeBuffer {
-    /// 编码后的机器码字节缓冲区
+    /// Machine-code byte buffer.
     bytes: Vec<u8>,
 
-    /// 标签到字节偏移的映射。
+    /// Map of label → byte offset.
     ///
-    /// 在编码过程中，每遇到一个 Label 伪指令，
-    /// 就将该标签映射到当前的 `bytes.len()`。
+    /// Each time a `Label` pseudo-instruction is encountered during encoding,
+    /// the label is bound to the current length of `bytes`.
     labels: HashMap<AsmLabel, usize>,
 
-    /// 待回填的 fixup 列表。
-    ///
-    /// 在 finish() 阶段统一处理。
+    /// Fixups awaiting resolution in `finish()`.
     fixups: Vec<Fixup>,
 }
 
 impl CodeBuffer {
-    /// 创建一个空的代码缓冲区
+    /// Create an empty code buffer.
     fn new() -> Self {
         Self {
             bytes: Vec::new(),
@@ -135,17 +141,16 @@ impl CodeBuffer {
         }
     }
 
-    /// 返回当前写入位置（即已写入的字节数）。
-    ///
-    /// 这个值同时也是下一个字节将要写入的偏移位置。
+    /// Return the current write position (i.e. number of bytes emitted so
+    /// far), which is also the offset of the next byte.
     fn pos(&self) -> usize {
         self.bytes.len()
     }
 
-    /// 将标签绑定到当前偏移位置。
+    /// Bind a label to the current byte offset.
     ///
-    /// 之后的 fixup 回填会使用这个偏移作为跳转目标。
-    /// 如果同一个标签被绑定两次，后者会覆盖前者（通常这是 bug）。
+    /// Fixup resolution uses this offset as the jump target. Binding the
+    /// same label twice is (almost always) a bug and is rejected.
     fn bind_label(&mut self, label: AsmLabel) {
         let previous = self.labels.insert(label, self.pos());
         assert!(
@@ -155,7 +160,7 @@ impl CodeBuffer {
         );
     }
 
-    /// 写入单个字节
+    /// Append one byte.
     fn emit_u8(&mut self, b: u8) {
         self.bytes.push(b);
     }
@@ -164,24 +169,26 @@ impl CodeBuffer {
         self.bytes.extend_from_slice(chunk);
     }
 
-    /// 写入 32 位有符号整数（小端序）。
+    /// Append a little-endian 32-bit signed integer.
     ///
-    /// x86_64 使用小端序，即最低有效字节在最低地址。
+    /// x86_64 is little-endian: the least-significant byte sits at the lowest
+    /// address.
     fn emit_i32(&mut self, v: i32) {
         self.bytes.extend_from_slice(&v.to_le_bytes());
     }
 
-    /// 写入 64 位有符号整数（小端序）。
+    /// Append a little-endian 64-bit signed integer.
     fn emit_i64(&mut self, v: i64) {
         self.bytes.extend_from_slice(&v.to_le_bytes());
     }
 
-    /// 写入一个 rel32 占位符（4 字节零），并记录对应的 fixup。
+    /// Emit a 4-byte zero placeholder and record the matching fixup.
     ///
-    /// 这是跳转和调用指令的核心：先预留空间，事后回填。
+    /// This is the core helper for every jump / call: reserve space now,
+    /// patch in the real displacement later.
     fn emit_rel32_fixup(&mut self, label: AsmLabel) {
         let at = self.pos();
-        self.emit_i32(0); // 4 字节零占位符
+        self.emit_i32(0); // four-byte zero placeholder
         self.fixups.push(Fixup {
             label,
             at,
@@ -189,42 +196,44 @@ impl CodeBuffer {
         });
     }
 
-    /// 完成编码：回填所有 fixup，返回最终的机器码字节序列。
+    /// Finalise encoding: apply every fixup and return the machine-code
+    /// buffer along with the label → offset map.
     ///
-    /// ## Fixup 回填算法
+    /// ## Fixup algorithm (`Rel32FromNextInsn`)
     ///
-    /// 对于每个 `Rel32FromNextInsn` 类型的 fixup：
-    /// 1. 从 `labels` 中查找目标标签的偏移 `target`
-    /// 2. 计算下一条指令的 IP：`next_ip = fixup.at + 4`
-    /// 3. 计算相对偏移：`rel = target - next_ip`
-    /// 4. 检查 `rel` 是否在 i32 范围内（±2GB）
-    /// 5. 将 `rel` 的小端序表示写回 `bytes[fixup.at..fixup.at+4]`
+    /// 1. Look up the target label's offset in `labels`.
+    /// 2. Next-instruction IP: `next_ip = fixup.at + 4`.
+    /// 3. Displacement: `rel = target - next_ip`.
+    /// 4. Verify `rel` fits in `i32` (a ±2 GiB range).
+    /// 5. Write the little-endian `rel32` into
+    ///    `bytes[fixup.at..fixup.at + 4]`.
     ///
-    /// ## Panic
+    /// ## Panics
     ///
-    /// - 如果引用了未绑定的标签
-    /// - 如果相对偏移超出 i32 范围（代码段 > 2GB 时才会发生）
+    /// - Jump to a label that was never bound.
+    /// - Displacement does not fit in `i32` (requires a `.text` larger than
+    ///   2 GiB, which is well outside anything this backend produces).
     fn finish(mut self) -> (Vec<u8>, HashMap<AsmLabel, usize>) {
         for fixup in &self.fixups {
-            // 查找目标标签的偏移
+            // Look up the target label offset.
             let target = *self
                 .labels
                 .get(&fixup.label)
                 .unwrap_or_else(|| panic!("unknown label: {:?}", fixup.label))
                 as i64;
 
-            // 下一条指令的 IP = fixup 位置 + 4 字节（rel32 字段本身的长度）
+            // Next-instruction IP = fixup site + 4 (the rel32 field width).
             let next_ip = (fixup.at + 4) as i64;
 
-            // 相对偏移 = 目标 - 下一条指令的 IP
+            // Relative displacement = target - next_ip.
             let rel = target - next_ip;
 
-            // 安全检查：确保相对偏移能用 32 位表示
+            // Safety: the displacement must fit in a 32-bit signed integer.
             let rel32 = i32::try_from(rel).expect("rel32 out of range");
 
             match fixup.kind {
                 FixupKind::Rel32FromNextInsn => {
-                    // 将计算出的相对偏移写回占位符位置
+                    // Write the displacement back into the placeholder slot.
                     self.bytes[fixup.at..fixup.at + 4].copy_from_slice(&rel32.to_le_bytes());
                 }
             }
@@ -234,13 +243,15 @@ impl CodeBuffer {
     }
 }
 
-/// 将 `AsmProgram` 编码为机器码。
+/// Encode an `AsmProgram` into machine code.
 ///
-/// 这是本模块的入口函数，供 `x86_64/mod.rs` 调用。
+/// Entry point of this module; called by `x86_64/mod.rs`.
 pub fn encode_program(program: &AsmProgram) -> EncodedProgram {
     encode_program_with_inst_map(program).0
 }
 
+/// Encode an `AsmProgram` and return both the encoded bytes and a map from
+/// each [`AsmLabel`] to its resolved byte offset inside `.text`.
 pub(crate) fn encode_program_with_labels(
     program: &AsmProgram,
 ) -> (EncodedProgram, HashMap<AsmLabel, usize>) {
@@ -252,7 +263,8 @@ pub(crate) fn encode_program_with_labels(
     (EncodedProgram { text }, labels)
 }
 
-/// 将 `AsmProgram` 编码为机器码，并保留每条指令在 `.text` 中的范围信息。
+/// Encode an `AsmProgram` into machine code, preserving the byte range of
+/// every input instruction inside `.text`.
 pub(crate) fn encode_program_with_inst_map(
     program: &AsmProgram,
 ) -> (EncodedProgram, Vec<EncodedInst>) {
@@ -272,15 +284,12 @@ pub(crate) fn encode_program_with_inst_map(
     (EncodedProgram { text }, inst_map)
 }
 
-// ============================================================================
-// 辅助编码函数
-// ============================================================================
-
-/// 返回寄存器在 x86_64 编码中的数字编号。
+/// Return the x86_64 register number for a `Reg64`.
 ///
-/// 低 3 位用于 ModRM/SIB/opcode，第 4 位用于 REX 的 R/B/X 扩展。
-///
-/// 注意：编号中跳过了 3(RBX)、4(RSP)、5(RBP)，因为本编译器不使用这些寄存器。
+/// The low three bits go into ModRM / SIB / opcode fields; the fourth bit
+/// feeds the REX R/B/X extension. Note that this numbering skips nothing —
+/// even registers this backend never references are assigned their canonical
+/// x86 numbers.
 fn reg_num(reg: Reg64) -> u8 {
     match reg {
         Reg64::Rax => 0,  // 000
@@ -301,38 +310,40 @@ fn reg_num(reg: Reg64) -> u8 {
     }
 }
 
-/// 发射 REX.W 前缀字节。
+/// Emit a REX.W prefix byte.
 ///
-/// REX 字节格式：`0100 WRXB`
+/// REX byte format: `0100 WRXB`.
 ///
-/// 参数 `r`, `x`, `b` 分别是 R/X/B 位的值（仅低 1 位有效）：
-/// - `r`：扩展 ModRM.reg 字段 → 传入 `reg_num >> 3`
-/// - `x`：扩展 SIB.index 字段 → 通常为 0（本编译器不使用 SIB）
-/// - `b`：扩展 ModRM.rm 字段 → 传入 `rm_num >> 3`
+/// `r`, `x`, `b` are the single bits of the R / X / B fields:
+/// - `r`: extension of ModRM.reg → pass `reg_num >> 3`.
+/// - `x`: extension of SIB.index → usually `0` (this backend does not use
+///   SIB beyond a single fixed case).
+/// - `b`: extension of ModRM.rm  → pass `rm_num >> 3`.
 ///
-/// 基础值 0x48 = `0100_1000`（W=1, R=0, X=0, B=0），
-/// 表示 64 位操作数宽度。
+/// Base value `0x48 = 0100_1000` means `W=1` (64-bit operand width) with all
+/// other bits clear.
 fn emit_rex_w(buf: &mut CodeBuffer, r: u8, x: u8, b: u8) {
     let rex = 0x48 | ((r & 1) << 2) | ((x & 1) << 1) | (b & 1);
     buf.emit_u8(rex);
 }
 
-/// 发射 "寄存器 op 符号扩展的32位立即数" 格式的指令。
+/// Emit `op reg, sign-extended imm32` (register + 32-bit sign-extended
+/// immediate).
 ///
-/// 编码：`REX.W + 0x81 + ModRM(11, subcode, rm) + imm32`
+/// Encoding: `REX.W + 0x81 + ModRM(11, subcode, rm) + imm32`.
 ///
-/// `subcode` 是 ModRM.reg 字段，用作操作码扩展：
+/// `subcode` selects the opcode extension (ModRM.reg field):
 /// - 0 → ADD
 /// - 1 → OR
 /// - 4 → AND
 /// - 5 → SUB
 /// - 7 → CMP
 ///
-/// imm32 会被 CPU 符号扩展到 64 位。
+/// The CPU sign-extends `imm32` to 64 bits.
 fn emit_reg_imm32(buf: &mut CodeBuffer, subcode: u8, reg: Reg64, imm: i32) {
     let rm = reg_num(reg);
     emit_rex_w(buf, 0, 0, rm >> 3);
-    buf.emit_u8(0x81); // 操作码：r/m64, imm32 格式
+    buf.emit_u8(0x81); // opcode: r/m64, imm32 form
     buf.emit_u8(0b11_000_000 | ((subcode & 7) << 3) | (rm & 7));
     buf.emit_i32(imm);
 }
@@ -383,15 +394,16 @@ fn emit_rip_rel(buf: &mut CodeBuffer, opcode: u8, subcode_or_reg: u8, label: Asm
     buf.emit_rel32_fixup(label);
 }
 
-/// 发射逻辑右移指令：`shr reg, imm8`。
+/// Emit a logical-right-shift instruction: `shr reg, imm8`.
 ///
-/// 编码：`REX.W + 0xC1 + ModRM(11, 5, rm) + imm8`
+/// Encoding: `REX.W + 0xC1 + ModRM(11, 5, rm) + imm8`.
 ///
-/// ModRM.reg = 5 表示 SHR 操作（同一操作码组中：4=SHL, 5=SHR, 7=SAR）。
+/// `ModRM.reg = 5` selects SHR in the shift group (4 = SHL, 5 = SHR,
+/// 7 = SAR).
 fn emit_shift_right_imm8(buf: &mut CodeBuffer, reg: Reg64, imm: u8) {
     let rm = reg_num(reg);
     emit_rex_w(buf, 0, 0, rm >> 3);
-    buf.emit_u8(0xC1); // 移位指令组（imm8 操作数）
+    buf.emit_u8(0xC1); // shift group (imm8 operand)
     buf.emit_u8(0b11_000_000 | (5 << 3) | (rm & 7)); // subcode=5 → SHR
     buf.emit_u8(imm);
 }
@@ -410,38 +422,33 @@ fn emit_mem8_disp0(buf: &mut CodeBuffer, opcode: u8, subcode: u8, reg: Reg64, im
     buf.emit_u8(imm);
 }
 
-/// 发射条件跳转指令：`0F cc rel32`。
+/// Emit a conditional near jump: `0F cc rel32`.
 ///
-/// 所有近条件跳转共享这个编码格式，cc 字节决定跳转条件。
-/// rel32 是相对于下一条指令 IP 的偏移。
+/// Every near Jcc uses this encoding, with `cc` selecting the condition. The
+/// `rel32` is relative to the IP of the instruction that follows.
 fn emit_jcc_rel32(buf: &mut CodeBuffer, cc: u8, label: AsmLabel) {
-    buf.emit_u8(0x0F); // 双字节操作码前缀
-    buf.emit_u8(cc); // 条件码
-    buf.emit_rel32_fixup(label); // 32 位相对偏移（待回填）
+    buf.emit_u8(0x0F); // two-byte opcode prefix
+    buf.emit_u8(cc); // condition code
+    buf.emit_rel32_fixup(label); // 32-bit relative displacement (fixup)
 }
 
-// ============================================================================
-// 主编码函数
-// ============================================================================
-
-/// 将单条 `AsmInst` 编码为机器码字节，写入 `CodeBuffer`。
+/// Encode a single `AsmInst` into the code buffer.
 ///
-/// 每种指令的编码细节在各 match 分支中详细注释。
+/// Per-instruction encoding details live in the matching match arm.
 fn encode_inst(buf: &mut CodeBuffer, inst: &AsmInst) {
     match inst {
-        // ========== 伪指令 ==========
+        // Pseudo-instructions.
         AsmInst::Label(label) => {
-            // 标签不产生字节，只记录当前偏移
+            // A label emits no bytes, it just records the current offset.
             buf.bind_label(*label);
         }
 
-        // ========== mov r64, imm64 ==========
+        // mov r64, imm64.
         //
-        // 唯一的 64 位立即数加载指令。
-        // 编码：REX.W + (0xB8 + rd) + imm64
-        //
-        // 操作码 0xB8~0xBF 的低 3 位直接编码目标寄存器编号。
-        // 总长度：10 字节（1 REX + 1 opcode + 8 imm64）。
+        // The only instruction that loads a full 64-bit immediate.
+        // Encoding: REX.W + (0xB8 + rd) + imm64. The low three bits of the
+        // opcode carry the destination register number. Total length: 10
+        // bytes (1 REX + 1 opcode + 8 imm64).
         AsmInst::MovRegImm64(reg, imm) => {
             let code = reg_num(*reg);
             emit_rex_w(buf, 0, 0, code >> 3);
@@ -449,20 +456,17 @@ fn encode_inst(buf: &mut CodeBuffer, inst: &AsmInst) {
             buf.emit_i64(*imm);
         }
 
-        // ========== mov dst, src ==========
+        // mov dst, src.
         //
-        // 编码：REX.W + 0x89 + ModRM(11, src, dst)
-        //
-        // 0x89 的方向是 r → r/m，所以：
-        // - ModRM.reg = src（源寄存器）
-        // - ModRM.rm  = dst（目标寄存器）
+        // Encoding: REX.W + 0x89 + ModRM(11, src, dst). 0x89 is the r → r/m
+        // direction, so ModRM.reg = src and ModRM.rm = dst.
         AsmInst::MovRegReg(dst, src) => {
             emit_rex_w(buf, reg_num(*src) >> 3, 0, reg_num(*dst) >> 3);
             buf.emit_u8(0x89);
             buf.emit_u8(0b11_000_000 | ((reg_num(*src) & 7) << 3) | (reg_num(*dst) & 7));
         }
 
-        // ========== add r64, imm32 ==========
+        // add r64, imm32.
         AsmInst::AddRegImm32(reg, imm) => {
             emit_reg_imm32(buf, 0, *reg, *imm); // subcode 0 = ADD
         }
@@ -471,43 +475,42 @@ fn encode_inst(buf: &mut CodeBuffer, inst: &AsmInst) {
             emit_reg_imm32(buf, 4, *reg, *imm); // subcode 4 = AND
         }
 
-        // ========== add dst, src ==========
+        // add dst, src.
         //
-        // 编码：REX.W + 0x01 + ModRM(11, src, dst)
-        // 0x01 是 ADD r/m64, r64 的操作码
+        // Encoding: REX.W + 0x01 + ModRM(11, src, dst). 0x01 is the opcode
+        // for ADD r/m64, r64.
         AsmInst::AddRegReg(dst, src) => {
             emit_rex_w(buf, reg_num(*src) >> 3, 0, reg_num(*dst) >> 3);
             buf.emit_u8(0x01);
             buf.emit_u8(0b11_000_000 | ((reg_num(*src) & 7) << 3) | (reg_num(*dst) & 7));
         }
 
-        // ========== sub dst, src ==========
+        // sub dst, src.
         //
-        // 编码：REX.W + 0x29 + ModRM(11, src, dst)
-        // 0x29 是 SUB r/m64, r64 的操作码
+        // Encoding: REX.W + 0x29 + ModRM(11, src, dst). 0x29 is the opcode
+        // for SUB r/m64, r64.
         AsmInst::SubRegReg(dst, src) => {
             emit_rex_w(buf, reg_num(*src) >> 3, 0, reg_num(*dst) >> 3);
             buf.emit_u8(0x29);
             buf.emit_u8(0b11_000_000 | ((reg_num(*src) & 7) << 3) | (reg_num(*dst) & 7));
         }
 
-        // ========== cmp lhs, rhs ==========
+        // cmp lhs, rhs.
         //
-        // 编码：REX.W + 0x39 + ModRM(11, rhs, lhs)
-        // 0x39 是 CMP r/m64, r64 的操作码
-        // 语义：计算 lhs - rhs，设置 EFLAGS，结果被丢弃
+        // Encoding: REX.W + 0x39 + ModRM(11, rhs, lhs). Semantically computes
+        // `lhs - rhs`, updates EFLAGS, discards the result.
         AsmInst::CmpRegReg(lhs, rhs) => {
             emit_rex_w(buf, reg_num(*rhs) >> 3, 0, reg_num(*lhs) >> 3);
             buf.emit_u8(0x39);
             buf.emit_u8(0b11_000_000 | ((reg_num(*rhs) & 7) << 3) | (reg_num(*lhs) & 7));
         }
 
-        // ========== cmp r64, imm32 ==========
+        // cmp r64, imm32.
         AsmInst::CmpRegImm32(reg, imm) => {
             emit_reg_imm32(buf, 7, *reg, *imm); // subcode 7 = CMP
         }
 
-        // ========== shr r64, imm8 ==========
+        // shr r64, imm8.
         AsmInst::ShrRegImm8(reg, imm) => emit_shift_right_imm8(buf, *reg, *imm),
 
         AsmInst::LeaRegMem(dst, base, disp) => emit_lea_reg_mem(buf, *dst, *base, *disp),
@@ -524,42 +527,40 @@ fn encode_inst(buf: &mut CodeBuffer, inst: &AsmInst) {
             emit_mem_reg64(buf, 0x8B, *base, *disp, *dst);
         }
 
-        // ========== add byte ptr [reg+0], imm8 ==========
+        // add byte ptr [reg+0], imm8.
         //
-        // 编码：REX.W + 0x80 + ModRM(01, 0, rm) + disp8(0) + imm8
+        // Encoding: REX.W + 0x80 + ModRM(01, 0, rm) + disp8(0) + imm8.
+        // 0x80 is the byte ALU group, with ModRM.reg = 0 selecting ADD.
         //
-        // 0x80 是字节 ALU 操作指令组，ModRM.reg=0 表示 ADD。
+        // Why `mod=01` (i.e. [reg+disp8]) instead of `mod=00` (i.e. [reg]):
+        // when `rm & 7 == 5` (the low three bits of R13) the CPU interprets
+        // `mod=00` as `[RIP+disp32]` rather than `[r13]`. Using
+        // `mod=01 + disp8=0` dodges that ambiguity.
         //
-        // 使用 mod=01（[reg+disp8]）而非 mod=00（[reg]）的原因：
-        // 当 rm & 7 == 5（即 R13 的低 3 位）时，mod=00 会被 CPU
-        // 解释为 [RIP+disp32] 而不是 [r13]。使用 mod=01 + disp8=0
-        // 可以避免这个歧义。
-        //
-        // ⚠ 潜在问题：当 rm & 7 == 4（即 R12）时，CPU 会期望
-        //   ModRM 之后跟一个 SIB 字节，但当前代码没有发射 SIB。
-        //   目前安全，因为 codegen 仅对 R13 使用此指令。
+        // Caveat: when `rm & 7 == 4` (e.g. R12) the CPU expects a SIB byte
+        // after ModRM, which this encoder does not emit. Safe in practice
+        // because codegen only issues this form with R13.
         AsmInst::AddMem8Imm8(reg, imm) => {
             emit_mem8_disp0(buf, 0x80, 0, *reg, *imm as u8);
         }
 
-        // ========== mov byte ptr [reg+0], imm8 ==========
+        // mov byte ptr [reg+0], imm8.
         //
-        // 编码：REX.W + 0xC6 + ModRM(01, 0, rm) + disp8(0) + imm8
-        // 0xC6 是 MOV r/m8, imm8 的操作码
+        // Encoding: REX.W + 0xC6 + ModRM(01, 0, rm) + disp8(0) + imm8.
+        // 0xC6 is the opcode for MOV r/m8, imm8.
         AsmInst::MovMem8Imm8(reg, imm) => {
             emit_mem8_disp0(buf, 0xC6, 0, *reg, *imm);
         }
 
-        // ========== cmp byte ptr [reg+0], imm8 ==========
+        // cmp byte ptr [reg+0], imm8.
         //
-        // 编码：REX.W + 0x80 + ModRM(01, 7, rm) + disp8(0) + imm8
-        // ModRM.reg = 7 表示 CMP
+        // Encoding: REX.W + 0x80 + ModRM(01, 7, rm) + disp8(0) + imm8.
+        // ModRM.reg = 7 selects CMP in the byte ALU group.
         AsmInst::CmpMem8Imm8(reg, imm) => {
             emit_mem8_disp0(buf, 0x80, 7, *reg, *imm);
         }
 
-        // ========== 条件跳转 ==========
-        // 编码格式统一：0x0F + cc + rel32
+        // Conditional near jumps: 0x0F + cc + rel32.
         AsmInst::Jz(label) => emit_jcc_rel32(buf, 0x84, *label), // ZF=1
         AsmInst::Jnz(label) => emit_jcc_rel32(buf, 0x85, *label), // ZF=0
         AsmInst::Jb(label) => emit_jcc_rel32(buf, 0x82, *label), // CF=1 (unsigned <)
@@ -567,16 +568,13 @@ fn encode_inst(buf: &mut CodeBuffer, inst: &AsmInst) {
         AsmInst::Jl(label) => emit_jcc_rel32(buf, 0x8C, *label), // SF≠OF (signed <)
         AsmInst::Jge(label) => emit_jcc_rel32(buf, 0x8D, *label), // SF=OF (signed >=)
 
-        // ========== 无条件跳转 ==========
-        // 编码：0xE9 + rel32
+        // Unconditional near jump: 0xE9 + rel32.
         AsmInst::Jmp(label) => {
             buf.emit_u8(0xE9);
             buf.emit_rel32_fixup(*label);
         }
 
-        // ========== 调用 ==========
-        // 编码：0xE8 + rel32
-        // CALL 隐式执行 push(RIP)，然后 jmp target
+        // Near call: 0xE8 + rel32. CALL implicitly pushes RIP then jumps.
         AsmInst::Call(label) => {
             buf.emit_u8(0xE8);
             buf.emit_rel32_fixup(*label);
@@ -586,25 +584,20 @@ fn encode_inst(buf: &mut CodeBuffer, inst: &AsmInst) {
             emit_rip_rel(buf, 0xFF, 2, *label, 0);
         }
 
-        // ========== 返回 ==========
-        // 编码：0xC3（近返回）
-        // RET 隐式执行 pop(RIP)
+        // Near return: 0xC3. RET implicitly pops RIP.
         AsmInst::Ret => buf.emit_u8(0xC3),
 
-        // ========== 清除方向标志 ==========
-        // 编码：0xFC
+        // Clear direction flag: 0xFC.
         AsmInst::Cld => buf.emit_u8(0xFC),
 
-        // ========== rep movsb ==========
-        // 编码：0xF3（REP 前缀）+ 0xA4（MOVSB）
-        // 重复 rcx 次：byte [rdi++] = byte [rsi++]
+        // rep movsb: 0xF3 (REP prefix) + 0xA4 (MOVSB).
+        // Repeats rcx times: byte [rdi++] = byte [rsi++].
         AsmInst::RepMovsb => {
             buf.emit_u8(0xF3);
             buf.emit_u8(0xA4);
         }
 
-        // ========== syscall ==========
-        // 编码：0x0F 0x05
+        // syscall: 0x0F 0x05.
         AsmInst::Syscall => {
             buf.emit_u8(0x0F);
             buf.emit_u8(0x05);

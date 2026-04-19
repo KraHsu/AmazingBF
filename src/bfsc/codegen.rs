@@ -1,7 +1,17 @@
+//! BFS-to-Brainfuck code emitter.
+//!
+//! Walks the type-checked AST and emits a BF source string in a single pass.
+//! `BfEmitter` maintains the current tape pointer, a bitmap of live temp cells
+//! above `MemMap::temp_base`, and a library of n-byte primitives (arithmetic,
+//! comparison, I/O) so higher-level statements compose without reimplementing
+//! BF idioms. Output is deterministic: identical input yields identical BF.
+
 use super::ast::*;
 use super::layout::MemMap;
 use std::collections::BTreeSet;
 
+/// Emit a Brainfuck source string for the type-checked BFS statement list
+/// against the frozen memory layout produced by `typeck`.
 pub(crate) fn emit(stmts: &[Stmt], layout: &MemMap) -> String {
     let mut emitter = BfEmitter::new(layout);
     for s in stmts {
@@ -9,10 +19,6 @@ pub(crate) fn emit(stmts: &[Stmt], layout: &MemMap) -> String {
     }
     emitter.output
 }
-
-// ============================================================
-//  BfEmitter
-// ============================================================
 
 struct BfEmitter<'a> {
     output: String,
@@ -35,9 +41,7 @@ impl<'a> BfEmitter<'a> {
         self.layout.temp_base
     }
 
-    // ============================================================
-    //  Temp allocator
-    // ============================================================
+    // Temp allocator.
 
     fn talloc(&mut self) -> usize {
         let mut i = 0;
@@ -80,9 +84,7 @@ impl<'a> BfEmitter<'a> {
         self.used = s;
     }
 
-    // ============================================================
-    //  BF emission primitives
-    // ============================================================
+    // BF emission primitives.
 
     fn raw(&mut self, s: &str) {
         self.output.push_str(s);
@@ -291,9 +293,7 @@ impl<'a> BfEmitter<'a> {
         t
     }
 
-    // ============================================================
-    //  Single-byte comparisons (a, b: consumed temps; returns new temp)
-    // ============================================================
+    // Single-byte comparisons (a, b: consumed temps; returns new temp).
 
     fn cmp_gt(&mut self, a: usize, b: usize) -> usize {
         let result = self.talloc();
@@ -375,27 +375,13 @@ impl<'a> BfEmitter<'a> {
     fn cmp_lt(&mut self, a: usize, b: usize) -> usize {
         self.cmp_gt(b, a)
     }
-    fn cmp_ge(&mut self, a: usize, b: usize) -> usize {
-        let r = self.cmp_gt(b, a);
-        self.negate(r)
-    }
-    fn cmp_le(&mut self, a: usize, b: usize) -> usize {
-        let r = self.cmp_gt(a, b);
-        self.negate(r)
-    }
     fn cmp_eq(&mut self, a: usize, b: usize) -> usize {
         self.sub_from(b, a);
         self.tfree(b);
         self.negate(a)
     }
-    fn cmp_ne(&mut self, a: usize, b: usize) -> usize {
-        let r = self.cmp_eq(a, b);
-        self.negate(r)
-    }
 
-    // ============================================================
-    //  Multi-byte comparisons (n >= 1; a, b: consumed n-cell temps; returns 1-cell temp)
-    // ============================================================
+    // Multi-byte comparisons (n >= 1; a, b: consumed n-cell temps; returns 1-cell temp).
 
     // a < b unsigned little-endian n bytes
     fn cmp_lt_n(&mut self, a: usize, b: usize, n: usize) -> usize {
@@ -512,9 +498,7 @@ impl<'a> BfEmitter<'a> {
         self.negate(r)
     }
 
-    // ============================================================
-    //  Multi-byte arithmetic
-    // ============================================================
+    // Multi-byte arithmetic.
 
     // dst[0..n] += src[0..n], carry-aware, wraps at 2^(8*n). src freed.
     fn add_n(&mut self, dst: usize, src: usize, n: usize) {
@@ -717,20 +701,7 @@ impl<'a> BfEmitter<'a> {
         a
     }
 
-    // ============================================================
-    //  Single-byte arithmetic (legacy, n=1 fast path)
-    // ============================================================
-
-    fn arith_add(&mut self, a: usize, b: usize) -> usize {
-        self.add_to(b, a);
-        self.tfree(b);
-        a
-    }
-    fn arith_sub(&mut self, a: usize, b: usize) -> usize {
-        self.sub_from(b, a);
-        self.tfree(b);
-        a
-    }
+    // Single-byte arithmetic (legacy, n=1 fast path).
 
     fn arith_mul(&mut self, a: usize, b: usize) -> usize {
         let r = self.talloc();
@@ -820,9 +791,7 @@ impl<'a> BfEmitter<'a> {
         a
     }
 
-    // ============================================================
-    //  Array access
-    // ============================================================
+    // Array access.
 
     fn arr_read(&mut self, layout: &super::layout::CellLayout, idx_expr: &Expr) -> (usize, usize) {
         let base = layout.base;
@@ -921,9 +890,7 @@ impl<'a> BfEmitter<'a> {
         self.tfree_n(val, ew);
     }
 
-    // ============================================================
-    //  Number I/O  (single-byte, legacy)
-    // ============================================================
+    // Number I/O (single-byte, legacy).
 
     fn print_num(&mut self, cell: usize) {
         let v = self.talloc();
@@ -1098,9 +1065,7 @@ impl<'a> BfEmitter<'a> {
         self.tfree(tc);
     }
 
-    // ============================================================
-    //  Multi-byte number I/O
-    // ============================================================
+    // Multi-byte number I/O.
 
     // cell *= 10, n bytes in-place
     fn mul10_n(&mut self, cell: usize, n: usize) {
@@ -1293,9 +1258,7 @@ impl<'a> BfEmitter<'a> {
         self.tfree(seen_nz);
     }
 
-    // ============================================================
-    //  Expression evaluation — returns (base_cell, width)
-    // ============================================================
+    // Expression evaluation — returns (base_cell, width).
 
     // Evaluate expression; returns (base, width). Caller must tfree_n(base, width).
     fn eval_expr(&mut self, expr: &Expr) -> (usize, usize) {
@@ -1455,9 +1418,7 @@ impl<'a> BfEmitter<'a> {
         }
     }
 
-    // ============================================================
-    //  Statements
-    // ============================================================
+    // Statements.
 
     fn gen_stmt(&mut self, stmt: &Stmt) {
         match stmt {

@@ -9,12 +9,18 @@ use crate::ir::lower::lower_to_hir;
 use crate::ir::optimize::{optimize_o0, optimize_o1, try_optimize_o2};
 use crate::logging::log_debug;
 
+/// Bundle produced by the shared frontend pipeline, passed from driver to interpreter or backend.
 pub(crate) struct FrontendArtifacts {
+    /// Number of tokens produced by the lexer (for diagnostics / logging).
     pub(crate) token_count: usize,
+    /// Number of AST top-level nodes produced by the parser.
     pub(crate) ast_nodes: usize,
+    /// Optimized HIR program ready for interpretation or LIR lowering.
     pub(crate) hir: HirProgram,
 }
 
+/// Run the shared `lex → parse → lower → optimize` pipeline and return the
+/// artifacts consumed by both `RunMode::Interpret` and the native backend.
 pub(crate) fn build_frontend(config: &DriverConfig) -> Result<FrontendArtifacts> {
     let tokens = lex(&config.source);
     log_debug(format!("lexed source (token_count={})", tokens.len()));

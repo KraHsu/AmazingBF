@@ -1,3 +1,9 @@
+//! BFS parser.
+//!
+//! Recursive-descent parser that turns `SpannedToken` streams into the AST
+//! defined in `super::ast`. Operator precedence is baked into the grammar;
+//! error messages carry byte positions for source-level diagnostics.
+
 use super::BfscError;
 use super::ast::*;
 use super::lexer::{SpannedToken, Token};
@@ -406,6 +412,8 @@ impl<'a> Parser<'a> {
     }
 }
 
+/// Parse a token stream into a vector of top-level `Stmt` nodes; errors carry
+/// byte positions from the input source.
 pub(crate) fn parse(tokens: &[SpannedToken]) -> Result<Vec<Stmt>, BfscError> {
     let mut p = Parser::new(tokens);
     let stmts = p.parse_stmts()?;

@@ -4,7 +4,8 @@
 //! the shipped binaries. Internal pipeline, CLI, IR, runtime, and backend modules stay
 //! crate-private so the implementation can evolve without exposing a large semver surface.
 
-#![allow(non_snake_case)] // package name `AmazingBF` is intentional for branding
+#![forbid(unsafe_code)]
+#![allow(non_snake_case)] // reason: package name `AmazingBF` is intentional for branding
 
 mod app;
 mod backend;

@@ -1,28 +1,30 @@
-//! # 调试输出模块 (debug.rs)
+//! Debug-output module (debug.rs).
 //!
-//! 本模块为 Brainfuck 编译器的 x86_64 后端提供两种调试输出能力：
+//! Provides two complementary listings for the x86_64 backend:
 //!
-//! - **方案 A**：`dump_asm_listing` —— 将 `AsmProgram` 转换为人类可读的汇编文本，
-//!   类似于 nasm/gas 风格的输出，用于快速查看编译器生成了哪些指令。
+//! - **Scheme A**: `dump_asm_listing` — pretty-prints an `AsmProgram` as
+//!   human-readable assembly text (roughly nasm/gas flavoured). Handy for
+//!   seeing which instructions the compiler actually emitted.
 //!
-//! - **方案 B**：`dump_hex_listing` —— 将 `AsmProgram` 编码为机器码，同时生成
-//!   带偏移量的 hex dump，每行显示"偏移 : 字节序列 : 汇编助记符"，
-//!   用于逐字节核对编码是否正确。
+//! - **Scheme B**: `dump_hex_listing` — encodes the same `AsmProgram` into
+//!   machine code and emits an offset + bytes + mnemonic dump, suitable for
+//!   byte-by-byte verification of the encoder.
 //!
-//! 两者配合使用，可以在不依赖 objdump/gdb 的情况下快速定位编译器 bug。
+//! Used together they make it practical to debug compiler output without
+//! relying on `objdump` or `gdb`.
 //!
-//! ## 使用示例
+//! ## Example
 //!
 //! ```rust,ignore
 //! use crate::backend::debug;
 //!
 //! let asm_program = compile_lir_to_asm(&lir);
 //!
-//! // 方案 A：输出汇编文本
+//! // Scheme A: write assembly text.
 //! let asm_text = debug::dump_asm_listing(&asm_program);
 //! std::fs::write("output.asm", &asm_text)?;
 //!
-//! // 方案 B：输出带 hex 的 listing
+//! // Scheme B: write the hex listing.
 //! let hex_text = debug::dump_hex_listing(&asm_program);
 //! std::fs::write("output.lst", &hex_text)?;
 //! ```
@@ -32,13 +34,9 @@ use std::fmt::Write;
 use crate::backend::asm::{AsmInst, AsmLabel, AsmProgram, Reg64};
 use crate::backend::x86_64::encode::encode_program_with_inst_map;
 
-// ============================================================================
-// 辅助：寄存器名称格式化
-// ============================================================================
-
-/// 将 `Reg64` 枚举值转换为小写的 x86_64 寄存器名称字符串。
+/// Return the lowercase x86_64 mnemonic for a `Reg64`.
 ///
-/// 例如 `Reg64::Rax` → `"rax"`，`Reg64::R13` → `"r13"`。
+/// `Reg64::Rax` → `"rax"`, `Reg64::R13` → `"r13"`, etc.
 fn reg_name(reg: Reg64) -> &'static str {
     match reg {
         Reg64::Rax => "rax",
@@ -67,15 +65,15 @@ fn format_signed_hex_i32(value: i32) -> String {
     }
 }
 
-/// 将标签 ID 格式化为统一的标签名称字符串。
+/// Format a label ID as a stable human-readable name.
 ///
-/// 内部标签（高位 u32 值）会被赋予可读的名称，例如：
+/// Internal labels (high `u32` values) are given symbolic names, e.g.:
 /// - `u32::MAX`     → `"__ensure_tape"`
 /// - `u32::MAX - 1` → `"__oom_exit"`
-/// - 其他高位值    → `"__internal_XXXXXXXX"`（十六进制）
-/// - 普通用户标签  → `"L0"`, `"L1"`, ...
+/// - other high values → `"__internal_XXXXXXXX"` (hex)
+/// - plain user labels → `"L0"`, `"L1"`, ...
 fn label_name(label: AsmLabel) -> String {
-    // 这些常量与 codegen.rs 中的定义保持一致
+    // These constants must stay in sync with `codegen.rs`.
     const INTERNAL_LABEL_ENSURE_TAPE_RAW: u32 = u32::MAX;
     const INTERNAL_LABEL_OOM_EXIT_RAW: u32 = u32::MAX - 1;
     const INTERNAL_LABEL_GROW_LOOP_RAW: u32 = u32::MAX - 2;
@@ -85,26 +83,22 @@ fn label_name(label: AsmLabel) -> String {
         INTERNAL_LABEL_ENSURE_TAPE_RAW => "__ensure_tape".to_string(),
         INTERNAL_LABEL_OOM_EXIT_RAW => "__oom_exit".to_string(),
         INTERNAL_LABEL_GROW_LOOP_RAW => "__grow_loop".to_string(),
-        // 固定语义的内部标签已经在上面单独匹配。
-        // 剩余高位编号视为临时内部标签。
+        // Fixed-semantics internal labels matched above; remaining high IDs are
+        // transient internal labels synthesised during codegen.
         raw if (0xFFFF_0000..INTERNAL_LABEL_RESERVED_MIN_RAW).contains(&raw) => {
             format!("__internal_{:08x}", raw)
         }
-        // 普通用户标签（来自 LIR 的 LabelId）
+        // Plain user label (comes from a LIR `LabelId`).
         raw => format!("L{}", raw),
     }
 }
 
-// ============================================================================
-// 方案 A：汇编文本 Listing
-// ============================================================================
-
-/// 【方案 A】将 `AsmProgram` 转换为人类可读的汇编文本。
+/// **Scheme A**: pretty-print an `AsmProgram` as human-readable assembly.
 ///
-/// 输出格式类似于 nasm/gas 风格，例如：
+/// Output is roughly nasm/gas flavoured, e.g.:
 /// ```text
 /// ; === Brainfuck x86_64 Assembly Listing ===
-/// ; 共 42 条指令
+/// ; 42 instructions total
 ///
 /// __ensure_tape:
 ///     mov     rax, 0x9                    ; syscall: mmap
@@ -112,20 +106,25 @@ fn label_name(label: AsmLabel) -> String {
 ///     ...
 /// ```
 ///
-/// # 参数
-/// - `program`: 要转换的汇编程序
+/// # Parameters
+/// - `program`: the assembly program to format.
 ///
-/// # 返回值
-/// 格式化后的汇编文本字符串
+/// # Returns
+/// The formatted assembly text as a single `String`.
 pub fn dump_asm_listing(program: &AsmProgram) -> String {
     let mut out = String::new();
 
-    // ---- 文件头部注释 ----
+    // Header comment.
     writeln!(out, "; === Brainfuck x86_64 Assembly Listing ===").unwrap();
-    writeln!(out, "; 共 {} 条指令（含标签伪指令）", program.insts.len()).unwrap();
+    writeln!(
+        out,
+        "; {} instructions (including label pseudo-instructions)",
+        program.insts.len()
+    )
+    .unwrap();
     writeln!(out).unwrap();
 
-    // ---- 逐条格式化 ----
+    // One pass per instruction.
     for inst in &program.insts {
         format_inst_asm(&mut out, inst);
     }
@@ -133,20 +132,19 @@ pub fn dump_asm_listing(program: &AsmProgram) -> String {
     out
 }
 
-/// 将单条 `AsmInst` 格式化为汇编文本，写入 `out`。
+/// Format a single `AsmInst` as assembly text and append it to `out`.
 ///
-/// 标签不缩进（顶格），普通指令缩进 4 个空格。
+/// Labels sit at column 0; ordinary instructions are indented by four spaces.
 fn format_inst_asm(out: &mut String, inst: &AsmInst) {
     match inst {
-        // ---- 伪指令：标签定义 ----
+        // Pseudo-instruction: label definition.
         AsmInst::Label(label) => {
-            // 标签前空一行以提高可读性
             writeln!(out, "{}:", label_name(*label)).unwrap();
         }
 
-        // ---- 数据移动 ----
+        // Data movement.
         AsmInst::MovRegImm64(reg, imm) => {
-            // 对于常见的系统调用号，添加注释说明
+            // Annotate common Linux syscall numbers inline.
             let comment = match imm {
                 0 => " ; sys_read",
                 1 => " ; sys_write",
@@ -159,7 +157,7 @@ fn format_inst_asm(out: &mut String, inst: &AsmInst) {
                 out,
                 "    mov     {}, 0x{:x}{}",
                 reg_name(*reg),
-                *imm as u64, // 以无符号十六进制显示
+                *imm as u64, // show as unsigned hex
                 comment
             )
             .unwrap();
@@ -169,7 +167,7 @@ fn format_inst_asm(out: &mut String, inst: &AsmInst) {
             writeln!(out, "    mov     {}, {}", reg_name(*dst), reg_name(*src)).unwrap();
         }
 
-        // ---- 算术运算 ----
+        // Arithmetic.
         AsmInst::AddRegImm32(reg, imm) => {
             writeln!(
                 out,
@@ -198,7 +196,7 @@ fn format_inst_asm(out: &mut String, inst: &AsmInst) {
             writeln!(out, "    sub     {}, {}", reg_name(*dst), reg_name(*src)).unwrap();
         }
 
-        // ---- 比较 ----
+        // Compare.
         AsmInst::CmpRegReg(lhs, rhs) => {
             writeln!(out, "    cmp     {}, {}", reg_name(*lhs), reg_name(*rhs)).unwrap();
         }
@@ -213,7 +211,7 @@ fn format_inst_asm(out: &mut String, inst: &AsmInst) {
             .unwrap();
         }
 
-        // ---- 移位 ----
+        // Shift.
         AsmInst::ShrRegImm8(reg, imm) => {
             writeln!(out, "    shr     {}, {}", reg_name(*reg), imm).unwrap();
         }
@@ -264,9 +262,9 @@ fn format_inst_asm(out: &mut String, inst: &AsmInst) {
             .unwrap();
         }
 
-        // ---- 内存字节操作（Brainfuck 核心） ----
+        // Memory-byte ops (Brainfuck core).
         AsmInst::AddMem8Imm8(reg, imm) => {
-            // 这是 BF 的 '+'/'-' 操作：修改当前单元的值
+            // BF `+` / `-`: mutate the current cell.
             writeln!(
                 out,
                 "    add     byte [{}], 0x{:02x}",
@@ -277,16 +275,16 @@ fn format_inst_asm(out: &mut String, inst: &AsmInst) {
         }
 
         AsmInst::MovMem8Imm8(reg, imm) => {
-            // 这是优化后的 BF 操作：直接设置单元值（如 [-] 优化为 set 0）
+            // Optimised cell assignment (e.g. `[-]` folded into `set 0`).
             writeln!(out, "    mov     byte [{}], 0x{:02x}", reg_name(*reg), imm).unwrap();
         }
 
         AsmInst::CmpMem8Imm8(reg, imm) => {
-            // 用于 BF 的 '[' 和 ']'：比较当前单元是否为零
+            // Zero check used by BF `[` / `]`.
             writeln!(out, "    cmp     byte [{}], 0x{:02x}", reg_name(*reg), imm).unwrap();
         }
 
-        // ---- 条件跳转 ----
+        // Conditional jumps.
         AsmInst::Jz(label) => {
             writeln!(out, "    jz      {}", label_name(*label)).unwrap();
         }
@@ -331,12 +329,12 @@ fn format_inst_asm(out: &mut String, inst: &AsmInst) {
             .unwrap();
         }
 
-        // ---- 无条件跳转 ----
+        // Unconditional jump.
         AsmInst::Jmp(label) => {
             writeln!(out, "    jmp     {}", label_name(*label)).unwrap();
         }
 
-        // ---- 函数调用与返回 ----
+        // Calls and returns.
         AsmInst::Call(label) => {
             writeln!(out, "    call    {}", label_name(*label)).unwrap();
         }
@@ -349,20 +347,24 @@ fn format_inst_asm(out: &mut String, inst: &AsmInst) {
             writeln!(out, "    ret").unwrap();
         }
 
-        // ---- 字符串操作相关 ----
+        // String ops.
         AsmInst::Cld => {
-            writeln!(out, "    cld                         ; 清除方向标志").unwrap();
+            writeln!(
+                out,
+                "    cld                         ; clear direction flag"
+            )
+            .unwrap();
         }
 
         AsmInst::RepMovsb => {
             writeln!(
                 out,
-                "    rep movsb                   ; 复制 rcx 字节: [rsi] -> [rdi]"
+                "    rep movsb                   ; copy rcx bytes: [rsi] -> [rdi]"
             )
             .unwrap();
         }
 
-        // ---- 系统调用 ----
+        // System call.
         AsmInst::Syscall => {
             writeln!(out, "    syscall").unwrap();
         }
@@ -397,14 +399,11 @@ fn format_inst_asm(out: &mut String, inst: &AsmInst) {
     }
 }
 
-// ============================================================================
-// 方案 B：带偏移量的 Hex Dump Listing
-// ============================================================================
-
-/// 【方案 B】将 `AsmProgram` 编码为机器码，并生成带偏移量的 hex listing。
+/// **Scheme B**: encode an `AsmProgram` into machine code and produce a hex
+/// listing with offsets.
 ///
-/// 机器码字节完全来自生产编码器 `encode.rs`，因此 `.lst` 与真实 ELF `.text`
-/// 始终共享同一份编码结果。
+/// The machine-code bytes come directly from the production encoder in
+/// `encode.rs`, so the `.lst` output always matches the real ELF `.text`.
 pub fn dump_hex_listing(program: &AsmProgram) -> String {
     let (encoded, inst_map) = encode_program_with_inst_map(program);
     let mut out = String::new();
@@ -412,7 +411,7 @@ pub fn dump_hex_listing(program: &AsmProgram) -> String {
     writeln!(out, "; === Brainfuck x86_64 Hex Listing ===").unwrap();
     writeln!(
         out,
-        "; 共 {} 条指令，编码后 {} 字节",
+        "; {} instructions, {} encoded bytes",
         program.insts.len(),
         encoded.text.len()
     )
@@ -464,7 +463,7 @@ pub fn dump_hex_listing(program: &AsmProgram) -> String {
     }
 
     writeln!(out).unwrap();
-    writeln!(out, "; 总计 {} 字节机器码", encoded.text.len()).unwrap();
+    writeln!(out, "; total {} bytes of machine code", encoded.text.len()).unwrap();
 
     out
 }

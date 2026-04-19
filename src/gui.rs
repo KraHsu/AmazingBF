@@ -1,3 +1,10 @@
+//! Tauri GUI bootstrap for the `bf-gui` binary (gated on feature `gui`).
+//!
+//! Hosts the interpreter in a worker thread, owns the Tauri main thread, and
+//! wires both sides to a shared `GuiShared` / `GuiIo` pair. Pixels flow out as
+//! coalesced frame messages over a `tauri::ipc::Channel`; keypresses flow in
+//! via the `send_key` IPC command.
+
 use std::sync::Arc;
 use std::sync::mpsc;
 use std::thread;
@@ -57,6 +64,8 @@ fn parse_opt_level(args: &[String]) -> OptLevel {
         .unwrap_or(OptLevel::O1)
 }
 
+/// Entry point of the `bf-gui` binary: parse CLI args, build HIR, spawn the
+/// interpreter thread, and hand the main thread to the Tauri event loop.
 pub(crate) fn run() -> crate::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {

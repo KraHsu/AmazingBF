@@ -1,13 +1,22 @@
+//! HIR interpreter engine.
+//!
+//! Walks a `HirProgram` against a shared [`Tape`] and `RuntimeIo`, terminating
+//! when the instruction list is exhausted. Loop bodies recurse synchronously,
+//! so no explicit call stack exists beyond the host stack. This is the final
+//! stage of the pipeline in `RunMode::Interpret`.
+
 use crate::ir::hir::{HirInst, HirProgram};
 use crate::runtime::host::HostRuntime;
 use crate::runtime::io::{IoError, RuntimeIo};
 use crate::runtime::tape::Tape;
 
+/// Errors raised by the HIR interpreter at runtime.
 #[derive(Debug)]
 pub enum RuntimeError {
+    /// I/O failure while reading or writing Brainfuck cells.
     Io(String),
     /// Reserved for future host-call support in the interpreter.
-    #[allow(dead_code)]
+    #[allow(dead_code)] // reason: constructed once host-call lowering lands
     Host(String),
 }
 
@@ -38,9 +47,12 @@ impl From<IoError> for RuntimeError {
 /// - `RuntimeIo`: input and output
 /// - `HostRuntime`: host extension calls
 pub(crate) struct Interpreter<I: RuntimeIo, H: HostRuntime> {
+    /// Data tape (auto-growing right-side).
     pub(crate) tape: Tape,
+    /// `RuntimeIo` backend used for `,` and `.` instructions.
     pub(crate) io: I,
-    #[allow(dead_code)] // used once host-call lowering reaches the interpreter
+    /// Host-call runtime; unused until host-call lowering reaches the interpreter.
+    #[allow(dead_code)] // reason: used once host-call lowering reaches the interpreter
     pub(crate) host: H,
 }
 
@@ -52,6 +64,7 @@ fn mul_add_delta_u8(v: u8, f: i32) -> i32 {
 }
 
 impl<I: RuntimeIo, H: HostRuntime> Interpreter<I, H> {
+    /// Create an interpreter with an `tape_len`-byte data tape and the supplied I/O and host runtime.
     pub(crate) fn new(tape_len: usize, io: I, host: H) -> Self {
         Self {
             tape: Tape::new(tape_len),
@@ -60,6 +73,7 @@ impl<I: RuntimeIo, H: HostRuntime> Interpreter<I, H> {
         }
     }
 
+    /// Execute a HIR program to completion, reporting the first I/O or host error encountered.
     pub(crate) fn run(&mut self, program: &HirProgram) -> Result<(), RuntimeError> {
         self.exec_block(&program.insts)
     }

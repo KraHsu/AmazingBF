@@ -1,3 +1,9 @@
+//! Mode dispatch: interpret / compile / dump, after the frontend has produced HIR.
+//!
+//! `run()` accepts a fully-validated `DriverConfig`, invokes the shared frontend,
+//! then routes HIR into the interpreter, into LIR→asm→ELF/PE64 codegen, or
+//! simply logs pipeline sizes without writing any artifact.
+
 use crate::Result;
 use crate::backend::asm::AsmProgram;
 use crate::backend::codegen::{

@@ -1,60 +1,111 @@
+//! BFS tokenizer.
+//!
+//! Converts raw BFS source text into a stream of `SpannedToken` values. Handles
+//! line / block comments, integer literals, keywords, and multi-character
+//! operators; byte-position spans are preserved for downstream parse errors.
+
 use super::BfscError;
 
+/// One BFS lexical token.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Token {
     // Literals
+    /// Unsigned integer literal value.
     Int(u64),
+    /// Identifier (variable or unresolved name).
     Ident(String),
     // Keywords
+    /// `let`
     Let,
+    /// `while`
     While,
+    /// `if`
     If,
+    /// `else`
     Else,
+    /// `scan`
     Scan,
+    /// `print`
     Print,
+    /// `putchar`
     Putchar,
+    /// `setpixel`
     Setpixel,
+    /// `getchar`
     Getchar,
     // Types
+    /// `u8`
     U8,
+    /// `i8`
     I8,
+    /// `u16`
     U16,
+    /// `i16`
     I16,
+    /// `u32`
     U32,
+    /// `i32`
     I32,
     // Operators
+    /// `+`
     Plus,
+    /// `-`
     Minus,
+    /// `*`
     Star,
+    /// `/`
     Slash,
+    /// `%`
     Percent,
+    /// `<`
     Lt,
+    /// `>`
     Gt,
+    /// `<=`
     Le,
+    /// `>=`
     Ge,
+    /// `==`
     EqEq,
+    /// `!=`
     BangEq,
+    /// `=`
     Eq,
+    /// `!`
     Bang,
+    /// `&&`
     AmpAmp,
+    /// `||`
     PipePipe,
     // Delimiters
+    /// `(`
     LParen,
+    /// `)`
     RParen,
+    /// `{`
     LBrace,
+    /// `}`
     RBrace,
+    /// `[`
     LBrack,
+    /// `]`
     RBrack,
+    /// `:`
     Colon,
+    /// `;`
     Semi,
+    /// `,`
     Comma,
-    // End of input
+    /// Synthetic end-of-input marker emitted by the tokenizer.
     Eof,
 }
 
+/// Token paired with its source byte offset for diagnostics.
 #[derive(Debug, Clone)]
 pub(crate) struct SpannedToken {
+    /// The token itself.
     pub(crate) token: Token,
+    /// Byte offset of the token's first character in the original source.
     pub(crate) pos: usize,
 }
 
@@ -79,6 +130,7 @@ fn keyword(s: &str) -> Option<Token> {
     }
 }
 
+/// Tokenize a BFS source string into a vector of [`SpannedToken`] (ending with `Eof`).
 pub(crate) fn tokenize(src: &str) -> Result<Vec<SpannedToken>, BfscError> {
     let bytes = src.as_bytes();
     let len = bytes.len();

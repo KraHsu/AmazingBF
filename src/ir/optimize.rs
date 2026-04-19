@@ -1,10 +1,24 @@
+//! HIR optimization passes (O0 / O1 / O2 / O3).
+//!
+//! O0 fuses consecutive `Move` / `Add`; O1 adds pattern recognition
+//! (`[-]` → `Zero`, `[>]` / `[<]` → `Scan`, simple affine loops →
+//! `LinearMul`); O2 iterates O1 to a fixed point; O3 additionally permits
+//! whole-program compile-time folds (only safe when the program reads no
+//! input). Every pass is driven from the entry point
+//! `optimize_program_for_opt_level`.
+
 use std::collections::BTreeMap;
 
 use crate::ir::hir::{HirInst, HirProgram};
 
+/// Errors produced by the optimization pipeline.
 #[derive(Debug)]
 pub enum OptimizeError {
-    DidNotConverge { max_iters: usize },
+    /// `-O2` / `-O3` fixed-point iteration exceeded its iteration budget.
+    DidNotConverge {
+        /// Iteration cap that was reached without the IR stabilising.
+        max_iters: usize,
+    },
 }
 
 impl std::fmt::Display for OptimizeError {
@@ -41,6 +55,8 @@ pub(crate) fn optimize_o2(program: HirProgram) -> HirProgram {
     try_optimize_o2(program).expect("optimize_o2: fixed-point optimization should converge")
 }
 
+/// `-O2` entry with explicit failure: iterates `-O1` until fixed-point or returns
+/// [`OptimizeError::DidNotConverge`] when the iteration budget is exhausted.
 pub(crate) fn try_optimize_o2(program: HirProgram) -> Result<HirProgram, OptimizeError> {
     const MAX_ITERS: usize = 4096;
     let mut current = program;

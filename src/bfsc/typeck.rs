@@ -1,8 +1,17 @@
+//! BFS type checker and memory-map builder.
+//!
+//! Runs two passes: the first collects variable declarations and assigns each
+//! a `CellLayout` in `MemMapBuilder`; the second validates all statements
+//! against the resulting symbol table. Returns the original AST plus a frozen
+//! `MemMap` for codegen to consume.
+
 use super::BfscError;
 use super::ast::*;
 use super::layout::{MemMap, MemMapBuilder};
 use std::collections::HashMap;
 
+/// Type-check `stmts` and compute a frozen memory layout. Returns the
+/// validated statement list and the finalised [`MemMap`] consumed by codegen.
 pub(crate) fn check(stmts: &[Stmt]) -> Result<(Vec<Stmt>, MemMap), BfscError> {
     let mut builder = MemMapBuilder::new();
     let mut sym: HashMap<String, TypeAnn> = HashMap::new();

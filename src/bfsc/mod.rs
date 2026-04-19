@@ -1,3 +1,10 @@
+//! `bfsc` — BFS (Brainf Script) source-level compiler that lowers `.bfs` to Brainfuck.
+//!
+//! Owns the `bfsc` binary's top-level pipeline: argument parsing, I/O, and the
+//! fixed sequence `lex → parse → typeck → codegen`. When `-c` is passed the
+//! generated BF is handed to `driver::run` to produce a native executable;
+//! otherwise it is written as BF source.
+
 mod ast;
 mod codegen;
 mod layout;
@@ -9,12 +16,18 @@ use std::fmt;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Errors produced by the `bfsc` binary's compile pipeline.
 #[derive(Debug)]
 pub(crate) enum BfscError {
+    /// Filesystem or stdin I/O failure.
     Io(std::io::Error),
+    /// Lexer-stage failure with a human-readable diagnostic.
     Lex(String),
+    /// Parser-stage failure with a human-readable diagnostic.
     Parse(String),
+    /// Type-check failure with a human-readable diagnostic.
     Type(String),
+    /// Backend compile failure when `-c` is passed.
     Compile(String),
 }
 
@@ -45,6 +58,7 @@ struct ParsedArgs {
     quiet: bool,
 }
 
+/// Entry point of the `bfsc` binary: parse arguments, compile, and emit output.
 pub(crate) fn run() -> Result<(), BfscError> {
     let args: Vec<String> = std::env::args().collect();
     let parsed = parse_args(&args)?;
@@ -234,6 +248,7 @@ fn print_help() {
     );
 }
 
+/// Run the BFS front-end (`lex → parse → typeck → codegen`) and return the BF source string.
 pub(crate) fn compile(source: &str) -> Result<String, BfscError> {
     let tokens = lexer::tokenize(source)?;
     let stmts = parser::parse(&tokens)?;

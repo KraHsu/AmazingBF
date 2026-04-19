@@ -1,80 +1,91 @@
-//! # 汇编 IR 定义 (asm.rs)
+//! Assembly IR for the x86_64 backend.
 //!
-//! 本模块定义了 x86_64 后端的**汇编中间表示**（Assembly IR）。
-//!
-//! 在编译流水线中的位置：
+//! Position in the compile pipeline:
 //! ```text
-//! BF 源码 → Token → AST → HIR → LIR → [AsmProgram] → 机器码 → 目标可执行文件
-//!                                      ^^^^^^^^^^
-//!                                      本模块定义
+//! BF source → Token → AST → HIR → LIR → [AsmProgram] → machine code → executable
+//!                                        ^^^^^^^^^^
+//!                                        defined here
 //! ```
 //!
-//! `AsmProgram` 是一个平坦的指令列表，每条 `AsmInst` 对应一条 x86_64 指令
-//! （或一个标签伪指令）。这一层抽象使得：
-//! - codegen.rs 不需要关心具体的机器码编码细节
-//! - encode.rs 不需要关心 BF 语义和寄存器分配策略
-//! - debug.rs 可以独立地对 AsmProgram 进行格式化和分析
+//! `AsmProgram` is a flat list of `AsmInst` values, each corresponding to a
+//! single x86_64 instruction (or a label pseudo-instruction). This layer lets:
+//! - `codegen.rs` stay free of machine-code encoding details,
+//! - `encode.rs` stay free of Brainfuck semantics and register allocation, and
+//! - `debug.rs` format / analyse an `AsmProgram` independently.
 //!
-//! ## 寄存器约定（由 codegen.rs 定义）
+//! ## Register convention (assigned by `codegen.rs`)
 //!
-//! | 寄存器 | 用途                                         |
-//! |--------|----------------------------------------------|
-//! | R12    | tape 基址（mmap 返回的起始地址）              |
-//! | R13    | 当前指针位置（BF 的 data pointer）            |
-//! | R14    | tape 结束地址（base + length）                |
-//! | R15    | PtrAdd 的临时目标地址（边界检查前的候选值）   |
-//! | RAX    | 系统调用号 / 返回值                          |
-//! | RSP    | 栈指针（Win64 shadow space / 临时槽位）      |
-//! | RDI    | 系统调用参数 1                               |
-//! | RSI    | 系统调用参数 2                               |
-//! | RDX    | 系统调用参数 3 / 临时变量                    |
-//! | R10    | 系统调用参数 4 / 临时变量（old_len）         |
-//! | R8     | 系统调用参数 5 / 临时变量（copy_start）      |
-//! | R9     | 系统调用参数 6 / 临时变量（desired_offset）  |
-//! | R11    | 临时变量（new_len，注意 syscall 会覆写此寄存器）|
-//! | RCX    | rep movsb 的计数器（注意 syscall 会覆写此寄存器）|
+//! | Reg | Purpose                                                          |
+//! |-----|------------------------------------------------------------------|
+//! | R12 | Tape base address (as returned by mmap / VirtualAlloc)           |
+//! | R13 | Current data pointer (the Brainfuck cell pointer)                |
+//! | R14 | Tape end address (base + length)                                 |
+//! | R15 | Candidate target for `PtrAdd` prior to bounds checking           |
+//! | RAX | Syscall number / return value                                    |
+//! | RSP | Stack pointer (Win64 shadow space + scratch slots)               |
+//! | RDI | Syscall arg 1                                                    |
+//! | RSI | Syscall arg 2                                                    |
+//! | RDX | Syscall arg 3 / scratch                                          |
+//! | R10 | Syscall arg 4 / scratch (`old_len`)                              |
+//! | R8  | Syscall arg 5 / scratch (`copy_start`)                           |
+//! | R9  | Syscall arg 6 / scratch (`desired_offset`)                       |
+//! | R11 | Scratch (`new_len`; clobbered by `syscall`)                      |
+//! | RCX | `rep movsb` counter (clobbered by `syscall`)                     |
 
 use std::fmt;
 
-/// 汇编标签，用于标记代码中的跳转目标。
+/// Assembly label, marking a jump / call target inside the program.
 ///
-/// 内部使用 `u32` 作为唯一标识符：
-/// - 用户标签（来自 LIR 的 LabelId）使用低位值（0, 1, 2, ...）
-/// - 内部标签（编译器生成的辅助标签）使用高位值（从 u32::MAX 递减）
-///
-/// 两类标签的 ID 空间不重叠，因此不会冲突。
+/// The wrapped `u32` is a unique identifier partitioned into two ranges so
+/// user-supplied labels and compiler-synthesised labels cannot collide:
+/// - User labels (forwarded from LIR `LabelId`) start at `0` and count up.
+/// - Internal helper labels count down from `u32::MAX`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct AsmLabel(pub u32);
 
-/// x86_64 通用 64 位寄存器。
+/// x86_64 general-purpose 64-bit registers actually used by this backend.
 ///
-/// 仅列出本编译器实际使用的寄存器，未包含 RBP。
-/// 这是因为：
-/// - RBP 目前仍未使用栈帧
-/// - 其余寄存器会被 Linux / Windows 后端按各自 ABI 复用
+/// RBP is deliberately omitted: the backend does not establish a stack frame,
+/// and every other register is reused across the Linux / Windows ABIs in the
+/// way described at the top of this module.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Reg64 {
+    /// Accumulator / syscall number / syscall return value.
     Rax,
+    /// Counter (also the `rep` count register; clobbered by `syscall`).
     Rcx,
+    /// Syscall arg 3 / general scratch.
     Rdx,
+    /// Callee-saved general register (not currently used, kept for symmetry).
     Rbx,
+    /// Stack pointer.
     Rsp,
+    /// Source pointer for `rep movsb` / syscall arg 2.
     Rsi,
+    /// Destination pointer for `rep movsb` / syscall arg 1.
     Rdi,
+    /// Syscall arg 5 / scratch.
     R8,
+    /// Syscall arg 6 / scratch.
     R9,
+    /// Syscall arg 4 / scratch.
     R10,
+    /// Scratch (clobbered by `syscall`, which preserves the old RFLAGS here).
     R11,
+    /// Tape base address (set once at program start).
     R12,
+    /// Current data pointer (the Brainfuck cell pointer).
     R13,
+    /// Tape end address (`tape_base + tape_len`).
     R14,
+    /// Candidate target for `PtrAdd` prior to bounds checking.
     R15,
 }
 
-/// 为 `Reg64` 实现 `Display` trait，输出小写寄存器名。
+/// Renders a `Reg64` as its lowercase mnemonic (e.g. `"rax"`).
 ///
-/// 这使得在格式化字符串中可以直接使用 `{}` 占位符输出寄存器名称，
-/// 例如 `format!("mov {}, {}", dst, src)` → `"mov rax, rcx"`。
+/// Enables using `{}` in format strings for instruction pretty-printing, e.g.
+/// `format!("mov {}, {}", dst, src)` → `"mov rax, rcx"`.
 impl fmt::Display for Reg64 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let name = match self {
@@ -98,211 +109,225 @@ impl fmt::Display for Reg64 {
     }
 }
 
-/// 为 `AsmLabel` 实现 `Display` trait，输出标签名。
+/// Renders an `AsmLabel` as `L<id>` (e.g. `L0`, `L42`).
 impl fmt::Display for AsmLabel {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "L{}", self.0)
     }
 }
 
-/// x86_64 汇编指令枚举。
+/// x86_64 assembly instruction.
 ///
-/// 每个变体对应一条具体的 x86_64 指令（或标签伪指令）。
-/// 指令集被限制为 Brainfuck 编译器实际需要的最小子集。
+/// Each variant maps to a single x86_64 instruction (or the `Label`
+/// pseudo-instruction). The set is intentionally the minimum subset that the
+/// Brainfuck compiler actually emits; rough groupings:
 ///
-/// 指令按功能分组：
-/// 1. 伪指令（Label）
-/// 2. 数据传送（MovRegImm64, MovRegReg, MovMem8Imm8）
-/// 3. 算术运算（AddRegImm32, AndRegImm32, AddRegReg, SubRegReg, AddMem8Imm8）
-/// 4. 比较（CmpRegReg, CmpRegImm32, CmpMem8Imm8）
-/// 5. 地址计算 / 栈槽 / RIP-relative（LeaRegMem, LeaRegLabel, MovMemReg64, MovRegMem64）
-/// 6. 移位（ShrRegImm8）
-/// 7. 控制流（Jz, Jnz, Jb, Jae, Jl, Jge, Jmp, Call, CallMemLabel, Ret）
-/// 7. 字符串操作（Cld, RepMovsb）
-/// 8. 系统调用（Syscall）
-/// 9. 原始机器码（RawBytes，用于 `-O3` 等预计算路径）
+/// 1. Pseudo: `Label`.
+/// 2. Data movement: `MovRegImm64`, `MovRegReg`, `MovMem8Imm8`.
+/// 3. Arithmetic: `AddRegImm32`, `AndRegImm32`, `AddRegReg`, `SubRegReg`,
+///    `AddMem8Imm8`.
+/// 4. Comparison: `CmpRegReg`, `CmpRegImm32`, `CmpMem8Imm8`.
+/// 5. Addressing / stack slots / RIP-relative: `LeaRegMem`, `LeaRegLabel`,
+///    `MovMemReg64`, `MovRegMem64`.
+/// 6. Shifts: `ShrRegImm8`.
+/// 7. Control flow: `Jz`, `Jnz`, `Jb`, `Jae`, `Jl`, `Jge`, `Jmp`, `Call`,
+///    `CallMemLabel`, `Ret`.
+/// 8. String ops: `Cld`, `RepMovsb`.
+/// 9. System call: `Syscall`.
+/// 10. Raw machine code: `RawBytes` (used by `-O3` pre-assembled paths).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AsmInst {
-    /// 标签定义（伪指令，不产生机器码字节）。
+    /// Label definition (pseudo-instruction; emits no machine bytes).
     ///
-    /// 标记一个代码位置，供跳转和调用指令引用。
+    /// Marks a code position referenced by jumps and calls.
     Label(AsmLabel),
 
-    /// `mov reg, imm64` — 将 64 位立即数加载到寄存器。
+    /// `mov reg, imm64` — load a 64-bit immediate into a register.
     ///
-    /// 这是 x86_64 中唯一能直接加载 64 位值的指令，
-    /// 编码长度为 10 字节（REX + opcode + 8 字节立即数）。
+    /// The only x86_64 form that can load a full 64-bit value directly; the
+    /// encoding is 10 bytes (REX + opcode + 8-byte immediate).
     MovRegImm64(Reg64, i64),
 
-    /// `mov dst, src` — 寄存器间数据传送。
+    /// `mov dst, src` — register-to-register move.
     MovRegReg(Reg64, Reg64),
 
-    /// `add reg, imm32` — 寄存器加符号扩展的 32 位立即数。
+    /// `add reg, imm32` — add a sign-extended 32-bit immediate to a register.
     ///
-    /// imm32 会被符号扩展到 64 位后再相加。
-    /// 用于指针偏移计算（如 tape 基址 + 偏移量）。
+    /// The immediate is sign-extended to 64 bits before the add; used for
+    /// pointer-offset arithmetic (tape base + offset).
     AddRegImm32(Reg64, i32),
 
-    /// `and reg, imm32` — 寄存器与符号扩展的 32 位立即数按位与。
+    /// `and reg, imm32` — bitwise AND with a sign-extended 32-bit immediate.
     ///
-    /// 主要用于栈指针对齐，例如 `and rsp, -16`。
+    /// Mainly used for stack-pointer alignment, e.g. `and rsp, -16`.
     AndRegImm32(Reg64, i32),
 
-    /// `add dst, src` — 寄存器加寄存器。
+    /// `add dst, src` — register + register.
     AddRegReg(Reg64, Reg64),
 
-    /// `sub dst, src` — 寄存器减寄存器。
+    /// `sub dst, src` — register - register.
     SubRegReg(Reg64, Reg64),
 
-    /// `cmp lhs, rhs` — 寄存器比较（设置标志位，不保存结果）。
+    /// `cmp lhs, rhs` — register compare (updates EFLAGS, discards result).
     ///
-    /// 等价于 `lhs - rhs`，但结果被丢弃，仅更新 EFLAGS。
+    /// Logically `lhs - rhs` with the difference thrown away; only EFLAGS is
+    /// updated.
     CmpRegReg(Reg64, Reg64),
 
-    /// `cmp reg, imm32` — 寄存器与立即数比较。
+    /// `cmp reg, imm32` — register vs. 32-bit immediate compare.
     CmpRegImm32(Reg64, i32),
 
-    /// `shr reg, imm8` — 逻辑右移指定位数。
+    /// `shr reg, imm8` — logical right shift by an 8-bit immediate count.
     ///
-    /// 用于 tape 扩容时计算 `(new_len - old_len) / 2`。
+    /// Used during tape growth to compute `(new_len - old_len) / 2`.
     ShrRegImm8(Reg64, u8),
 
-    /// `lea dst, [base + disp]` — 计算基址加偏移后的地址。
+    /// `lea dst, [base + disp]` — compute `base + disp` as an address.
     ///
-    /// 主要用于 Win64 调用时构造栈上 scratch/第五参数地址。
+    /// Used when building Win64 scratch-slot / fifth-argument addresses.
     LeaRegMem(Reg64, Reg64, i32),
 
-    /// `lea dst, [rip + rel32]` — 取当前指令附近标签的地址。
+    /// `lea dst, [rip + rel32]` — take the address of a nearby label.
     ///
-    /// 主要用于访问同一段内嵌入的 IAT / 字符串 / 只读数据。
+    /// Used to reach IAT entries, embedded strings, and read-only data placed
+    /// in the same section.
     LeaRegLabel(Reg64, AsmLabel),
 
-    /// `mov qword ptr [base + disp], src` — 将 64 位寄存器写入内存。
+    /// `mov qword ptr [base + disp], src` — store a 64-bit register to memory.
     ///
-    /// 当前主要用于 Win64 shadow space / 栈槽写入。
+    /// Primarily used for Win64 shadow space and stack-slot writes.
     MovMemReg64(Reg64, i32, Reg64),
 
-    /// `mov dst, qword ptr [base + disp]` — 从内存加载 64 位值到寄存器。
+    /// `mov dst, qword ptr [base + disp]` — load a 64-bit value from memory.
     ///
-    /// 当前主要用于 Win64 shadow space / 栈槽读取。
+    /// Primarily used for Win64 shadow space and stack-slot reads.
     MovRegMem64(Reg64, Reg64, i32),
 
-    /// `add byte ptr [reg], imm8` — 内存字节加立即数。
+    /// `add byte ptr [reg], imm8` — add an 8-bit immediate to a memory byte.
     ///
-    /// 对 `reg` 指向的内存地址处的单个字节进行加法。
-    /// 这是 Brainfuck `+` 和 `-` 指令的直接实现。
-    /// 当前编码器仅支持无需 SIB 的基址寄存器组合（实际由 codegen 固定为 R13）。
+    /// Adds to the single byte at the address in `reg`; this is the direct
+    /// lowering of Brainfuck `+` / `-`. The encoder only accepts base-register
+    /// forms that do not need a SIB byte (codegen hard-pins this to R13).
     AddMem8Imm8(Reg64, i8),
 
-    /// `mov byte ptr [reg], imm8` — 将立即数写入内存字节。
+    /// `mov byte ptr [reg], imm8` — store an 8-bit immediate into memory.
     ///
-    /// 用于优化后的 BF 操作，如 `[-]` 被优化为 `CellSet(0)`。
-    /// 当前编码器仅支持无需 SIB 的基址寄存器组合（实际由 codegen 固定为 R13）。
+    /// Used for optimised BF patterns, e.g. `[-]` being folded into
+    /// `CellSet(0)`. Same SIB-free restriction as `AddMem8Imm8`.
     MovMem8Imm8(Reg64, u8),
 
-    /// `cmp byte ptr [reg], imm8` — 内存字节与立即数比较。
+    /// `cmp byte ptr [reg], imm8` — compare a memory byte with an immediate.
     ///
-    /// 用于 BF 的 `[` 和 `]`：检查当前单元是否为零。
-    /// 当前编码器仅支持无需 SIB 的基址寄存器组合（实际由 codegen 固定为 R13）。
+    /// Used by BF `[` / `]` to decide whether the current cell is zero. Same
+    /// SIB-free restriction as `AddMem8Imm8`.
     CmpMem8Imm8(Reg64, u8),
 
-    /// `jz label` — 条件跳转：零标志位为 1 时跳转（ZF=1）。
+    /// `jz label` — conditional jump when ZF=1 (result was zero).
     ///
-    /// 用于 BF 的 `[`：当前单元为零时跳过循环体。
+    /// Used by BF `[`: skip the loop body when the current cell is zero.
     Jz(AsmLabel),
 
-    /// `jnz label` — 条件跳转：零标志位为 0 时跳转（ZF=0）。
+    /// `jnz label` — conditional jump when ZF=0 (result was non-zero).
     ///
-    /// 用于 BF 的 `]`：当前单元非零时跳回循环开头。
+    /// Used by BF `]`: jump back to the loop head when the current cell is
+    /// non-zero.
     Jnz(AsmLabel),
 
-    /// `jb label` — 无符号条件跳转：低于时跳转（CF=1）。
+    /// `jb label` — unsigned branch when CF=1 (below).
     ///
-    /// 用于 tape 边界检查：指针 < tape 基址。
+    /// Used by tape bounds-checking: pointer < tape base.
     Jb(AsmLabel),
 
-    /// `jae label` — 无符号条件跳转：高于等于时跳转（CF=0）。
+    /// `jae label` — unsigned branch when CF=0 (above or equal).
     ///
-    /// 用于 tape 边界检查：指针 >= tape 结束地址。
+    /// Used by tape bounds-checking: pointer >= tape end.
     Jae(AsmLabel),
 
-    /// `jl label` — 有符号条件跳转：小于时跳转（SF≠OF）。
+    /// `jl label` — signed branch when SF≠OF (less than).
     ///
-    /// 用于检查 mmap 返回值是否为负（表示错误）。
+    /// Used to detect a negative mmap return value (an error).
     Jl(AsmLabel),
 
-    /// `jge label` — 有符号条件跳转：大于等于时跳转（SF=OF）。
+    /// `jge label` — signed branch when SF=OF (greater than or equal).
     ///
-    /// 用于 tape 扩容循环的终止条件。
+    /// Used to terminate the tape-growth loop.
     Jge(AsmLabel),
 
-    /// `jmp label` — 无条件跳转。
+    /// `jmp label` — unconditional jump.
     Jmp(AsmLabel),
 
-    /// `call label` — 函数调用。
+    /// `call label` — function call.
     ///
-    /// 将返回地址（下一条指令的 RIP）压入栈中，然后跳转到目标标签。
-    /// 用于调用 `ensure_tape` 扩容函数。
+    /// Pushes the return address (RIP of the following instruction) onto the
+    /// stack, then jumps to `label`. Used to call the `ensure_tape` grow
+    /// routine.
     Call(AsmLabel),
 
-    /// `call qword ptr [rip + rel32]` — 通过内存中的函数指针间接调用。
+    /// `call qword ptr [rip + rel32]` — indirect call through a memory slot.
     ///
-    /// 主要用于调用 PE 导入表中的 Win32 API。
+    /// Primarily used to call Win32 APIs via the PE import table.
     CallMemLabel(AsmLabel),
 
-    /// `ret` — 函数返回。
+    /// `ret` — return from a function.
     ///
-    /// 从栈顶弹出返回地址并跳转回去。
+    /// Pops the return address from the top of the stack and jumps there.
     Ret,
 
-    /// `cld` — 清除方向标志位（DF=0）。
+    /// `cld` — clear the direction flag (DF=0).
     ///
-    /// 确保后续的 `rep movsb` 向前（递增方向）复制数据。
+    /// Ensures a following `rep movsb` copies forward (auto-incrementing).
     Cld,
 
-    /// `rep movsb` — 重复字节复制。
+    /// `rep movsb` — repeat byte move.
     ///
-    /// 将 `rcx` 个字节从 `[rsi]` 复制到 `[rdi]`，
-    /// 每次复制后 rsi 和 rdi 各递增 1（因为 DF=0）。
-    /// 用于 tape 扩容时将旧数据复制到新缓冲区。
+    /// Copies `rcx` bytes from `[rsi]` to `[rdi]`, incrementing both pointers
+    /// by 1 per iteration (DF=0 guaranteed by `Cld`). Used during tape growth
+    /// to move old contents into the new buffer.
     RepMovsb,
 
-    /// `syscall` — 触发 Linux x86_64 系统调用。
+    /// `syscall` — raise a Linux x86_64 system call.
     ///
-    /// 系统调用约定：
-    /// - rax = 系统调用号
-    /// - rdi, rsi, rdx, r10, r8, r9 = 参数 1~6
-    /// - 返回值写入 rax
-    /// - 内核会覆写 rcx（保存旧 RIP）和 r11（保存旧 RFLAGS）
+    /// Calling convention:
+    /// - `rax` = syscall number
+    /// - `rdi, rsi, rdx, r10, r8, r9` = args 1..=6
+    /// - return value written back to `rax`
+    /// - kernel clobbers `rcx` (saved RIP) and `r11` (saved RFLAGS)
     Syscall,
 
-    /// 原始机器码字节（由 `-O3` 等路径预组装，不经指令级编码器）。
+    /// Raw machine-code bytes, pre-assembled by `-O3` paths that bypass the
+    /// per-instruction encoder.
     RawBytes(Vec<u8>),
 
-    /// `push r64`
+    /// `push r64` — push a 64-bit register onto the stack.
     Push(Reg64),
 
-    /// `pop r64`
+    /// `pop r64` — pop into a 64-bit register from the stack.
     Pop(Reg64),
 
-    /// `movzx ebx, byte [r13]`（tape 当前格读入 ebx 低 8 位，高位清零）。
+    /// `movzx ebx, byte [r13]` — read the current tape cell into `ebx`'s low
+    /// byte, zero-extending the upper bits.
     MovzxEbxFromMemR13,
 
-    /// `mov eax, ebx`
+    /// `mov eax, ebx` — copy `ebx` to `eax` (upper 32 bits of `rax` cleared).
     MovEaxEbx,
 
-    /// `imul eax, ebx, imm32`（仅用于 `-O1` LinearMul 低 8 位与 tape 语义一致）。
+    /// `imul eax, ebx, imm32` — multiply `ebx` by an immediate into `eax`.
+    ///
+    /// Used only by `-O1 LinearMul`; the low 8 bits of the result match tape
+    /// semantics exactly.
     ImulEaxEbxImm32(i32),
 
-    /// `add byte [r13], al`
+    /// `add byte [r13], al` — add `al` into the current tape cell.
     AddMemR13Al,
 }
 
-/// 汇编程序：一个平坦的指令序列。
+/// Assembly program: a flat sequence of instructions.
 ///
-/// 这是 codegen 的输出、encode 的输入。
-/// 所有跳转目标通过 `AsmLabel` 引用，由 encode 阶段解析为相对偏移。
+/// The output of `codegen` and the input to `encode`. All jump targets are
+/// referenced via `AsmLabel`; the `encode` stage resolves them into relative
+/// offsets.
 #[derive(Debug, Clone)]
 pub struct AsmProgram {
+    /// Instructions in emission order.
     pub insts: Vec<AsmInst>,
 }

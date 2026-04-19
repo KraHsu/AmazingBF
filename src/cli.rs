@@ -1,3 +1,12 @@
+//! Command-line argument parsing for all four shipped binaries.
+//!
+//! `parse_cli` / `parse_interpreter_cli` / `parse_compiler_cli` share a single
+//! state machine parameterised by `Flavor`: the `AmazingBF` entry point
+//! accepts every flag, while the specialised `bf-interpreter` / `bf-compiler`
+//! entries disallow mode-switching. User-facing help and error text is
+//! bilingual (Chinese + English) as mandated by CLAUDE.md; the resulting
+//! `AppConfig` carries a fully-validated `DriverConfig` plus log level.
+
 use crate::driver::config::{CompileTarget, DriverConfig, OptLevel, RunMode};
 
 use std::ffi::{OsStr, OsString};
@@ -58,14 +67,19 @@ const COMPILER_AFTER_HELP: &str = "\
   # 交叉编译为 Windows PE64
   bf-compiler path/to/hello.bf --target x86_64-windows -o ./hello_bf.exe";
 
+/// Identifies which binary entry point is parsing arguments.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum BinKind {
+    /// The full `AmazingBF` driver: accepts every flag including `-m`.
     AmazingBF,
+    /// `bf-interpreter`: forces `RunMode::Interpret`; rejects `-m` / `--target`.
     Interpreter,
+    /// `bf-compiler`: forces `RunMode::Compile`; rejects `--interp-debug`.
     Compiler,
 }
 
 impl BinKind {
+    /// Human-readable program name used in help / version banners.
     pub(crate) fn title(self) -> &'static str {
         match self {
             Self::AmazingBF => "AmazingBF",
@@ -75,8 +89,10 @@ impl BinKind {
     }
 }
 
+/// Fully-validated configuration handed from `cli` to `driver::run`.
 #[derive(Debug, Clone)]
 pub(crate) struct AppConfig {
+    /// Normalised driver configuration for the selected pipeline stage.
     pub(crate) driver_cfg: DriverConfig,
 
     /// 0 -> quiet
@@ -87,21 +103,34 @@ pub(crate) struct AppConfig {
     pub(crate) log_level: u8,
 }
 
+/// Outcome of CLI parsing — either an early exit (help/version) or a failure.
 #[derive(Debug)]
 pub(crate) enum CliError {
+    /// User requested `-h` / `--help`; caller should print help for this binary and exit 0.
     Help(BinKind),
+    /// User requested `-V` / `--version`; caller should print the version banner and exit 0.
     Version(BinKind),
+    /// Invalid flag combination or missing argument; caller should print `message` and exit 2.
     Usage {
+        /// Bilingual error text intended for stderr.
         message: String,
+        /// When true, the user passed `-q`; suppress additional hints.
         quiet: bool,
     },
+    /// Generic parse-time diagnostic with a custom exit code.
     Message {
+        /// Bilingual error text intended for stderr.
         message: String,
+        /// When true, suppress auxiliary hints.
         quiet: bool,
+        /// Process exit code to return after printing `message`.
         exit_code: i32,
     },
+    /// Failed to load the input source file (e.g. missing path, permission denied).
     Io {
+        /// Path that failed to load, or `"-"` for stdin.
         path: String,
+        /// Underlying filesystem error.
         source: std::io::Error,
     },
 }
@@ -406,11 +435,7 @@ fn parse_long(
             Ok(())
         }
         "interp-debug" if matches!(flavor, Flavor::Full | Flavor::Interpreter) => {
-            if value == Some("false") {
-                core.interp_debug = false;
-            } else {
-                core.interp_debug = true;
-            }
+            core.interp_debug = value != Some("false");
             Ok(())
         }
         _ => Err(CliError::Usage {
@@ -536,6 +561,7 @@ fn parse_args(flavor: Flavor) -> std::result::Result<AppConfig, CliError> {
     finish_from_partial(core, flavor)
 }
 
+/// Print bilingual help text for the given binary flavor to stderr.
 pub(crate) fn print_help(kind: BinKind) {
     let title = kind.title();
     match kind {
@@ -573,14 +599,17 @@ pub(crate) fn print_help(kind: BinKind) {
     }
 }
 
+/// Parse argv for the full `AmazingBF` binary (all modes available).
 pub(crate) fn parse_cli() -> std::result::Result<AppConfig, CliError> {
     parse_args(Flavor::Full)
 }
 
+/// Parse argv for the `bf-interpreter` binary (locked to `RunMode::Interpret`).
 pub(crate) fn parse_interpreter_cli() -> std::result::Result<AppConfig, CliError> {
     parse_args(Flavor::Interpreter)
 }
 
+/// Parse argv for the `bf-compiler` binary (locked to `RunMode::Compile`).
 pub(crate) fn parse_compiler_cli() -> std::result::Result<AppConfig, CliError> {
     parse_args(Flavor::Compiler)
 }

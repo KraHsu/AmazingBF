@@ -1,3 +1,10 @@
+//! Bidirectional tape storage shared by interpreter and backend.
+//!
+//! The `Tape` backs both positive and negative cell indices by splitting
+//! storage into two `Vec<u8>` halves that grow on demand. `TapeStats` captures
+//! runtime usage (pointer range, growth, total movement) so `--interp-debug`
+//! can summarize behaviour after a program finishes.
+
 /// Statistics collected while a [`Tape`] is in use (pointer range, growth, move totals).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TapeStats {
@@ -42,6 +49,7 @@ pub(crate) struct Tape {
 }
 
 impl Tape {
+    /// Create a fresh tape with `initial_len` cells on the right side (minimum 1).
     pub(crate) fn new(initial_len: usize) -> Self {
         let len = initial_len.max(1);
         Self {

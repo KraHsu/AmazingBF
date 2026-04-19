@@ -9,20 +9,20 @@ pub(crate) mod encode;
 pub(crate) mod pe;
 pub(crate) mod windows;
 
-/// 调试输出模块。
+/// Debug-output module.
 ///
-/// 提供两种调试输出格式：
-/// - `dump_asm_listing`: 人类可读的汇编文本（方案 A）
-/// - `dump_hex_listing`: 带偏移量的十六进制字节转储（方案 B）
+/// Provides two listing formats:
+/// - `dump_asm_listing`: human-readable assembly text (scheme A).
+/// - `dump_hex_listing`: per-instruction hex byte dump with offsets (scheme B).
 ///
-/// 使用示例：
+/// Usage:
 /// ```rust,ignore
 /// let asm = compile_lir_to_asm(&lir);
 ///
-/// // 输出汇编文本到文件
+/// // Write human-readable assembly text.
 /// std::fs::write("hello_bf.asm", debug::dump_asm_listing(&asm))?;
 ///
-/// // 输出 hex listing 到文件
+/// // Write the hex listing.
 /// std::fs::write("hello_bf.lst", debug::dump_hex_listing(&asm))?;
 /// ```
 pub(crate) mod debug;
@@ -37,13 +37,13 @@ use crate::logging::log_debug;
 /// ```text
 /// AsmProgram
 ///   → encode_program       (encode.rs)    → EncodedProgram
-///   → build_elf_executable (elf.rs)       → Vec<u8>（ELF 文件内容）
+///   → build_elf_executable (elf.rs)       → Vec<u8>  (ELF file bytes)
 /// ```
 ///
-/// # 参数
+/// # Parameters
 /// - `asm`: assembly program to encode
 ///
-/// # 返回值
+/// # Returns
 /// Full ELF file bytes ready to write to disk.
 pub fn compile_asm_to_elf(asm: &AsmProgram) -> Vec<u8> {
     let encoded = encode::encode_program(asm);

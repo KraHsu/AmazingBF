@@ -1,6 +1,11 @@
-/// HIR: High-level IR
-///
-/// Only a minimal instruction set for now.
+//! HIR (High-level IR) for Brainfuck programs.
+//!
+//! Flattens the AST into a minimal instruction set that supports peephole
+//! fusion (`Move`, `Add`), loop-shape recognition (`Zero`, `Scan`,
+//! `LinearMul`), and whole-program queries such as `has_put_byte`. HIR is the
+//! input to `ir::optimize` and both the interpreter and LIR lowering.
+
+/// Individual HIR instruction after AST lowering.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum HirInst {
     /// Moves the data pointer. Positive values move it to the right,
@@ -31,8 +36,10 @@ pub(crate) enum HirInst {
     Loop(Vec<HirInst>),
 }
 
+/// Complete HIR program as a flat instruction sequence.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct HirProgram {
+    /// Top-level instruction list; `Loop` variants carry their own nested bodies.
     pub(crate) insts: Vec<HirInst>,
 }
 

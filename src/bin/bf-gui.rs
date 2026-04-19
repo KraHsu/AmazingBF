@@ -1,3 +1,9 @@
+//! `bf-gui` binary: Brainfuck interpreter driving a Tauri webview.
+//!
+//! Sets Linux-specific WebKit workarounds (force XWayland + software renderer)
+//! by re-exec'ing itself with the environment tweaked, then hands control to
+//! [`AmazingBF::run_bf_gui`].
+
 fn main() {
     // WebKit on Linux can fail with Wayland protocol errors or GBM buffer errors
     // depending on the compositor. Force XWayland + software rendering on first launch.

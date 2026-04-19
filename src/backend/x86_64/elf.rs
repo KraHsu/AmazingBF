@@ -1,191 +1,190 @@
-//! # ELF 可执行文件生成器 (elf.rs)
+//! ELF executable builder (elf.rs).
 //!
-//! 本模块负责将编码后的机器码打包为 ELF64 可执行文件格式。
+//! Packages encoded machine code into an ELF64 executable image.
 //!
-//! ## ELF 文件结构
+//! ## File layout
 //!
-//! 生成的 ELF 文件采用最简化的布局：
+//! The emitted ELF uses the minimum layout that Linux will load:
 //!
 //! ```text
-//! ┌─────────────────────┐  偏移 0x00
-//! │    ELF Header       │  64 字节
-//! ├─────────────────────┤  偏移 0x40
-//! │  Program Header     │  56 字节（1 个 PT_LOAD 段）
-//! ├─────────────────────┤  偏移 0x78
-//! │    .text            │  机器码（可变长度）
+//! ┌─────────────────────┐  offset 0x00
+//! │    ELF Header       │  64 bytes
+//! ├─────────────────────┤  offset 0x40
+//! │  Program Header     │  56 bytes (one PT_LOAD segment)
+//! ├─────────────────────┤  offset 0x78
+//! │    .text            │  machine code (variable length)
 //! └─────────────────────┘
 //! ```
 //!
-//! 特点：
-//! - 仅一个 LOAD 段，包含整个文件（ELF 头 + 程序头 + 代码）
-//! - 权限为 RX（读/执行）；运行时 tape 由独立的匿名 mmap 提供
-//! - 无 Section Header Table（意味着 objdump/gdb 无法识别代码段）
-//! - 入口点 = 基地址 + ELF 头大小 + 程序头大小 = .text 段起始
+//! Properties:
+//! - Exactly one LOAD segment, covering the whole file (ELF header, program
+//!   header, and code),
+//! - Permissions RX; the runtime tape is supplied independently through an
+//!   anonymous `mmap` at runtime,
+//! - No section header table (so `objdump` / `gdb` cannot identify the code
+//!   section),
+//! - Entry point = base + ELF header size + program header size = start of
+//!   `.text`.
 //!
-//! ## 虚拟地址布局
+//! ## Virtual-address layout
 //!
 //! ```text
-//! 0x400000               ← 基地址（BASE_VADDR）
-//! 0x400000 + 0x78        ← 入口点（.text 起始）
-//! 0x400000 + file_size   ← 文件结束
+//! 0x400000               ← base (BASE_VADDR)
+//! 0x400000 + 0x78        ← entry point (.text start)
+//! 0x400000 + file_size   ← end of image
 //! ```
 //!
-//! ## 局限性
+//! ## Known limitations
 //!
-//! - 没有 section header，无法被 `objdump -d` 或 GDB 识别代码段
-//! - 没有符号表（.symtab），无法显示函数名或标签
-//! - 没有调试信息（DWARF），无法做源码级调试
-//! - 可以通过 debug.rs 的 hex listing 来弥补这些不足
+//! - No section headers, so `objdump -d` and GDB cannot locate code sections,
+//! - No symbol table (`.symtab`), so there are no function / label names,
+//! - No debug info (DWARF), so source-level debugging is unavailable.
+//! - `debug.rs` provides a hex listing that makes up for most of the above.
 
 use crate::backend::x86_64::encode::EncodedProgram;
 
-/// ELF64 文件头大小（固定 64 字节）
+/// Size of the ELF64 file header (fixed at 64 bytes).
 const ELF64_EHDR_SIZE: usize = 64;
 
-/// ELF64 程序头大小（固定 56 字节）
+/// Size of an ELF64 program header entry (fixed at 56 bytes).
 const ELF64_PHDR_SIZE: usize = 56;
 
-/// 程序的虚拟地址基地址。
+/// Virtual-address base for the loaded image.
 ///
-/// 0x400000 是 Linux x86_64 上 Position-Dependent Executable 的传统基地址。
-/// 内核将 ELF 文件映射到从此地址开始的虚拟内存区域。
+/// 0x400000 is the conventional base for position-dependent executables on
+/// Linux x86_64; the kernel maps the ELF file starting here.
 const BASE_VADDR: u64 = 0x400000;
 
-/// 段对齐要求。
+/// Segment alignment requirement.
 ///
-/// 0x1000 = 4096 字节 = 1 页，这是 x86_64 Linux 的页大小。
-/// LOAD 段的 p_align 必须是页大小的倍数。
+/// 0x1000 bytes = 4 KiB = one page on x86_64 Linux. `p_align` for LOAD
+/// segments must be a multiple of the page size.
 const PAGE_ALIGN: u64 = 0x1000;
 
-/// 将编码后的机器码打包为完整的 ELF64 可执行文件。
+/// Build a complete ELF64 executable around the encoded machine code.
 ///
-/// # 参数
-/// - `encoded`: 编码后的程序（包含 .text 段的机器码字节）
+/// # Parameters
+/// - `encoded`: the encoded program carrying `.text` bytes.
 ///
-/// # 返回值
-/// 完整的 ELF 文件内容，可直接写入磁盘并通过 `chmod +x` 执行
+/// # Returns
+/// Full ELF file bytes — ready to write to disk and make executable with
+/// `chmod +x`.
 pub fn build_elf_executable(encoded: &EncodedProgram) -> Vec<u8> {
-    // .text 段在文件中的偏移 = ELF 头 + 1 个程序头
+    // File offset of .text = ELF header + one program header.
     let text_off = (ELF64_EHDR_SIZE + ELF64_PHDR_SIZE) as u64;
 
-    // 入口点的虚拟地址 = 基地址 + .text 偏移
+    // Entry-point virtual address = base + .text offset.
     let entry = BASE_VADDR + text_off;
 
-    // 整个文件的大小 = 头部 + 机器码
+    // Total file size = headers + machine code.
     let file_size = text_off as usize + encoded.text.len();
     let file_size_u64 = file_size as u64;
 
     let mut out = Vec::with_capacity(file_size);
 
-    // =====================================================================
-    // ELF Header（64 字节）
-    // 参考：https://man7.org/linux/man-pages/man5/elf.5.html
-    // =====================================================================
+    // ELF header (64 bytes); see https://man7.org/linux/man-pages/man5/elf.5.html.
 
-    // ---- e_ident[16]: ELF 标识 ----
+    // e_ident[16]: ELF identification.
     out.extend_from_slice(&[
-        0x7F, b'E', b'L', b'F', // EI_MAG0~3: ELF 魔数
-        2,    // EI_CLASS   = ELFCLASS64（64 位 ELF）
-        1,    // EI_DATA    = ELFDATA2LSB（小端序）
-        1,    // EI_VERSION = EV_CURRENT（当前版本）
-        0,    // EI_OSABI   = ELFOSABI_SYSV（System V ABI）
+        0x7F, b'E', b'L', b'F', // EI_MAG0..=3: ELF magic
+        2,    // EI_CLASS     = ELFCLASS64
+        1,    // EI_DATA      = ELFDATA2LSB (little-endian)
+        1,    // EI_VERSION   = EV_CURRENT
+        0,    // EI_OSABI     = ELFOSABI_SYSV
         0,    // EI_ABIVERSION = 0
-        0, 0, 0, 0, 0, 0, 0, // EI_PAD: 填充字节
+        0, 0, 0, 0, 0, 0, 0, // EI_PAD: padding
     ]);
 
-    // ---- e_type: 文件类型 ----
-    push_u16(&mut out, 2); // ET_EXEC = 2（可执行文件）
+    // e_type: file type.
+    push_u16(&mut out, 2); // ET_EXEC = 2 (executable)
 
-    // ---- e_machine: 目标架构 ----
+    // e_machine: target architecture.
     push_u16(&mut out, 62); // EM_X86_64 = 62
 
-    // ---- e_version: ELF 版本 ----
+    // e_version: ELF version.
     push_u32(&mut out, 1); // EV_CURRENT = 1
 
-    // ---- e_entry: 程序入口点虚拟地址 ----
+    // e_entry: virtual address of the program entry point.
     push_u64(&mut out, entry);
 
-    // ---- e_phoff: 程序头表在文件中的偏移 ----
-    push_u64(&mut out, ELF64_EHDR_SIZE as u64); // 紧跟 ELF 头之后
+    // e_phoff: file offset of the program header table.
+    push_u64(&mut out, ELF64_EHDR_SIZE as u64); // immediately after the ELF header
 
-    // ---- e_shoff: 节头表在文件中的偏移 ----
-    push_u64(&mut out, 0); // 无节头表
+    // e_shoff: file offset of the section header table.
+    push_u64(&mut out, 0); // no section header table
 
-    // ---- e_flags: 处理器特定标志 ----
-    push_u32(&mut out, 0); // x86_64 不使用
+    // e_flags: processor-specific flags.
+    push_u32(&mut out, 0); // unused on x86_64
 
-    // ---- e_ehsize: ELF 头大小 ----
+    // e_ehsize: size of the ELF header.
     push_u16(&mut out, ELF64_EHDR_SIZE as u16);
 
-    // ---- e_phentsize: 程序头表项大小 ----
+    // e_phentsize: size of a program header entry.
     push_u16(&mut out, ELF64_PHDR_SIZE as u16);
 
-    // ---- e_phnum: 程序头表项数量 ----
-    push_u16(&mut out, 1); // 只有一个 LOAD 段
+    // e_phnum: number of program header entries.
+    push_u16(&mut out, 1); // a single LOAD segment
 
-    // ---- e_shentsize: 节头表项大小 ----
-    push_u16(&mut out, 0); // 无节头表
+    // e_shentsize: size of a section header entry.
+    push_u16(&mut out, 0); // no section headers
 
-    // ---- e_shnum: 节头表项数量 ----
-    push_u16(&mut out, 0); // 无节头表
+    // e_shnum: number of section header entries.
+    push_u16(&mut out, 0); // no section headers
 
-    // ---- e_shstrndx: 节名字符串表的节头索引 ----
-    push_u16(&mut out, 0); // 无节名字符串表
+    // e_shstrndx: section header index of the section-name string table.
+    push_u16(&mut out, 0); // no section-name string table
 
-    // =====================================================================
-    // Program Header（56 字节）
-    // 描述一个可加载段，包含整个文件内容
-    // =====================================================================
+    // Program header (56 bytes): describes one loadable segment that spans the
+    // entire file.
 
-    // ---- p_type: 段类型 ----
-    push_u32(&mut out, 1); // PT_LOAD = 1（可加载段）
+    // p_type: segment type.
+    push_u32(&mut out, 1); // PT_LOAD = 1 (loadable segment)
 
-    // ---- p_flags: 段权限 ----
-    // PF_R(4) | PF_X(1) = 5
-    // 代码段不承载运行时 tape；tape 通过匿名 mmap 单独分配。
+    // p_flags: segment permissions.
+    // PF_R(4) | PF_X(1) = 5.
+    // The code segment does not host the runtime tape; the tape is allocated
+    // separately via anonymous mmap.
     push_u32(&mut out, 0x4 | 0x1);
 
-    // ---- p_offset: 段在文件中的偏移 ----
-    push_u64(&mut out, 0); // 从文件开头开始（包含 ELF 头和程序头）
+    // p_offset: file offset of the segment.
+    push_u64(&mut out, 0); // starts at file offset 0 (covers headers + code)
 
-    // ---- p_vaddr: 段在内存中的虚拟地址 ----
+    // p_vaddr: virtual address of the segment.
     push_u64(&mut out, BASE_VADDR);
 
-    // ---- p_paddr: 段的物理地址（在现代 OS 中通常等于 p_vaddr） ----
+    // p_paddr: physical address (on modern OSes usually equal to p_vaddr).
     push_u64(&mut out, BASE_VADDR);
 
-    // ---- p_filesz: 段在文件中的大小 ----
+    // p_filesz: segment size in the file.
     push_u64(&mut out, file_size_u64);
 
-    // ---- p_memsz: 段在内存中的大小 ----
-    // 等于 p_filesz（不需要额外的 BSS 段，因为 tape 通过 mmap 动态分配）
+    // p_memsz: segment size in memory.
+    // Same as p_filesz (no extra BSS needed; the tape is mmap'd at runtime).
     push_u64(&mut out, file_size_u64);
 
-    // ---- p_align: 段对齐 ----
+    // p_align: segment alignment.
     push_u64(&mut out, PAGE_ALIGN);
 
-    // ---- 断言：头部大小正确 ----
+    // Sanity check: the header block has exactly the expected size.
     assert_eq!(out.len(), ELF64_EHDR_SIZE + ELF64_PHDR_SIZE);
 
-    // =====================================================================
-    // .text 段（机器码）
-    // =====================================================================
+    // .text segment (machine code).
     out.extend_from_slice(&encoded.text);
 
     out
 }
 
-/// 写入 16 位无符号整数（小端序）
+/// Append a little-endian `u16`.
 fn push_u16(out: &mut Vec<u8>, v: u16) {
     out.extend_from_slice(&v.to_le_bytes());
 }
 
-/// 写入 32 位无符号整数（小端序）
+/// Append a little-endian `u32`.
 fn push_u32(out: &mut Vec<u8>, v: u32) {
     out.extend_from_slice(&v.to_le_bytes());
 }
 
-/// 写入 64 位无符号整数（小端序）
+/// Append a little-endian `u64`.
 fn push_u64(out: &mut Vec<u8>, v: u64) {
     out.extend_from_slice(&v.to_le_bytes());
 }

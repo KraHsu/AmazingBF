@@ -1,74 +1,80 @@
-//! # LIR → x86_64 汇编代码生成器 (codegen.rs)
+//! LIR → x86_64 assembly code generator (codegen.rs).
 //!
-//! 本模块负责将低级中间表示（LIR）翻译为 x86_64 汇编指令序列（`AsmProgram`）。
+//! Translates the low-level IR (`LirProgram`) into an x86_64 assembly program
+//! (`AsmProgram`).
 //!
-//! ## 编译策略
+//! ## Compilation strategy
 //!
-//! Brainfuck 虚拟机的核心状态是一条无限长的字节数组（"tape"）和一个指针。
-//! 本编译器使用 mmap 分配 tape，并在指针超出范围时动态扩容。
+//! The Brainfuck virtual machine is driven by two pieces of state: a
+//! conceptually unbounded byte tape and a pointer into it. This backend
+//! allocates the tape with `mmap` and grows it on demand whenever the pointer
+//! would escape the currently mapped range.
 //!
-//! ### 寄存器分配
+//! ### Register allocation
 //!
-//! 编译器使用固定的寄存器分配方案（不需要寄存器分配器）：
+//! A fixed register assignment is used (no real register allocator):
 //!
-//! | 寄存器 | 角色              | 说明                                |
-//! |--------|-------------------|-------------------------------------|
-//! | R12    | tape_base         | mmap 返回的缓冲区起始地址           |
-//! | R13    | data_ptr          | 当前 BF 指针位置（BF 的 ">"/"<"）   |
-//! | R14    | tape_end          | 缓冲区结束地址 = base + length      |
-//! | R15    | scratch           | PtrAdd 时的候选新指针（边界检查前）  |
+//! | Register | Role              | Notes                                         |
+//! |----------|-------------------|-----------------------------------------------|
+//! | R12      | tape_base         | Buffer start returned by `mmap`               |
+//! | R13      | data_ptr          | Current BF pointer (`>` / `<`)                |
+//! | R14      | tape_end          | Buffer end = base + length                    |
+//! | R15      | scratch           | Candidate `PtrAdd` target before bounds check |
 //!
-//! ### Tape 扩容策略
+//! ### Tape growth strategy
 //!
-//! 当 `PtrAdd` 导致指针越界时（< base 或 >= end），调用 `ensure_tape_contains_r15`：
-//! 1. 反复将 tape 长度翻倍，直到新 tape 能容纳目标地址
-//! 2. mmap 分配新缓冲区
-//! 3. 将旧数据居中复制到新缓冲区
-//! 4. munmap 释放旧缓冲区
-//! 5. 更新 R12/R13/R14 三个寄存器
+//! When a `PtrAdd` would move the pointer out of the current tape (either
+//! below `base` or at/past `end`), `ensure_tape_contains_r15` is called:
+//! 1. Repeatedly double the tape length until the target offset fits,
+//! 2. `mmap` a fresh buffer of the new length,
+//! 3. Copy the old contents into the middle of the new buffer,
+//! 4. `munmap` the old buffer,
+//! 5. Refresh R12 / R13 / R14 to point into the new buffer.
 //!
-//! ## 标签分配
+//! ## Label allocation
 //!
-//! - 用户标签：直接从 LIR 的 `LabelId` 映射（低位 u32 值）
-//! - 内部标签：从 `u32::MAX` 递减分配，避免与用户标签冲突
+//! - User labels: mapped directly from LIR `LabelId` values (low `u32`s).
+//! - Internal labels: numbered downwards from `u32::MAX`, so they never
+//!   overlap user labels.
 
 use crate::backend::asm::{AsmInst, AsmLabel, AsmProgram, Reg64};
 use crate::ir::lir::{LabelId, LirInst, LirProgram};
 
-/// 初始 tape 大小（字节）。
+/// Initial tape size in bytes.
 ///
-/// 4096 = 1 页，足以运行大多数简单的 BF 程序。
-/// 如果程序需要更多空间，会通过 ensure_tape 动态扩容。
+/// 4096 bytes = one page, enough for most simple BF programs. Larger programs
+/// hit `ensure_tape` and grow the buffer on demand.
 const INITIAL_TAPE_SIZE: usize = 4096;
 
-/// 内部标签 ID：`ensure_tape` 函数的入口点。
+/// Internal label ID: entry point of the `ensure_tape` routine.
 ///
-/// 当 PtrAdd 检测到指针越界时，会 CALL 到此标签。
+/// Called by the slow path of bounds-checked `PtrAdd`.
 const INTERNAL_LABEL_ENSURE_TAPE_RAW: u32 = u32::MAX;
 
-/// 内部标签 ID：统一的失败退出点。
+/// Internal label ID: the single failure exit (`exit(1)`).
 ///
-/// 当 mmap/read 等系统调用返回负值（失败）时，跳转到此标签执行 exit(1)。
+/// Any `mmap` / `read` / `munmap` syscall that returns a negative value jumps
+/// here.
 const INTERNAL_LABEL_EXIT_ONE_RAW: u32 = u32::MAX - 1;
 
-/// 内部标签 ID：`ensure_tape` 中翻倍循环的入口。
-///
-/// 这个标签用于 tape 扩容时的"反复翻倍直到足够大"的循环。
+/// Internal label ID: the top of the doubling loop inside `ensure_tape`.
 const INTERNAL_LABEL_GROW_LOOP_RAW: u32 = u32::MAX - 2;
 
-/// 保留内部标签区间的最低值（含）。
+/// Lowest reserved internal-label ID (inclusive).
 ///
-/// [INTERNAL_LABEL_RESERVED_MIN_RAW, u32::MAX] 这段编号空间
-/// 专门留给“固定语义”的内部标签，不能被 fresh_internal_label() 占用。
+/// The range `[INTERNAL_LABEL_RESERVED_MIN_RAW, u32::MAX]` is reserved for
+/// labels with fixed semantics and must never be consumed by
+/// `fresh_internal_label()`.
 const INTERNAL_LABEL_RESERVED_MIN_RAW: u32 = INTERNAL_LABEL_GROW_LOOP_RAW;
 
-/// 临时内部标签 ID 的分配起点。
+/// Starting point for transient internal label IDs.
 ///
-/// PtrAdd 的边界检查需要生成临时标签（slow_path 和 done），
-/// 它们从“保留内部标签区间”以下开始递减分配，避免与固定内部标签撞号。
+/// The bounds check in `PtrAdd` needs temporary `slow_path` / `done` labels;
+/// they are allocated downward from this base so they sit strictly below the
+/// reserved range and cannot collide with fixed internal labels.
 const INTERNAL_LABEL_BASE_RAW: u32 = INTERNAL_LABEL_RESERVED_MIN_RAW - 1;
 
-/// 发射 `PtrAdd`：移动 `r13`，越界时 `call ensure_tape`。
+/// Emit `PtrAdd`: move `r13`, calling `ensure_tape` on out-of-range.
 fn emit_ptr_add_out(
     out: &mut Vec<AsmInst>,
     next_internal_label: &mut u32,
@@ -100,46 +106,40 @@ fn emit_ptr_add_out(
     out.push(AsmInst::Label(done));
 }
 
-/// 将 LIR 程序编译为 x86_64 汇编程序。
+/// Compile a LIR program into an x86_64 assembly program.
 ///
-/// 生成的程序结构如下：
+/// Produced layout:
 /// ```text
-/// [初始化 tape]       ← emit_init_tape
-/// [翻译后的 BF 指令]  ← 主循环
-/// [exit(0)]            ← 正常退出
-/// [ensure_tape 函数]   ← emit_ensure_tape_contains_r15
-/// [exit(1)]            ← emit_exit_one（OOM 退出）
+/// [tape init]        ← emit_init_tape
+/// [translated BF]    ← main loop
+/// [exit(0)]          ← normal exit
+/// [ensure_tape]      ← emit_ensure_tape_contains_r15
+/// [exit(1)]          ← emit_exit_one (OOM / syscall failure)
 /// ```
-///
-/// # 参数
-/// - `lir`: 要编译的 LIR 程序
-///
-/// # 返回值
-/// 编译后的汇编程序
 pub fn compile_lir_to_asm(lir: &LirProgram) -> AsmProgram {
     let ensure_tape_label = AsmLabel(INTERNAL_LABEL_ENSURE_TAPE_RAW);
     let exit_one_label = AsmLabel(INTERNAL_LABEL_EXIT_ONE_RAW);
 
-    // 内部标签计数器，从 INTERNAL_LABEL_BASE_RAW 递减分配
+    // Transient internal-label counter, decrementing from INTERNAL_LABEL_BASE_RAW.
     let mut next_internal_label = INTERNAL_LABEL_BASE_RAW;
 
     let mut out = Vec::new();
 
-    // ==== 1. 初始化 tape（mmap 分配内存） ====
+    // 1. Initialise the tape (mmap).
     emit_init_tape(&mut out, exit_one_label);
 
-    // ==== 2. 翻译 LIR 指令 ====
+    // 2. Translate LIR instructions.
     for inst in &lir.insts {
         match inst {
-            // ---- PtrAdd(0)：空操作，跳过 ----
+            // PtrAdd(0): no-op.
             LirInst::PtrAdd(0) => {}
 
-            // ---- PtrAdd(n)：移动数据指针 ----
+            // PtrAdd(n): move the data pointer.
             LirInst::PtrAdd(n) => {
                 emit_ptr_add_out(&mut out, &mut next_internal_label, *n, ensure_tape_label);
             }
 
-            // ---- LinearMul：`-O1` 仿射循环（如 `[->+<]`）----
+            // LinearMul: `-O1` affine loops (e.g. `[->+<]`).
             LirInst::LinearMul(factors) => {
                 if factors.is_empty() {
                     out.push(AsmInst::MovMem8Imm8(Reg64::R13, 0));
@@ -158,7 +158,7 @@ pub fn compile_lir_to_asm(lir: &LirProgram) -> AsmProgram {
                 out.push(AsmInst::Pop(Reg64::Rbx));
             }
 
-            // ---- Scan：`while *p { < or > }`（`[<]` / `[>]`）----
+            // Scan: `while *p { < or > }` (`[<]` / `[>]`).
             LirInst::Scan(dir) => {
                 let step = *dir;
                 debug_assert!(step == 1 || step == -1, "Scan step must be ±1");
@@ -172,61 +172,53 @@ pub fn compile_lir_to_asm(lir: &LirProgram) -> AsmProgram {
                 out.push(AsmInst::Label(loop_done));
             }
 
-            // ---- CellAdd(0)：空操作，跳过 ----
+            // CellAdd(0): no-op.
             LirInst::CellAdd(0) => {}
 
-            // ---- CellAdd(n)：修改当前单元的值 ----
+            // CellAdd(n): modify the current cell.
             //
-            // BF 的 '+' 和 '-' 经过合并后变成 CellAdd(n)，
-            // 其中 n 可以是负数（对应 '-'）。
-            //
-            // 由于 BF 的单元是 8 位无符号整数（0~255），
-            // 我们只需要取 n mod 256 的结果作为加数。
+            // After merging, BF's `+` / `-` runs become a single `CellAdd(n)`
+            // where `n` may be negative. Cells are 8-bit unsigned (0..=255),
+            // so we only need `n mod 256`.
             LirInst::CellAdd(n) => {
-                // 将 n 映射到 0..=255 范围
-                // (n % 256 + 256) % 256 确保负数也能正确映射
-                // 例如：-1 → 255，-3 → 253
+                // Normalise into 0..=255; the extra `+ 256` handles negatives
+                // (e.g. -1 → 255, -3 → 253).
                 let imm = ((*n % 256) + 256) % 256;
                 if imm != 0 {
-                    // 等价于 `*data_ptr = (*data_ptr + imm) % 256`
+                    // Equivalent to `*data_ptr = (*data_ptr + imm) % 256`.
                     out.push(AsmInst::AddMem8Imm8(Reg64::R13, imm as u8 as i8));
                 }
             }
 
-            // ---- CellSet(v)：将当前单元设置为指定值 ----
+            // CellSet(v): overwrite the current cell.
             //
-            // 这是一个优化指令，由 `[-]` 或 `[+]` 等模式识别生成。
-            // 直接将内存字节设为 v，无需先读取再修改。
+            // Emitted by patterns like `[-]` / `[+]`; writes the byte
+            // directly, skipping the read-modify-write.
             LirInst::CellSet(v) => {
                 out.push(AsmInst::MovMem8Imm8(Reg64::R13, *v));
             }
 
-            // ---- PutByte：输出当前单元 ----
+            // PutByte: emit the current cell (`.`).
             //
-            // 等价于 BF 的 '.' 操作。
-            // 使用 Linux sys_write 系统调用：
-            //   write(fd=1(stdout), buf=data_ptr, count=1)
+            // Linux `sys_write(fd=1, buf=data_ptr, count=1)`.
             LirInst::PutByte => {
-                out.push(AsmInst::MovRegImm64(Reg64::Rax, 1)); // syscall 号 = 1 (write)
+                out.push(AsmInst::MovRegImm64(Reg64::Rax, 1)); // syscall number = 1 (write)
                 out.push(AsmInst::MovRegImm64(Reg64::Rdi, 1)); // fd = 1 (stdout)
                 out.push(AsmInst::MovRegReg(Reg64::Rsi, Reg64::R13)); // buf = data_ptr
                 out.push(AsmInst::MovRegImm64(Reg64::Rdx, 1)); // count = 1
                 out.push(AsmInst::Syscall);
             }
 
-            // ---- GetByte：读取一个字节到当前单元 ----
+            // GetByte: read a byte into the current cell (`,`).
             //
-            // 等价于 BF 的 ',' 操作。
-            // 使用 Linux sys_read 系统调用：
-            //   read(fd=0(stdin), buf=data_ptr, count=1)
-            //
-            // 语义上需要与解释器保持一致：
-            // - 返回 1：成功读取一个字节，内核已经写入 *data_ptr
-            // - 返回 0：EOF，将当前单元设为 255
-            // - 返回负值：读取失败，exit(1)
+            // Linux `sys_read(fd=0, buf=data_ptr, count=1)`. Semantics match
+            // the interpreter:
+            // - return 1: byte read, kernel already stored it at `*data_ptr`.
+            // - return 0: EOF → store 255 in the current cell.
+            // - return < 0: read failure → exit(1).
             LirInst::GetByte => {
                 let done = fresh_internal_label(&mut next_internal_label);
-                out.push(AsmInst::MovRegImm64(Reg64::Rax, 0)); // syscall 号 = 0 (read)
+                out.push(AsmInst::MovRegImm64(Reg64::Rax, 0)); // syscall number = 0 (read)
                 out.push(AsmInst::MovRegImm64(Reg64::Rdi, 0)); // fd = 0 (stdin)
                 out.push(AsmInst::MovRegReg(Reg64::Rsi, Reg64::R13)); // buf = data_ptr
                 out.push(AsmInst::MovRegImm64(Reg64::Rdx, 1)); // count = 1
@@ -238,44 +230,41 @@ pub fn compile_lir_to_asm(lir: &LirProgram) -> AsmProgram {
                 out.push(AsmInst::Label(done));
             }
 
-            // ---- Label：标签定义 ----
+            // Label: label definition.
             //
-            // 直接从 LIR 的 LabelId 映射到 AsmLabel。
+            // Directly maps the LIR `LabelId` onto an `AsmLabel`.
             LirInst::Label(id) => {
                 out.push(AsmInst::Label(map_label(*id)));
             }
 
-            // ---- JumpIfZero：当前单元为零时跳转 ----
-            //
-            // 对应 BF 的 '['：如果当前单元为 0，跳过循环体。
+            // JumpIfZero: jump if current cell is zero (BF `[`).
             LirInst::JumpIfZero(id) => {
-                out.push(AsmInst::CmpMem8Imm8(Reg64::R13, 0)); // 比较 *data_ptr 与 0
-                out.push(AsmInst::Jz(map_label(*id))); // 如果为零则跳转
+                out.push(AsmInst::CmpMem8Imm8(Reg64::R13, 0)); // compare *data_ptr with 0
+                out.push(AsmInst::Jz(map_label(*id))); // jump if zero
             }
 
-            // ---- JumpIfNonZero：当前单元非零时跳转 ----
-            //
-            // 对应 BF 的 ']'：如果当前单元不为 0，跳回循环开头。
+            // JumpIfNonZero: jump if current cell is non-zero (BF `]`).
             LirInst::JumpIfNonZero(id) => {
-                out.push(AsmInst::CmpMem8Imm8(Reg64::R13, 0)); // 比较 *data_ptr 与 0
-                out.push(AsmInst::Jnz(map_label(*id))); // 如果非零则跳转
+                out.push(AsmInst::CmpMem8Imm8(Reg64::R13, 0)); // compare *data_ptr with 0
+                out.push(AsmInst::Jnz(map_label(*id))); // jump if non-zero
             }
         }
     }
 
-    // ==== 3. 程序正常退出：exit(0) ====
-    out.push(AsmInst::MovRegImm64(Reg64::Rax, 60)); // syscall 号 = 60 (exit)
-    out.push(AsmInst::MovRegImm64(Reg64::Rdi, 0)); // 退出码 = 0
+    // 3. Normal termination: exit(0).
+    out.push(AsmInst::MovRegImm64(Reg64::Rax, 60)); // syscall number = 60 (exit)
+    out.push(AsmInst::MovRegImm64(Reg64::Rdi, 0)); // exit code = 0
     out.push(AsmInst::Syscall);
 
-    // ==== 4. 辅助函数 ====
+    // 4. Helper routines.
     emit_ensure_tape_contains_r15(&mut out, ensure_tape_label, exit_one_label);
     emit_exit_one(&mut out, exit_one_label);
 
     AsmProgram { insts: out }
 }
 
-/// 最小 ELF 载荷：仅 `exit(0)`。用于 `-O3` 且源码中无任何 `.` 时。
+/// Minimal ELF payload: just `exit(0)`. Used at `-O3` when the source has no
+/// `.` operators at all.
 pub fn compile_trivial_exit_asm() -> AsmProgram {
     AsmProgram {
         insts: vec![
@@ -286,9 +275,10 @@ pub fn compile_trivial_exit_asm() -> AsmProgram {
     }
 }
 
-/// `write(1, buf, n); exit(0)`，字节放在栈上，不经过 Brainfuck tape。
+/// `write(1, buf, n); exit(0)`, with bytes living on the stack — the Brainfuck
+/// tape is bypassed entirely.
 ///
-/// `data` 为空时等价于 [`compile_trivial_exit_asm`]。
+/// An empty `data` degenerates to [`compile_trivial_exit_asm`].
 pub fn compile_precomputed_stdout_asm(data: &[u8]) -> AsmProgram {
     if data.is_empty() {
         return compile_trivial_exit_asm();
@@ -300,7 +290,8 @@ pub fn compile_precomputed_stdout_asm(data: &[u8]) -> AsmProgram {
     }
 }
 
-/// 生成 `sub rsp` / `mov [rsp+off]` / `write` / `exit` 的机器码（Linux x86_64）。
+/// Build raw `sub rsp` / `mov [rsp+off]` / `write` / `exit` bytes (Linux
+/// x86_64).
 fn build_precomputed_stdout_machine_code(data: &[u8]) -> Vec<u8> {
     let n = data.len();
     let mut code = Vec::new();
@@ -370,9 +361,9 @@ fn emit_mov_byte_rsp_offset(code: &mut Vec<u8>, offset: usize, val: u8) {
     }
 }
 
-/// 生成 tape 初始化代码。
+/// Emit tape initialisation code.
 ///
-/// 使用 mmap 系统调用分配初始缓冲区：
+/// Uses the `mmap` syscall to allocate the initial buffer:
 /// ```c
 /// void *ptr = mmap(NULL, INITIAL_TAPE_SIZE,
 ///                  PROT_READ | PROT_WRITE,
@@ -380,17 +371,18 @@ fn emit_mov_byte_rsp_offset(code: &mut Vec<u8>, offset: usize, val: u8) {
 ///                  -1, 0);
 /// ```
 ///
-/// 分配成功后，初始化三个核心寄存器：
-/// - R12 = ptr           （tape 基址）
-/// - R13 = ptr + size/2  （数据指针，初始位于 tape 中间）
-/// - R14 = ptr + size    （tape 末尾）
+/// On success the three core registers are initialised as:
+/// - R12 = ptr            (tape base)
+/// - R13 = ptr + size/2   (data pointer, starting in the middle of the tape)
+/// - R14 = ptr + size     (tape end)
 ///
-/// 将指针初始化在中间而非开头，是为了支持 BF 程序向左移动指针（'<'），
-/// 而无需立即触发扩容。
+/// Starting the pointer in the middle rather than at the start means BF
+/// programs that move the pointer left (`<`) can do so for a while before
+/// triggering growth.
 fn emit_init_tape(out: &mut Vec<AsmInst>, exit_one_label: AsmLabel) {
-    // ---- mmap 系统调用参数 ----
+    // mmap syscall arguments.
     out.push(AsmInst::MovRegImm64(Reg64::Rax, 9)); // sys_mmap = 9
-    out.push(AsmInst::MovRegImm64(Reg64::Rdi, 0)); // addr = NULL（让内核选择地址）
+    out.push(AsmInst::MovRegImm64(Reg64::Rdi, 0)); // addr = NULL (let the kernel choose)
     out.push(AsmInst::MovRegImm64(
         // length = INITIAL_TAPE_SIZE
         Reg64::Rsi,
@@ -402,48 +394,51 @@ fn emit_init_tape(out: &mut Vec<AsmInst>, exit_one_label: AsmLabel) {
         Reg64::R10,
         0x22,
     ));
-    out.push(AsmInst::MovRegImm64(Reg64::R8, -1)); // fd = -1（匿名映射）
+    out.push(AsmInst::MovRegImm64(Reg64::R8, -1)); // fd = -1 (anonymous mapping)
     out.push(AsmInst::MovRegImm64(Reg64::R9, 0)); // offset = 0
     out.push(AsmInst::Syscall);
 
-    // ---- 检查 mmap 返回值 ----
-    // 返回值 < 0 表示错误（如 ENOMEM）
+    // Check mmap return value; a negative return (e.g. -ENOMEM) is fatal.
     out.push(AsmInst::CmpRegImm32(Reg64::Rax, 0));
     out.push(AsmInst::Jl(exit_one_label));
 
-    // ---- 初始化寄存器 ----
-    // R12 = tape_base = mmap 返回的地址
+    // Initialise registers.
+    // R12 = tape_base = mmap return value.
     out.push(AsmInst::MovRegReg(Reg64::R12, Reg64::Rax));
 
-    // R13 = data_ptr = base + size/2（初始位于中间）
+    // R13 = data_ptr = base + size/2 (middle of the tape).
     out.push(AsmInst::MovRegReg(Reg64::R13, Reg64::Rax));
     out.push(AsmInst::AddRegImm32(
         Reg64::R13,
         (INITIAL_TAPE_SIZE / 2) as i32,
     ));
 
-    // R14 = tape_end = base + size
+    // R14 = tape_end = base + size.
     out.push(AsmInst::MovRegReg(Reg64::R14, Reg64::Rax));
     out.push(AsmInst::AddRegImm32(Reg64::R14, INITIAL_TAPE_SIZE as i32));
 }
 
-/// 生成 tape 扩容函数 `ensure_tape_contains_r15`。
+/// Emit the tape-growth routine `ensure_tape_contains_r15`.
 ///
-/// 前置条件：R15 包含目标地址（可能在当前 tape 范围之外）。
+/// Precondition: R15 holds a target address that may sit outside the current
+/// tape range.
 ///
-/// ## 算法
+/// ## Algorithm
 ///
-/// 1. 计算 old_len = R14 - R12
-/// 2. 计算 desired_offset = R15 - R12（可以是负数，表示向左越界）
-/// 3. 反复将 new_len 翻倍，直到：
-///    - copy_start = (new_len - old_len) / 2（旧数据在新 tape 中的起始偏移）
-///    - copy_start + desired_offset >= 0 且 < new_len
-/// 4. mmap 分配 new_len 大小的新缓冲区
-/// 5. 将旧数据复制到新缓冲区的 copy_start 位置（居中）
-/// 6. munmap 释放旧缓冲区
-/// 7. 更新 R12 = new_base, R13 = new_base + copy_start + desired_offset, R14 = new_base + new_len
+/// 1. Compute `old_len = R14 - R12`.
+/// 2. Compute `desired_offset = R15 - R12` (may be negative if R15 < R12).
+/// 3. Repeatedly double `new_len` until:
+///    - `copy_start = (new_len - old_len) / 2` (where the old contents will
+///      land in the new tape),
+///    - `copy_start + desired_offset` is in `[0, new_len)`.
+/// 4. `mmap` a fresh buffer of length `new_len`.
+/// 5. Copy the old bytes into the new buffer at offset `copy_start`.
+/// 6. `munmap` the old buffer.
+/// 7. Update `R12 = new_base`,
+///    `R13 = new_base + copy_start + desired_offset`, `R14 = new_base + new_len`.
 ///
-/// 后置条件：R12/R13/R14 指向新 tape，R13 位于有效范围内。
+/// Postcondition: R12 / R13 / R14 reference the new tape and R13 is inside
+/// the valid range.
 fn emit_ensure_tape_contains_r15(
     out: &mut Vec<AsmInst>,
     ensure_tape_label: AsmLabel,
@@ -451,48 +446,48 @@ fn emit_ensure_tape_contains_r15(
 ) {
     let grow_loop = AsmLabel(INTERNAL_LABEL_GROW_LOOP_RAW);
 
-    // ---- 函数入口 ----
+    // Function entry.
     out.push(AsmInst::Label(ensure_tape_label));
 
-    // R10 = old_len = tape_end - tape_base
+    // R10 = old_len = tape_end - tape_base.
     out.push(AsmInst::MovRegReg(Reg64::R10, Reg64::R14));
     out.push(AsmInst::SubRegReg(Reg64::R10, Reg64::R12));
 
-    // R9 = desired_offset = target_ptr - tape_base
-    // 注意：这可能是负数（如果 R15 < R12）
+    // R9 = desired_offset = target_ptr - tape_base.
+    // May be negative (when R15 < R12).
     out.push(AsmInst::MovRegReg(Reg64::R9, Reg64::R15));
     out.push(AsmInst::SubRegReg(Reg64::R9, Reg64::R12));
 
-    // R11 = new_len（候选值，从 old_len 开始，每次翻倍）
+    // R11 = new_len (candidate; doubles each iteration, seeded at old_len).
     out.push(AsmInst::MovRegReg(Reg64::R11, Reg64::R10));
 
-    // ---- 翻倍循环 ----
+    // Doubling loop.
     out.push(AsmInst::Label(grow_loop));
 
-    // new_len *= 2（自加实现翻倍）
+    // new_len *= 2 (via self-add).
     out.push(AsmInst::AddRegReg(Reg64::R11, Reg64::R11));
 
-    // R8 = copy_start = (new_len - old_len) / 2
-    // 旧数据将被放置在新缓冲区的这个偏移处（居中对齐）
+    // R8 = copy_start = (new_len - old_len) / 2.
+    // The old contents are centred inside the new buffer at this offset.
     out.push(AsmInst::MovRegReg(Reg64::R8, Reg64::R11));
     out.push(AsmInst::SubRegReg(Reg64::R8, Reg64::R10));
     out.push(AsmInst::ShrRegImm8(Reg64::R8, 1));
 
-    // 检查：copy_start + desired_offset 是否在 [0, new_len) 范围内
-    // RAX = copy_start + desired_offset
+    // Check whether copy_start + desired_offset lies in [0, new_len).
+    // RAX = copy_start + desired_offset.
     out.push(AsmInst::MovRegReg(Reg64::Rax, Reg64::R8));
     out.push(AsmInst::AddRegReg(Reg64::Rax, Reg64::R9));
 
-    // 如果 rax < 0（有符号），说明 new_len 还不够大
+    // rax < 0 (signed): new_len still too small.
     out.push(AsmInst::CmpRegImm32(Reg64::Rax, 0));
     out.push(AsmInst::Jl(grow_loop));
 
-    // 如果 rax >= new_len（有符号），说明 new_len 还不够大
+    // rax >= new_len (signed): new_len still too small.
     out.push(AsmInst::CmpRegReg(Reg64::Rax, Reg64::R11));
     out.push(AsmInst::Jge(grow_loop));
 
-    // ---- 分配新缓冲区 ----
-    // mmap(NULL, new_len, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0)
+    // Allocate the new buffer.
+    // mmap(NULL, new_len, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0).
     out.push(AsmInst::MovRegImm64(Reg64::Rax, 9)); // sys_mmap
     out.push(AsmInst::MovRegImm64(Reg64::Rdi, 0)); // addr = NULL
     out.push(AsmInst::MovRegReg(Reg64::Rsi, Reg64::R11)); // length = new_len
@@ -502,54 +497,52 @@ fn emit_ensure_tape_contains_r15(
     out.push(AsmInst::MovRegImm64(Reg64::R9, 0)); // offset
     out.push(AsmInst::Syscall);
 
-    // 检查 mmap 返回值
+    // Check mmap return value.
     out.push(AsmInst::CmpRegImm32(Reg64::Rax, 0));
     out.push(AsmInst::Jl(exit_one_label));
 
-    // ---- 重新计算被 syscall 覆写的值 ----
+    // Recompute values clobbered by the syscall.
     //
-    // Linux x86_64 syscall 会覆写 rcx（保存旧 RIP）和 r11（保存旧 RFLAGS），
-    // 同时 mmap 的参数寄存器 r8/r9/r10 也已被使用。
-    // 但 rsi 在 syscall 后仍保留着 new_len。
-    //
-    // 需要重新计算：
-    // - R10 = old_len（从 R14 - R12 重新计算）
-    // - R9  = desired_offset（从 R15 - R12 重新计算）
-    // - R11 = new_len（从 rsi 恢复，因为 rsi 在 syscall 后未被覆写）
-    // - R8  = copy_start（从 (new_len - old_len) / 2 重新计算）
+    // Linux x86_64 `syscall` clobbers `rcx` (holds old RIP) and `r11` (holds
+    // old RFLAGS); mmap has also consumed r8 / r9 / r10. `rsi` still holds
+    // `new_len` afterwards, so we recover:
+    // - R10 = old_len (recomputed from R14 - R12)
+    // - R9  = desired_offset (recomputed from R15 - R12)
+    // - R11 = new_len (recovered from rsi)
+    // - R8  = copy_start (recomputed as (new_len - old_len) / 2)
     out.push(AsmInst::MovRegReg(Reg64::R10, Reg64::R14));
     out.push(AsmInst::SubRegReg(Reg64::R10, Reg64::R12));
     out.push(AsmInst::MovRegReg(Reg64::R9, Reg64::R15));
     out.push(AsmInst::SubRegReg(Reg64::R9, Reg64::R12));
-    out.push(AsmInst::MovRegReg(Reg64::R11, Reg64::Rsi)); // rsi 保存了 new_len
+    out.push(AsmInst::MovRegReg(Reg64::R11, Reg64::Rsi)); // rsi retained new_len
     out.push(AsmInst::MovRegReg(Reg64::R8, Reg64::R11));
     out.push(AsmInst::SubRegReg(Reg64::R8, Reg64::R10));
     out.push(AsmInst::ShrRegImm8(Reg64::R8, 1));
 
-    // RDX = new_base（mmap 返回的新缓冲区地址）
+    // RDX = new_base (from the mmap return).
     out.push(AsmInst::MovRegReg(Reg64::Rdx, Reg64::Rax));
 
-    // ---- 复制旧数据到新缓冲区 ----
-    // rep movsb: 复制 old_len 字节，从 old_base 到 new_base + copy_start
+    // Copy the old contents into the new buffer.
+    // rep movsb copies old_len bytes from old_base to new_base + copy_start.
     //
-    // rep movsb 的参数：
-    // - RDI = 目标地址 = new_base + copy_start
-    // - RSI = 源地址 = old_base (R12)
-    // - RCX = 字节数 = old_len (R10)
+    // rep movsb inputs:
+    // - RDI = destination = new_base + copy_start
+    // - RSI = source      = old_base (R12)
+    // - RCX = byte count  = old_len  (R10)
     out.push(AsmInst::MovRegReg(Reg64::Rdi, Reg64::Rdx)); // rdi = new_base
     out.push(AsmInst::AddRegReg(Reg64::Rdi, Reg64::R8)); // rdi += copy_start
     out.push(AsmInst::MovRegReg(Reg64::Rsi, Reg64::R12)); // rsi = old_base
     out.push(AsmInst::MovRegReg(Reg64::Rcx, Reg64::R10)); // rcx = old_len
-    out.push(AsmInst::Cld); // 清除方向标志（确保向前复制）
-    out.push(AsmInst::RepMovsb); // 执行复制
+    out.push(AsmInst::Cld); // clear DF (forward copy)
+    out.push(AsmInst::RepMovsb); // do the copy
 
-    // ---- 在 munmap 之前先准备好新 tape 的结束地址 ----
-    // syscall 会覆写 r11，因此不能在 munmap 之后再依赖 new_len。
+    // Compute the new tape_end before issuing munmap.
+    // The upcoming syscall clobbers r11, so the value must be committed now.
     out.push(AsmInst::MovRegReg(Reg64::R14, Reg64::Rdx));
     out.push(AsmInst::AddRegReg(Reg64::R14, Reg64::R11)); // r14 = new_base + new_len
 
-    // ---- 释放旧缓冲区 ----
-    // munmap(old_base, old_len)
+    // Release the old buffer.
+    // munmap(old_base, old_len).
     out.push(AsmInst::MovRegImm64(Reg64::Rax, 11)); // sys_munmap = 11
     out.push(AsmInst::MovRegReg(Reg64::Rdi, Reg64::R12)); // addr = old_base
     out.push(AsmInst::MovRegReg(Reg64::Rsi, Reg64::R10)); // length = old_len
@@ -557,35 +550,33 @@ fn emit_ensure_tape_contains_r15(
     out.push(AsmInst::CmpRegImm32(Reg64::Rax, 0));
     out.push(AsmInst::Jl(exit_one_label));
 
-    // ---- 更新核心寄存器 ----
-    // R12 = new_base
+    // Refresh the remaining core registers.
+    // R12 = new_base.
     out.push(AsmInst::MovRegReg(Reg64::R12, Reg64::Rdx));
 
-    // R13 = new_base + copy_start + desired_offset
-    // 这是目标地址在新 tape 中的位置
+    // R13 = new_base + copy_start + desired_offset (target address inside new tape).
     out.push(AsmInst::MovRegReg(Reg64::R13, Reg64::Rdx));
     out.push(AsmInst::AddRegReg(Reg64::R13, Reg64::R8)); // + copy_start
     out.push(AsmInst::AddRegReg(Reg64::R13, Reg64::R9)); // + desired_offset
 
-    // 返回到调用者（PtrAdd 的 slow_path 中的 CALL 之后）
+    // Return to caller (the CALL in the PtrAdd slow path).
     out.push(AsmInst::Ret);
 }
 
-/// 生成 OOM 退出代码：exit(1)。
-///
-/// 当 mmap 分配失败时跳转到这里，以非零退出码终止程序。
+/// Emit the OOM / failure path: `exit(1)`.
 fn emit_exit_one(out: &mut Vec<AsmInst>, label: AsmLabel) {
     out.push(AsmInst::Label(label));
     out.push(AsmInst::MovRegImm64(Reg64::Rax, 60)); // sys_exit = 60
-    out.push(AsmInst::MovRegImm64(Reg64::Rdi, 1)); // 退出码 = 1
+    out.push(AsmInst::MovRegImm64(Reg64::Rdi, 1)); // exit code = 1
     out.push(AsmInst::Syscall);
 }
 
-/// 分配一个新的内部标签 ID。
+/// Allocate a fresh internal label ID.
 ///
-/// 从 `next_raw` 的当前值取出一个标签，然后递减。
-/// 临时内部标签必须始终落在“保留内部标签区间”以下，
-/// 否则会与具有固定语义的内部标签（如 __grow_loop）发生冲突。
+/// Takes the current value of `next_raw` and decrements it. Transient
+/// internal labels must stay strictly below the reserved range, otherwise
+/// they would collide with labels that carry fixed semantics (e.g.
+/// `__grow_loop`).
 fn fresh_internal_label(next_raw: &mut u32) -> AsmLabel {
     debug_assert!(
         *next_raw < INTERNAL_LABEL_RESERVED_MIN_RAW,
@@ -598,11 +589,10 @@ fn fresh_internal_label(next_raw: &mut u32) -> AsmLabel {
     label
 }
 
-/// 将 LIR 的 `LabelId` 映射为 `AsmLabel`。
+/// Map a LIR `LabelId` onto an `AsmLabel`.
 ///
-/// 直接使用 LabelId 的内部值作为 AsmLabel 的 ID。
-/// 由于用户标签从 0 递增，内部标签从 u32::MAX 递减，
-/// 两者不会冲突。
+/// The raw `u32` is reused as-is: user labels count up from 0 and internal
+/// labels count down from `u32::MAX`, so the two namespaces never collide.
 fn map_label(id: LabelId) -> AsmLabel {
     AsmLabel(id.0)
 }

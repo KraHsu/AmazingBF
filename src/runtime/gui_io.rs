@@ -1,3 +1,11 @@
+//! GUI runtime I/O: keypress input + framebuffer output for `bf-gui`.
+//!
+//! Allocates a reserved range of negative tape indices (`SCREEN_*`) as a
+//! 256×256 RGB332 framebuffer. `Setpixel` writes are coalesced into a single
+//! dirty-bbox frame and forwarded to the Tauri webview through
+//! `GuiShared.frame_sink`. Keypresses arrive via a `Mutex<VecDeque<u8>>` guarded
+//! by `cv_key` so `GetByte` can block until a key is available.
+
 use std::collections::VecDeque;
 use std::sync::mpsc::{SyncSender, TrySendError};
 use std::sync::{Arc, Condvar, Mutex};
@@ -24,7 +32,9 @@ const FRAME_HEADER_LEN: usize = 16;
 
 /// Shared state between the interpreter thread and the Tauri main thread.
 pub(crate) struct GuiShared {
+    /// Queue of pending keycodes delivered by the webview, consumed by `GetByte`.
     pub(crate) keys: Mutex<VecDeque<u8>>,
+    /// Signalled when `keys` goes from empty to non-empty.
     pub(crate) cv_key: Condvar,
     /// Frame forwarder sink. Populated once a webview subscribes.
     /// Replacing the `Sender` lets a reloaded webview install a fresh forwarder.
@@ -32,6 +42,7 @@ pub(crate) struct GuiShared {
 }
 
 impl GuiShared {
+    /// Build an empty shared state wrapped in an `Arc` for cross-thread sharing.
     pub(crate) fn new() -> Arc<Self> {
         Arc::new(Self {
             keys: Mutex::new(VecDeque::new()),
@@ -100,6 +111,7 @@ pub(crate) struct GuiIo {
 }
 
 impl GuiIo {
+    /// Build a fresh [`GuiIo`] bound to the shared key queue / frame channel.
     pub(crate) fn new(shared: Arc<GuiShared>) -> Self {
         let mut lut = [0u32; 256];
         for b in 0..=255u32 {

@@ -1,12 +1,26 @@
+//! Compile-time configuration assembled from CLI flags.
+//!
+//! `DriverConfig` is the single source of truth passed from `cli` to
+//! `driver::run`. `RunMode`, `CompileTarget`, and `OptLevel` are parsed and
+//! normalised here; downstream layers assume the resulting config is fully
+//! validated (e.g. `output` is populated with a platform-appropriate default
+//! when the user did not pass `-o`).
+
 use std::path::PathBuf;
 
+/// Default Brainfuck tape length used by the interpreter when no override is set.
 pub(crate) const DEFAULT_INTERPRETER_TAPE_LEN: usize = 30_000;
 
+/// Normalised compile-time configuration consumed by `driver::run`.
 #[derive(Debug, Clone)]
 pub(crate) struct DriverConfig {
+    /// Path to the input Brainfuck source file.
     pub(crate) source: String,
+    /// Which pipeline stage to run (interpret / dump / compile).
     pub(crate) mode: RunMode,
+    /// Target triple for native code generation in `compile` mode.
     pub(crate) target: CompileTarget,
+    /// Destination path for compile-mode artefacts (`.out` / `.exe`).
     pub(crate) output: PathBuf,
     /// When true in `interpret` mode, print tape statistics to stderr after the run.
     pub(crate) interp_debug: bool,
@@ -16,15 +30,16 @@ pub(crate) struct DriverConfig {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RunMode {
-    /// 跑通流水线并在日志中输出各阶段规模，不写 ELF 或 listing
+    /// Run the full pipeline and log per-stage sizes; do not write ELF / listings.
     Dump,
-    /// 在优化后的 HIR 上解释执行（默认）
+    /// Interpret the optimised HIR (default).
     Interpret,
-    /// 生成 target 对应的原生可执行文件，并在 `-o` 旁写出 `.asm` / `.lst`
+    /// Emit a native executable for `target` plus `.asm` / `.lst` alongside `-o`.
     Compile,
 }
 
 impl RunMode {
+    /// Parse the `--mode` CLI flag; returns `None` for unknown values.
     pub(crate) fn parse(s: &str) -> Option<Self> {
         match s {
             "dump" => Some(Self::Dump),
@@ -34,6 +49,7 @@ impl RunMode {
         }
     }
 
+    /// Canonical CLI name for this mode.
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Dump => "dump",
@@ -58,6 +74,7 @@ pub(crate) enum CompileTarget {
 }
 
 impl CompileTarget {
+    /// Parse the `--target` CLI flag; returns `None` for unknown values.
     pub(crate) fn parse(s: &str) -> Option<Self> {
         match s {
             "x86_64-linux" => Some(Self::X86_64Linux),
@@ -66,6 +83,7 @@ impl CompileTarget {
         }
     }
 
+    /// Select the default target for the host OS at build time.
     pub(crate) const fn build_default() -> Self {
         #[cfg(target_os = "windows")]
         {
@@ -77,6 +95,7 @@ impl CompileTarget {
         }
     }
 
+    /// Canonical CLI name for this target.
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::X86_64Linux => "x86_64-linux",
@@ -84,6 +103,7 @@ impl CompileTarget {
         }
     }
 
+    /// Platform-appropriate default output filename when `-o` is omitted.
     pub(crate) const fn default_output_name(self) -> &'static str {
         match self {
             Self::X86_64Linux => "a.out",
@@ -115,6 +135,7 @@ pub(crate) enum OptLevel {
 }
 
 impl OptLevel {
+    /// Parse the `-O` CLI flag; returns `None` for unknown values.
     pub(crate) fn parse(s: &str) -> Option<Self> {
         match s {
             "0" => Some(Self::O0),
@@ -125,6 +146,7 @@ impl OptLevel {
         }
     }
 
+    /// Canonical CLI digit for this optimisation tier (e.g. `"2"`).
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::O0 => "0",

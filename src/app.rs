@@ -5,6 +5,9 @@ use crate::cli::{self, CliError};
 
 type ParseFn = fn() -> std::result::Result<cli::AppConfig, CliError>;
 
+/// Run the provided CLI parser, translate [`CliError`] outcomes into appropriate
+/// process behaviour (usage / version / help exits), then hand the resulting
+/// [`cli::AppConfig`] to `driver::run`.
 pub(crate) fn run_with_parse(parse: ParseFn) -> Result<()> {
     let config = match parse() {
         Ok(config) => config,
