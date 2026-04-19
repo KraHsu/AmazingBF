@@ -1,7 +1,7 @@
-use std::collections::HashMap;
+use super::BfscError;
 use super::ast::*;
 use super::layout::{MemMap, MemMapBuilder};
-use super::BfscError;
+use std::collections::HashMap;
 
 pub(crate) fn check(stmts: &[Stmt]) -> Result<(Vec<Stmt>, MemMap), BfscError> {
     let mut builder = MemMapBuilder::new();
@@ -34,9 +34,7 @@ fn collect_decls(
             }
             match ty {
                 TypeAnn::Scalar(st) => builder.alloc_scalar(name.clone(), *st),
-                TypeAnn::Array(st, len) => {
-                    builder.alloc_array(name.clone(), *st, *len as usize)
-                }
+                TypeAnn::Array(st, len) => builder.alloc_array(name.clone(), *st, *len as usize),
             }
             sym.insert(name.clone(), ty.clone());
         }
@@ -44,7 +42,10 @@ fn collect_decls(
             for s in body {
                 collect_decls(s, sym, builder)?;
             }
-            if let Stmt::If { else_: Some(eb), .. } = stmt {
+            if let Stmt::If {
+                else_: Some(eb), ..
+            } = stmt
+            {
                 for s in eb {
                     collect_decls(s, sym, builder)?;
                 }
@@ -107,7 +108,7 @@ fn check_lval(lval: &LValue, sym: &HashMap<String, TypeAnn>) -> Result<(), BfscE
             match sym.get(name.as_str()) {
                 None => return Err(BfscError::Type(format!("undeclared variable '{name}'"))),
                 Some(TypeAnn::Scalar(_)) => {
-                    return Err(BfscError::Type(format!("'{name}' is not an array")))
+                    return Err(BfscError::Type(format!("'{name}' is not an array")));
                 }
                 Some(TypeAnn::Array(_, _)) => {}
             }
@@ -129,7 +130,7 @@ fn check_expr(expr: &Expr, sym: &HashMap<String, TypeAnn>) -> Result<(), BfscErr
             match sym.get(name.as_str()) {
                 None => return Err(BfscError::Type(format!("undeclared variable '{name}'"))),
                 Some(TypeAnn::Scalar(_)) => {
-                    return Err(BfscError::Type(format!("'{name}' is not an array")))
+                    return Err(BfscError::Type(format!("'{name}' is not an array")));
                 }
                 Some(TypeAnn::Array(_, _)) => {}
             }

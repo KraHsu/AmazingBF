@@ -110,6 +110,10 @@ pub(crate) enum Stmt {
     Scan(LValue),
     Print(Expr),
     Putchar(Expr),
-    Setpixel { x: Expr, y: Expr, color: Expr },
+    Setpixel {
+        x: Expr,
+        y: Expr,
+        color: Expr,
+    },
     Getchar(LValue),
 }

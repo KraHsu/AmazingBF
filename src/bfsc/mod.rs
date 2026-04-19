@@ -189,8 +189,7 @@ fn run_compile_mode(bf: String, args: &ParsedArgs) -> Result<(), BfscError> {
         .unwrap_or_else(|| PathBuf::from(args.target.default_output_name()));
 
     let log_level = if args.quiet { 0u8 } else { 1u8 };
-    crate::logging::init_logger(log_level)
-        .map_err(|e| BfscError::Compile(e.to_string()))?;
+    crate::logging::init_logger(log_level).map_err(|e| BfscError::Compile(e.to_string()))?;
 
     let config = DriverConfig {
         source: bf,

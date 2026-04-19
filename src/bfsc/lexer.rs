@@ -134,7 +134,10 @@ pub(crate) fn tokenize(src: &str) -> Result<Vec<SpannedToken>, BfscError> {
                 n = n.wrapping_mul(10).wrapping_add((bytes[pos] - b'0') as u64);
                 pos += 1;
             }
-            tokens.push(SpannedToken { token: Token::Int(n), pos: start });
+            tokens.push(SpannedToken {
+                token: Token::Int(n),
+                pos: start,
+            });
             continue;
         }
 
@@ -144,9 +147,11 @@ pub(crate) fn tokenize(src: &str) -> Result<Vec<SpannedToken>, BfscError> {
                 pos += 1;
             }
             let word = &src[start..pos];
-            let tok = keyword(word)
-                .unwrap_or_else(|| Token::Ident(word.to_string()));
-            tokens.push(SpannedToken { token: tok, pos: start });
+            let tok = keyword(word).unwrap_or_else(|| Token::Ident(word.to_string()));
+            tokens.push(SpannedToken {
+                token: tok,
+                pos: start,
+            });
             continue;
         }
 
@@ -193,13 +198,16 @@ pub(crate) fn tokenize(src: &str) -> Result<Vec<SpannedToken>, BfscError> {
                 return Err(BfscError::Lex(format!(
                     "unexpected character {:?} at byte {start}",
                     other as char
-                )))
+                )));
             }
         };
         push!(tok);
         pos += 1;
     }
 
-    tokens.push(SpannedToken { token: Token::Eof, pos: len });
+    tokens.push(SpannedToken {
+        token: Token::Eof,
+        pos: len,
+    });
     Ok(tokens)
 }

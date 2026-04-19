@@ -1,6 +1,6 @@
+use super::BfscError;
 use super::ast::*;
 use super::lexer::{SpannedToken, Token};
-use super::BfscError;
 
 struct Parser<'a> {
     tokens: &'a [SpannedToken],
@@ -56,42 +56,91 @@ impl<'a> Parser<'a> {
 
     fn parse_type(&mut self) -> Result<TypeAnn, BfscError> {
         let st = match self.cur() {
-            Token::U8 => { self.bump(); ScalarType::U8 }
-            Token::I8 => { self.bump(); ScalarType::I8 }
-            Token::U16 => { self.bump(); ScalarType::U16 }
-            Token::I16 => { self.bump(); ScalarType::I16 }
-            Token::U32 => { self.bump(); ScalarType::U32 }
-            Token::I32 => { self.bump(); ScalarType::I32 }
+            Token::U8 => {
+                self.bump();
+                ScalarType::U8
+            }
+            Token::I8 => {
+                self.bump();
+                ScalarType::I8
+            }
+            Token::U16 => {
+                self.bump();
+                ScalarType::U16
+            }
+            Token::I16 => {
+                self.bump();
+                ScalarType::I16
+            }
+            Token::U32 => {
+                self.bump();
+                ScalarType::U32
+            }
+            Token::I32 => {
+                self.bump();
+                ScalarType::I32
+            }
             Token::LBrack => {
                 self.bump();
                 let elem = self.parse_scalar_type()?;
                 self.expect(&Token::Semi)?;
                 let n = match self.cur() {
-                    Token::Int(n) => { let n = *n; self.bump(); n }
-                    _ => return Err(BfscError::Parse(format!(
-                        "expected array size at byte {}", self.cur_pos()
-                    ))),
+                    Token::Int(n) => {
+                        let n = *n;
+                        self.bump();
+                        n
+                    }
+                    _ => {
+                        return Err(BfscError::Parse(format!(
+                            "expected array size at byte {}",
+                            self.cur_pos()
+                        )));
+                    }
                 };
                 self.expect(&Token::RBrack)?;
                 return Ok(TypeAnn::Array(elem, n as u32));
             }
-            _ => return Err(BfscError::Parse(format!(
-                "expected type, got {:?} at byte {}", self.cur(), self.cur_pos()
-            ))),
+            _ => {
+                return Err(BfscError::Parse(format!(
+                    "expected type, got {:?} at byte {}",
+                    self.cur(),
+                    self.cur_pos()
+                )));
+            }
         };
         Ok(TypeAnn::Scalar(st))
     }
 
     fn parse_scalar_type(&mut self) -> Result<ScalarType, BfscError> {
         match self.cur() {
-            Token::U8 => { self.bump(); Ok(ScalarType::U8) }
-            Token::I8 => { self.bump(); Ok(ScalarType::I8) }
-            Token::U16 => { self.bump(); Ok(ScalarType::U16) }
-            Token::I16 => { self.bump(); Ok(ScalarType::I16) }
-            Token::U32 => { self.bump(); Ok(ScalarType::U32) }
-            Token::I32 => { self.bump(); Ok(ScalarType::I32) }
+            Token::U8 => {
+                self.bump();
+                Ok(ScalarType::U8)
+            }
+            Token::I8 => {
+                self.bump();
+                Ok(ScalarType::I8)
+            }
+            Token::U16 => {
+                self.bump();
+                Ok(ScalarType::U16)
+            }
+            Token::I16 => {
+                self.bump();
+                Ok(ScalarType::I16)
+            }
+            Token::U32 => {
+                self.bump();
+                Ok(ScalarType::U32)
+            }
+            Token::I32 => {
+                self.bump();
+                Ok(ScalarType::I32)
+            }
             _ => Err(BfscError::Parse(format!(
-                "expected scalar type, got {:?} at byte {}", self.cur(), self.cur_pos()
+                "expected scalar type, got {:?} at byte {}",
+                self.cur(),
+                self.cur_pos()
             ))),
         }
     }
@@ -126,7 +175,8 @@ impl<'a> Parser<'a> {
             Token::Getchar => self.parse_getchar(),
             Token::Ident(_) => self.parse_assign(),
             tok => Err(BfscError::Parse(format!(
-                "unexpected token {tok:?} at byte {}", self.cur_pos()
+                "unexpected token {tok:?} at byte {}",
+                self.cur_pos()
             ))),
         }
     }
@@ -349,7 +399,8 @@ impl<'a> Parser<'a> {
                 Ok(e)
             }
             t => Err(BfscError::Parse(format!(
-                "expected expression, got {t:?} at byte {}", self.cur_pos()
+                "expected expression, got {t:?} at byte {}",
+                self.cur_pos()
             ))),
         }
     }

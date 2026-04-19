@@ -1,5 +1,5 @@
-use std::collections::HashMap;
 use super::ast::ScalarType;
+use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
 pub(crate) struct CellLayout {
@@ -42,29 +42,38 @@ pub(crate) struct MemMapBuilder {
 
 impl MemMapBuilder {
     pub(crate) fn new() -> Self {
-        MemMapBuilder { vars: HashMap::new(), next_cell: 0 }
+        MemMapBuilder {
+            vars: HashMap::new(),
+            next_cell: 0,
+        }
     }
 
     pub(crate) fn alloc_scalar(&mut self, name: String, ty: ScalarType) {
         let width = ty.cell_width();
-        self.vars.insert(name, CellLayout {
-            base: self.next_cell,
-            width,
-            ty,
-            array_len: None,
-        });
+        self.vars.insert(
+            name,
+            CellLayout {
+                base: self.next_cell,
+                width,
+                ty,
+                array_len: None,
+            },
+        );
         self.next_cell += width;
     }
 
     pub(crate) fn alloc_array(&mut self, name: String, ty: ScalarType, len: usize) {
         let elem_width = ty.cell_width();
         let total = elem_width * len;
-        self.vars.insert(name, CellLayout {
-            base: self.next_cell,
-            width: total,
-            ty,
-            array_len: Some(len),
-        });
+        self.vars.insert(
+            name,
+            CellLayout {
+                base: self.next_cell,
+                width: total,
+                ty,
+                array_len: Some(len),
+            },
+        );
         self.next_cell += total;
     }
 
