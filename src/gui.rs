@@ -1,17 +1,23 @@
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use tauri::ipc::Response;
 use tauri::{Builder, State};
 
 use crate::driver::config::{CompileTarget, DEFAULT_INTERPRETER_TAPE_LEN, DriverConfig, OptLevel, RunMode};
 use crate::driver::pipeline::build_frontend;
 use crate::interp::engine::Interpreter;
-use crate::runtime::gui_io::{GuiIo, KeyQueue, ScreenBuf, SCREEN_CELLS};
+use crate::runtime::gui_io::{DirtyFlag, GuiIo, KeyQueue, ScreenBuf, SCREEN_CELLS};
 use crate::runtime::host::NullHost;
 
 #[tauri::command]
-fn get_screen(screen: State<ScreenBuf>) -> Vec<u8> {
-    screen.inner().lock().unwrap().clone()
+fn get_screen(screen: State<ScreenBuf>, dirty: State<DirtyFlag>) -> Response {
+    if !dirty.inner().load(Ordering::Acquire) {
+        return Response::new(vec![]);
+    }
+    dirty.inner().store(false, Ordering::Release);
+    Response::new(screen.inner().lock().unwrap().clone())
 }
 
 #[tauri::command]
@@ -57,12 +63,14 @@ pub(crate) fn run() -> crate::Result<()> {
     let hir = frontend.hir;
 
     let screen: ScreenBuf = Arc::new(Mutex::new(vec![0u8; SCREEN_CELLS]));
+    let dirty: DirtyFlag = Arc::new(AtomicBool::new(false));
     let keys: KeyQueue = Arc::new(Mutex::new(VecDeque::new()));
 
     let screen_thr = screen.clone();
+    let dirty_thr = dirty.clone();
     let keys_thr = keys.clone();
     std::thread::spawn(move || {
-        let io = GuiIo::new(screen_thr, keys_thr);
+        let io = GuiIo::new(screen_thr, dirty_thr, keys_thr);
         let mut interp = Interpreter::new(DEFAULT_INTERPRETER_TAPE_LEN, io, NullHost::new());
         if let Err(e) = interp.run(&hir) {
             eprintln!("interpreter error: {e}");
@@ -71,6 +79,7 @@ pub(crate) fn run() -> crate::Result<()> {
 
     Builder::default()
         .manage(screen)
+        .manage(dirty)
         .manage(keys)
         .invoke_handler(tauri::generate_handler![get_screen, send_key])
         .run(tauri::generate_context!())

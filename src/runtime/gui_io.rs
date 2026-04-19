@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -13,6 +14,9 @@ const SCREEN_END: isize = -1;
 /// Sequence: 0xFE x y color → writes screen[y*256+x] = color.
 const SETPIXEL_CMD: u8 = 0xFE;
 
+/// Number of pixel writes before flushing the local buffer to the shared screen.
+const FLUSH_BATCH: usize = 256;
+
 /// Shared screen framebuffer: `screen[pixel]` where `pixel = -(ptr+1)`.
 ///
 /// Cell −1 → pixel 0 = (0, 0), cell −65536 → pixel 65535 = (255, 255).
@@ -20,6 +24,9 @@ pub(crate) type ScreenBuf = Arc<Mutex<Vec<u8>>>;
 
 /// Shared keypress queue fed by the Tauri frontend.
 pub(crate) type KeyQueue = Arc<Mutex<VecDeque<u8>>>;
+
+/// Set to `true` whenever the screen buffer is updated; cleared by `get_screen`.
+pub(crate) type DirtyFlag = Arc<AtomicBool>;
 
 /// State machine for the BFS `setpixel` command protocol.
 enum CmdState {
@@ -33,13 +40,41 @@ enum CmdState {
 /// reads input from a keypress queue fed by the Tauri frontend.
 pub(crate) struct GuiIo {
     pub(crate) screen: ScreenBuf,
+    pub(crate) dirty: DirtyFlag,
     pub(crate) keys: KeyQueue,
+    /// Interpreter-local copy of the screen; written without locking.
+    local: Vec<u8>,
+    write_count: usize,
     cmd: CmdState,
 }
 
 impl GuiIo {
-    pub(crate) fn new(screen: ScreenBuf, keys: KeyQueue) -> Self {
-        Self { screen, keys, cmd: CmdState::Idle }
+    pub(crate) fn new(screen: ScreenBuf, dirty: DirtyFlag, keys: KeyQueue) -> Self {
+        Self {
+            local: vec![0u8; SCREEN_CELLS],
+            screen,
+            dirty,
+            keys,
+            write_count: 0,
+            cmd: CmdState::Idle,
+        }
+    }
+
+    /// Copy the local buffer to the shared screen in one mutex acquisition.
+    fn flush(&mut self) {
+        let mut shared = self.screen.lock().unwrap();
+        shared.copy_from_slice(&self.local);
+        drop(shared);
+        self.dirty.store(true, Ordering::Release);
+        self.write_count = 0;
+    }
+
+    fn write_pixel(&mut self, pixel: usize, byte: u8) {
+        self.local[pixel] = byte;
+        self.write_count += 1;
+        if self.write_count >= FLUSH_BATCH {
+            self.flush();
+        }
     }
 }
 
@@ -48,7 +83,7 @@ impl RuntimeIo for GuiIo {
         if (SCREEN_START..=SCREEN_END).contains(&ptr) {
             // ptr = -1 → pixel 0, ptr = -65536 → pixel 65535
             let pixel = (-(ptr + 1)) as usize;
-            self.screen.lock().unwrap()[pixel] = byte;
+            self.write_pixel(pixel, byte);
             return Ok(());
         }
         // Positive-cell write: check for BFS setpixel command protocol.
@@ -68,7 +103,7 @@ impl RuntimeIo for GuiIo {
             CmdState::WaitXY(x) => { self.cmd = CmdState::WaitXYC(x, byte); }
             CmdState::WaitXYC(x, y) => {
                 let pixel = (y as usize) * 256 + (x as usize);
-                self.screen.lock().unwrap()[pixel] = byte;
+                self.write_pixel(pixel, byte);
                 self.cmd = CmdState::Idle;
             }
         }
@@ -76,6 +111,8 @@ impl RuntimeIo for GuiIo {
     }
 
     fn get_byte(&mut self, _ptr: isize) -> Result<u8, IoError> {
+        // Flush before blocking so the current frame is visible while waiting for input.
+        self.flush();
         loop {
             if let Some(k) = self.keys.lock().unwrap().pop_front() {
                 return Ok(k);

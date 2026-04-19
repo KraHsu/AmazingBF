@@ -35,19 +35,26 @@
 
     function start(invoke) {
       const imgData = ctx.createImageData(256, 256);
-      const px = imgData.data;
+      const u32 = new Uint32Array(imgData.data.buffer);
+
+      // Precompute RGB332 → little-endian RGBA32 lookup table.
+      // Pixel layout in memory (LE): [R, G, B, A] stored as 0xAABBGGRR.
+      const LUT = new Uint32Array(256);
+      for (let b = 0; b < 256; b++) {
+        const r = (b >> 5) * 36;          // 3 bits → 0..252
+        const g = ((b >> 2) & 7) * 36;    // 3 bits → 0..252
+        const bl = (b & 3) * 85;          // 2 bits → 0..255
+        LUT[b] = (0xFF000000 | (bl << 16) | (g << 8) | r) >>> 0;
+      }
 
       async function render() {
-        const buf = await invoke('get_screen');
-        for (let i = 0; i < 65536; i++) {
-          const b = buf[i];
-          const j = i << 2;
-          px[j]     = (b >> 5) * 36;          // R: 3 bits → 0..252
-          px[j + 1] = ((b >> 2) & 7) * 36;    // G: 3 bits → 0..252
-          px[j + 2] = (b & 3) * 85;           // B: 2 bits → 0..255
-          px[j + 3] = 255;
+        const raw = new Uint8Array(await invoke('get_screen'));
+        if (raw.length > 0) {
+          for (let i = 0; i < 65536; i++) {
+            u32[i] = LUT[raw[i]];
+          }
+          ctx.putImageData(imgData, 0, 0);
         }
-        ctx.putImageData(imgData, 0, 0);
         requestAnimationFrame(render);
       }
 
