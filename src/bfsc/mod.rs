@@ -251,8 +251,8 @@ fn print_help() {
 /// Run the BFS front-end (`lex → parse → typeck → codegen`) and return the BF source string.
 pub(crate) fn compile(source: &str) -> Result<String, BfscError> {
     let tokens = lexer::tokenize(source)?;
-    let stmts = parser::parse(&tokens)?;
-    let (typed, layout) = typeck::check(&stmts)?;
-    let bf = codegen::emit(&typed, &layout);
+    let program = parser::parse(&tokens)?;
+    let (program, layout, fns) = typeck::check(&program)?;
+    let bf = codegen::emit(&program, &layout, &fns);
     Ok(bf)
 }

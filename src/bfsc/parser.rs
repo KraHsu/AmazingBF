@@ -162,6 +162,64 @@ impl<'a> Parser<'a> {
         Ok(stmts)
     }
 
+    fn parse_program(&mut self) -> Result<Program, BfscError> {
+        let mut fns = Vec::new();
+        let mut top = Vec::new();
+        loop {
+            match self.cur() {
+                Token::Eof => break,
+                Token::Fn => fns.push(self.parse_fn_def()?),
+                _ => top.push(self.parse_stmt()?),
+            }
+        }
+        Ok(Program { fns, top })
+    }
+
+    fn parse_fn_def(&mut self) -> Result<FnDef, BfscError> {
+        self.bump(); // fn
+        let name = match self.bump() {
+            Token::Ident(s) => s.clone(),
+            t => {
+                return Err(BfscError::Parse(format!(
+                    "expected function name, got {t:?}"
+                )));
+            }
+        };
+        self.expect(&Token::LParen)?;
+        let mut params: Vec<Param> = Vec::new();
+        if !self.peek(&Token::RParen) {
+            loop {
+                let pname = match self.bump() {
+                    Token::Ident(s) => s.clone(),
+                    t => {
+                        return Err(BfscError::Parse(format!(
+                            "expected parameter name, got {t:?}"
+                        )));
+                    }
+                };
+                self.expect(&Token::Colon)?;
+                let pty = self.parse_type()?;
+                params.push(Param { name: pname, ty: pty });
+                if !self.match_tok(&Token::Comma) {
+                    break;
+                }
+            }
+        }
+        self.expect(&Token::RParen)?;
+        let ret_ty = if self.match_tok(&Token::Arrow) {
+            Some(self.parse_scalar_type()?)
+        } else {
+            None
+        };
+        let body = self.parse_block()?;
+        Ok(FnDef {
+            name,
+            params,
+            ret_ty,
+            body,
+        })
+    }
+
     fn parse_block(&mut self) -> Result<Vec<Stmt>, BfscError> {
         self.expect(&Token::LBrace)?;
         let stmts = self.parse_stmts()?;
@@ -179,12 +237,60 @@ impl<'a> Parser<'a> {
             Token::Putchar => self.parse_putchar(),
             Token::Setpixel => self.parse_setpixel(),
             Token::Getchar => self.parse_getchar(),
-            Token::Ident(_) => self.parse_assign(),
+            Token::Return => self.parse_return(),
+            Token::Ident(_) => {
+                // One-token lookahead: `name(` starts a call statement; anything
+                // else is an assignment to a variable or array element.
+                if self.pos + 1 < self.tokens.len()
+                    && self.tokens[self.pos + 1].token == Token::LParen
+                {
+                    self.parse_call_stmt()
+                } else {
+                    self.parse_assign()
+                }
+            }
             tok => Err(BfscError::Parse(format!(
                 "unexpected token {tok:?} at byte {}",
                 self.cur_pos()
             ))),
         }
+    }
+
+    fn parse_return(&mut self) -> Result<Stmt, BfscError> {
+        self.bump(); // return
+        if self.match_tok(&Token::Semi) {
+            Ok(Stmt::Return(None))
+        } else {
+            let expr = self.parse_expr()?;
+            self.expect(&Token::Semi)?;
+            Ok(Stmt::Return(Some(expr)))
+        }
+    }
+
+    fn parse_call_stmt(&mut self) -> Result<Stmt, BfscError> {
+        let name = match self.bump() {
+            Token::Ident(s) => s.clone(),
+            t => return Err(BfscError::Parse(format!("expected identifier, got {t:?}"))),
+        };
+        self.expect(&Token::LParen)?;
+        let args = self.parse_call_args()?;
+        self.expect(&Token::RParen)?;
+        self.expect(&Token::Semi)?;
+        Ok(Stmt::Call(name, args))
+    }
+
+    fn parse_call_args(&mut self) -> Result<Vec<Expr>, BfscError> {
+        let mut args = Vec::new();
+        if self.peek(&Token::RParen) {
+            return Ok(args);
+        }
+        loop {
+            args.push(self.parse_expr()?);
+            if !self.match_tok(&Token::Comma) {
+                break;
+            }
+        }
+        Ok(args)
     }
 
     fn parse_let(&mut self) -> Result<Stmt, BfscError> {
@@ -394,6 +500,10 @@ impl<'a> Parser<'a> {
                     let idx = self.parse_expr()?;
                     self.expect(&Token::RBrack)?;
                     Ok(Expr::Index(name, Box::new(idx)))
+                } else if self.match_tok(&Token::LParen) {
+                    let args = self.parse_call_args()?;
+                    self.expect(&Token::RParen)?;
+                    Ok(Expr::Call(name, args))
                 } else {
                     Ok(Expr::Var(name))
                 }
@@ -412,11 +522,11 @@ impl<'a> Parser<'a> {
     }
 }
 
-/// Parse a token stream into a vector of top-level `Stmt` nodes; errors carry
-/// byte positions from the input source.
-pub(crate) fn parse(tokens: &[SpannedToken]) -> Result<Vec<Stmt>, BfscError> {
+/// Parse a token stream into a full BFS [`Program`] (top-level functions plus
+/// top-level statements); errors carry byte positions from the input source.
+pub(crate) fn parse(tokens: &[SpannedToken]) -> Result<Program, BfscError> {
     let mut p = Parser::new(tokens);
-    let stmts = p.parse_stmts()?;
+    let program = p.parse_program()?;
     if !p.peek(&Token::Eof) {
         return Err(BfscError::Parse(format!(
             "unexpected token {:?} at byte {}",
@@ -424,5 +534,5 @@ pub(crate) fn parse(tokens: &[SpannedToken]) -> Result<Vec<Stmt>, BfscError> {
             p.cur_pos()
         )));
     }
-    Ok(stmts)
+    Ok(program)
 }

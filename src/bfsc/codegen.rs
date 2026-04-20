@@ -7,14 +7,31 @@
 //! BF idioms. Output is deterministic: identical input yields identical BF.
 
 use super::ast::*;
-use super::layout::MemMap;
-use std::collections::BTreeSet;
+use super::layout::{CellLayout, MemMap};
+use super::typeck::FnTable;
+use std::collections::{BTreeSet, HashMap};
 
-/// Emit a Brainfuck source string for the type-checked BFS statement list
-/// against the frozen memory layout produced by `typeck`.
-pub(crate) fn emit(stmts: &[Stmt], layout: &MemMap) -> String {
-    let mut emitter = BfEmitter::new(layout);
-    for s in stmts {
+/// Sentinel name used to address the enclosing function's return slot when
+/// emitting `Stmt::Return(Some(_))`. The name contains a non-identifier
+/// character so it cannot collide with any user-declared BFS binding.
+const RET_SLOT: &str = "$ret";
+
+/// Build the program's function definition table, keyed by function name,
+/// from the parsed AST.
+fn fn_defs(program: &Program) -> HashMap<String, FnDef> {
+    program
+        .fns
+        .iter()
+        .map(|f| (f.name.clone(), f.clone()))
+        .collect()
+}
+
+/// Emit a Brainfuck source string for the type-checked BFS program against
+/// the frozen top-level memory layout and function table produced by `typeck`.
+pub(crate) fn emit(program: &Program, layout: &MemMap, _fns: &FnTable) -> String {
+    let defs = fn_defs(program);
+    let mut emitter = BfEmitter::new(layout, &defs);
+    for s in &program.top {
         emitter.gen_stmt(s);
     }
     emitter.output
@@ -24,17 +41,40 @@ struct BfEmitter<'a> {
     output: String,
     ptr: usize,
     layout: &'a MemMap,
+    fns: &'a HashMap<String, FnDef>,
+    /// Stack of per-call-frame binding overlays (parameters, return slot, and
+    /// function-local `let` bindings). Top-level code runs with an empty
+    /// `scopes` stack so `lookup` falls through to the static `layout`.
+    scopes: Vec<HashMap<String, CellLayout>>,
     used: BTreeSet<usize>,
 }
 
 impl<'a> BfEmitter<'a> {
-    fn new(layout: &'a MemMap) -> Self {
+    fn new(layout: &'a MemMap, fns: &'a HashMap<String, FnDef>) -> Self {
         BfEmitter {
             output: String::new(),
             ptr: 0,
             layout,
+            fns,
+            scopes: Vec::new(),
             used: BTreeSet::new(),
         }
+    }
+
+    /// Look up a binding by name, preferring the innermost active scope and
+    /// falling back to the static top-level layout. Panics on unknown names
+    /// because typeck has already validated them.
+    fn lookup(&self, name: &str) -> CellLayout {
+        for scope in self.scopes.iter().rev() {
+            if let Some(l) = scope.get(name) {
+                return l.clone();
+            }
+        }
+        self.layout.get(name).unwrap().clone()
+    }
+
+    fn in_fn_scope(&self) -> bool {
+        !self.scopes.is_empty()
     }
 
     fn temp_base(&self) -> usize {
@@ -1276,7 +1316,7 @@ impl<'a> BfEmitter<'a> {
                 (t, w)
             }
             Expr::Var(name) => {
-                let layout = self.layout.get(name).unwrap();
+                let layout = self.lookup(name);
                 let base = layout.base;
                 let w = layout.width;
                 let t = self.talloc_n(w);
@@ -1284,8 +1324,15 @@ impl<'a> BfEmitter<'a> {
                 (t, w)
             }
             Expr::Index(name, idx_expr) => {
-                let layout = self.layout.get(name).unwrap().clone();
+                let layout = self.lookup(name);
                 self.arr_read(&layout, idx_expr)
+            }
+            Expr::Call(name, args) => {
+                // typeck has already rejected void calls in expression position
+                let (r, rw) = self.inline_call(name, args).expect(
+                    "void function in expression context should have been rejected by typeck",
+                );
+                (r, rw)
             }
             Expr::BinOp(op, left, right) => {
                 let (a, aw) = self.eval_expr(left);
@@ -1418,13 +1465,183 @@ impl<'a> BfEmitter<'a> {
         }
     }
 
+    // Function inlining.
+
+    /// Expand a call site as a fresh copy of the callee's body with
+    /// parameters bound into a new scope. Returns `Some((base, width))` of
+    /// the return-value cells for non-void callees (the caller must `tfree_n`),
+    /// or `None` for void functions.
+    fn inline_call(&mut self, name: &str, args: &[Expr]) -> Option<(usize, usize)> {
+        let def = self
+            .fns
+            .get(name)
+            .expect("call to undefined function should have been rejected by typeck")
+            .clone();
+
+        // Evaluate all arguments into temp cells BEFORE pushing the new scope,
+        // so argument expressions still see the caller's bindings (e.g., a
+        // caller-side `x` passed as an argument to a callee whose parameter
+        // is also named `x`).
+        let mut scalar_args: Vec<(usize, usize)> = Vec::new();
+        let mut array_aliases: Vec<CellLayout> = Vec::new();
+        for (param, arg) in def.params.iter().zip(args.iter()) {
+            match &param.ty {
+                TypeAnn::Scalar(_) => {
+                    let (v, vw) = self.eval_expr(arg);
+                    scalar_args.push((v, vw));
+                    array_aliases.push(CellLayout {
+                        base: 0,
+                        width: 0,
+                        ty: ScalarType::U8,
+                        array_len: None,
+                    }); // placeholder; unused
+                }
+                TypeAnn::Array(_, _) => {
+                    // typeck guarantees the arg is an array identifier
+                    let arr_name = match arg {
+                        Expr::Var(n) => n.clone(),
+                        _ => unreachable!("typeck validated array argument is a name"),
+                    };
+                    array_aliases.push(self.lookup(&arr_name));
+                    scalar_args.push((0, 0)); // placeholder; unused
+                }
+            }
+        }
+
+        // Build the new scope: parameters (with scalar values moved into fresh
+        // cells, or arrays aliased) plus an optional return slot.
+        let mut scope: HashMap<String, CellLayout> = HashMap::new();
+        let mut scalar_param_cells: Vec<(usize, usize)> = Vec::new();
+
+        for (i, param) in def.params.iter().enumerate() {
+            match &param.ty {
+                TypeAnn::Scalar(st) => {
+                    let w = st.cell_width();
+                    let base = self.talloc_n(w);
+                    // Zero the param cells; bfmove_n below writes into freshly
+                    // cleared cells and any tail that widen leaves is already
+                    // cleared inside `widen`.
+                    for k in 0..w {
+                        self.clear(base + k);
+                    }
+                    let (v, vw) = scalar_args[i];
+                    let v = if vw < w { self.widen(v, vw, w) } else { v };
+                    self.bfmove_n(v, base, w);
+                    self.tfree_n(v, w);
+                    scalar_param_cells.push((base, w));
+                    scope.insert(
+                        param.name.clone(),
+                        CellLayout {
+                            base,
+                            width: w,
+                            ty: *st,
+                            array_len: None,
+                        },
+                    );
+                }
+                TypeAnn::Array(_, _) => {
+                    // Alias the caller's array into the param name; no copy.
+                    scope.insert(param.name.clone(), array_aliases[i].clone());
+                }
+            }
+        }
+
+        // Allocate a return slot for non-void callees.
+        let ret_cells = def.ret_ty.map(|rt| {
+            let w = rt.cell_width();
+            let base = self.talloc_n(w);
+            // Zero the slot so a void-style fallthrough body would still give
+            // a deterministic value (typeck enforces non-void bodies end in
+            // `return expr;` so this is belt-and-suspenders).
+            for i in 0..w {
+                self.clear(base + i);
+            }
+            scope.insert(
+                RET_SLOT.to_string(),
+                CellLayout {
+                    base,
+                    width: w,
+                    ty: rt,
+                    array_len: None,
+                },
+            );
+            (base, w)
+        });
+
+        // Remember which in-fn local cells we allocate during the body so we
+        // can free them on frame unwind. We do that by snapshotting `used`
+        // before pushing the scope, and delta-freeing after.
+        // NOTE: scalar_param_cells and the return slot are already tracked in
+        // `used` via talloc_n; we explicitly free them below, which takes care
+        // of everything the frame introduced.
+        self.scopes.push(scope);
+        for s in &def.body {
+            self.gen_stmt(s);
+        }
+        let frame_scope = self.scopes.pop().unwrap();
+
+        // Free all frame-local cells:
+        //   - scalar parameter cells
+        //   - function-local `let` bindings registered in the frame scope
+        //     (anything whose name is not a parameter and not the return slot)
+        for (base, w) in scalar_param_cells {
+            self.tfree_n(base, w);
+        }
+        let param_names: std::collections::HashSet<&str> =
+            def.params.iter().map(|p| p.name.as_str()).collect();
+        for (nm, l) in &frame_scope {
+            if nm == RET_SLOT {
+                continue;
+            }
+            if param_names.contains(nm.as_str()) {
+                continue;
+            }
+            // Array params are aliased; real array params wouldn't reach here
+            // because they're in `param_names`. So `l` is always a freshly
+            // allocated scalar/array local — free it.
+            self.tfree_n(l.base, l.width);
+        }
+
+        ret_cells
+    }
+
     // Statements.
 
     fn gen_stmt(&mut self, stmt: &Stmt) {
         match stmt {
-            Stmt::Let { name, init, .. } => {
+            Stmt::Let { name, ty, init } => {
+                // Top-level `let` binds into the static MemMap allocated by
+                // typeck; in-function `let` dynamically allocates temp cells
+                // so each call gets its own copy of the local.
+                let layout = if self.in_fn_scope() {
+                    let (base, width, array_len, scalar_ty) = match ty {
+                        TypeAnn::Scalar(st) => (self.talloc_n(st.cell_width()), st.cell_width(), None, *st),
+                        TypeAnn::Array(st, len) => {
+                            let total = st.cell_width() * (*len as usize);
+                            (self.talloc_n(total), total, Some(*len as usize), *st)
+                        }
+                    };
+                    let l = CellLayout {
+                        base,
+                        width,
+                        ty: scalar_ty,
+                        array_len,
+                    };
+                    // Zero the freshly allocated cells so the binding starts
+                    // as if memset-to-0, matching the BF interpreter's clean
+                    // tape assumption at top level.
+                    for i in 0..width {
+                        self.clear(base + i);
+                    }
+                    self.scopes
+                        .last_mut()
+                        .unwrap()
+                        .insert(name.clone(), l.clone());
+                    l
+                } else {
+                    self.lookup(name)
+                };
                 if let Some(expr) = init {
-                    let layout = self.layout.get(name).unwrap().clone();
                     let (v, vw) = self.eval_expr(expr);
                     let v = if vw < layout.width {
                         self.widen(v, vw, layout.width)
@@ -1437,7 +1654,7 @@ impl<'a> BfEmitter<'a> {
             }
             Stmt::Assign { lval, expr } => match lval {
                 LValue::Var(name) => {
-                    let layout = self.layout.get(name).unwrap().clone();
+                    let layout = self.lookup(name);
                     let (v, vw) = self.eval_expr(expr);
                     let v = if vw < layout.width {
                         self.widen(v, vw, layout.width)
@@ -1448,7 +1665,7 @@ impl<'a> BfEmitter<'a> {
                     self.tfree_n(v, layout.width);
                 }
                 LValue::Index(name, idx_expr) => {
-                    let layout = self.layout.get(name).unwrap().clone();
+                    let layout = self.lookup(name);
                     let (v, vw) = self.eval_expr(expr);
                     self.arr_write(&layout, idx_expr, v, vw);
                 }
@@ -1492,14 +1709,14 @@ impl<'a> BfEmitter<'a> {
             Stmt::Getchar(lval) => {
                 match lval {
                     LValue::Var(name) => {
-                        let layout = self.layout.get(name).unwrap().clone();
+                        let layout = self.lookup(name);
                         self.inp(layout.base);
                         for i in 1..layout.width {
                             self.clear(layout.base + i);
                         }
                     }
                     LValue::Index(name, idx_expr) => {
-                        let layout = self.layout.get(name).unwrap().clone();
+                        let layout = self.lookup(name);
                         let ew = layout.elem_width();
                         let t = self.talloc_n(ew);
                         self.inp(t);
@@ -1511,13 +1728,34 @@ impl<'a> BfEmitter<'a> {
                     }
                 }
             }
+            Stmt::Call(name, args) => {
+                if let Some((r, rw)) = self.inline_call(name, args) {
+                    self.tfree_n(r, rw);
+                }
+            }
+            Stmt::Return(expr) => {
+                if let Some(e) = expr {
+                    let layout = self.lookup(RET_SLOT);
+                    let (v, vw) = self.eval_expr(e);
+                    let v = if vw < layout.width {
+                        self.widen(v, vw, layout.width)
+                    } else {
+                        v
+                    };
+                    self.bfmove_n(v, layout.base, layout.width);
+                    self.tfree_n(v, layout.width);
+                }
+                // typeck enforces `return` appears only as the tail of a
+                // function body, so no short-circuit machinery is needed —
+                // the enclosing `inline_call` returns right after this frame.
+            }
             Stmt::Scan(lval) => match lval {
                 LValue::Var(name) => {
-                    let layout = self.layout.get(name).unwrap().clone();
+                    let layout = self.lookup(name);
                     self.scan_num_n(layout.base, layout.width);
                 }
                 LValue::Index(name, idx_expr) => {
-                    let layout = self.layout.get(name).unwrap().clone();
+                    let layout = self.lookup(name);
                     let ew = layout.elem_width();
                     let t = self.talloc_n(ew);
                     self.scan_num_n(t, ew);

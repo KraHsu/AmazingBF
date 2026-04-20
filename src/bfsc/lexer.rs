@@ -33,6 +33,10 @@ pub(crate) enum Token {
     Setpixel,
     /// `getchar`
     Getchar,
+    /// `fn`
+    Fn,
+    /// `return`
+    Return,
     // Types
     /// `u8`
     U8,
@@ -77,6 +81,8 @@ pub(crate) enum Token {
     AmpAmp,
     /// `||`
     PipePipe,
+    /// `->`
+    Arrow,
     // Delimiters
     /// `(`
     LParen,
@@ -120,6 +126,8 @@ fn keyword(s: &str) -> Option<Token> {
         "putchar" => Some(Token::Putchar),
         "setpixel" => Some(Token::Setpixel),
         "getchar" => Some(Token::Getchar),
+        "fn" => Some(Token::Fn),
+        "return" => Some(Token::Return),
         "u8" => Some(Token::U8),
         "i8" => Some(Token::I8),
         "u16" => Some(Token::U16),
@@ -217,6 +225,7 @@ pub(crate) fn tokenize(src: &str) -> Result<Vec<SpannedToken>, BfscError> {
                 (b'!', b'=') => Some(Token::BangEq),
                 (b'&', b'&') => Some(Token::AmpAmp),
                 (b'|', b'|') => Some(Token::PipePipe),
+                (b'-', b'>') => Some(Token::Arrow),
                 _ => None,
             };
             if let Some(tok) = maybe {

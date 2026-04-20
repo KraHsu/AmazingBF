@@ -107,6 +107,8 @@ pub(crate) enum Expr {
     BinOp(BinOp, Box<Expr>, Box<Expr>),
     /// Unary operation applied to a subexpression.
     UnOp(UnOp, Box<Expr>),
+    /// Function call `name(args...)`; must resolve to a non-void function.
+    Call(String, Vec<Expr>),
 }
 
 /// Left-hand side of an assignment or input statement.
@@ -170,4 +172,39 @@ pub(crate) enum Stmt {
     },
     /// `getchar(lval);` — read one raw byte from stdin into `lval`.
     Getchar(LValue),
+    /// `name(args...);` — call a function, discarding any return value.
+    Call(String, Vec<Expr>),
+    /// `return expr?;` — set the enclosing function's return slot and end its body.
+    Return(Option<Expr>),
+}
+
+/// One formal parameter in a function definition.
+#[derive(Debug, Clone)]
+pub(crate) struct Param {
+    /// Parameter name as used inside the body.
+    pub(crate) name: String,
+    /// Declared parameter type (scalar by value; array by reference).
+    pub(crate) ty: TypeAnn,
+}
+
+/// Top-level function definition in a BFS program.
+#[derive(Debug, Clone)]
+pub(crate) struct FnDef {
+    /// Function name (unique in the program's global namespace).
+    pub(crate) name: String,
+    /// Ordered parameter list.
+    pub(crate) params: Vec<Param>,
+    /// Optional scalar return type; `None` for void.
+    pub(crate) ret_ty: Option<ScalarType>,
+    /// Statements making up the body.
+    pub(crate) body: Vec<Stmt>,
+}
+
+/// A whole BFS program: a set of top-level functions plus top-level statements.
+#[derive(Debug, Clone)]
+pub(crate) struct Program {
+    /// Function definitions declared at the top level.
+    pub(crate) fns: Vec<FnDef>,
+    /// Top-level statements executed in the order written.
+    pub(crate) top: Vec<Stmt>,
 }
