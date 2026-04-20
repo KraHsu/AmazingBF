@@ -179,14 +179,22 @@ pub fn compile_lir_to_asm(lir: &LirProgram) -> AsmProgram {
             //
             // After merging, BF's `+` / `-` runs become a single `CellAdd(n)`
             // where `n` may be negative. Cells are 8-bit unsigned (0..=255),
-            // so we only need `n mod 256`.
+            // so we only need `n mod 256`. `±1` go through the shorter
+            // single-byte-operand `inc` / `dec` forms (one byte shorter than
+            // the equivalent `add [r13], imm8`); everything else falls through
+            // to the generic `AddMem8Imm8`.
             LirInst::CellAdd(n) => {
                 // Normalise into 0..=255; the extra `+ 256` handles negatives
                 // (e.g. -1 → 255, -3 → 253).
                 let imm = ((*n % 256) + 256) % 256;
-                if imm != 0 {
-                    // Equivalent to `*data_ptr = (*data_ptr + imm) % 256`.
-                    out.push(AsmInst::AddMem8Imm8(Reg64::R13, imm as u8 as i8));
+                match imm {
+                    0 => {}
+                    1 => out.push(AsmInst::IncMem8(Reg64::R13)),
+                    255 => out.push(AsmInst::DecMem8(Reg64::R13)),
+                    other => {
+                        // Equivalent to `*data_ptr = (*data_ptr + other) % 256`.
+                        out.push(AsmInst::AddMem8Imm8(Reg64::R13, other as u8 as i8));
+                    }
                 }
             }
 

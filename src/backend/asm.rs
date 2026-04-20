@@ -125,7 +125,7 @@ impl fmt::Display for AsmLabel {
 /// 1. Pseudo: `Label`.
 /// 2. Data movement: `MovRegImm64`, `MovRegReg`, `MovMem8Imm8`.
 /// 3. Arithmetic: `AddRegImm32`, `AndRegImm32`, `AddRegReg`, `SubRegReg`,
-///    `AddMem8Imm8`.
+///    `AddMem8Imm8`, `IncMem8`, `DecMem8`.
 /// 4. Comparison: `CmpRegReg`, `CmpRegImm32`, `CmpMem8Imm8`.
 /// 5. Addressing / stack slots / RIP-relative: `LeaRegMem`, `LeaRegLabel`,
 ///    `MovMemReg64`, `MovRegMem64`.
@@ -209,6 +209,18 @@ pub enum AsmInst {
     /// lowering of Brainfuck `+` / `-`. The encoder only accepts base-register
     /// forms that do not need a SIB byte (codegen hard-pins this to R13).
     AddMem8Imm8(Reg64, i8),
+
+    /// `inc byte ptr [reg]` — increment a memory byte by one.
+    ///
+    /// Short form of `add byte [reg], 1` (4 bytes vs. 5). Same SIB-free
+    /// restriction as [`AsmInst::AddMem8Imm8`].
+    IncMem8(Reg64),
+
+    /// `dec byte ptr [reg]` — decrement a memory byte by one.
+    ///
+    /// Short form of `add byte [reg], -1` (4 bytes vs. 5). Same SIB-free
+    /// restriction as [`AsmInst::AddMem8Imm8`].
+    DecMem8(Reg64),
 
     /// `mov byte ptr [reg], imm8` — store an 8-bit immediate into memory.
     ///

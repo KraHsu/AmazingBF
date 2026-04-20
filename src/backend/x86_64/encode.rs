@@ -327,10 +327,14 @@ fn emit_rex_w(buf: &mut CodeBuffer, r: u8, x: u8, b: u8) {
     buf.emit_u8(rex);
 }
 
-/// Emit `op reg, sign-extended imm32` (register + 32-bit sign-extended
-/// immediate).
+/// Emit `op reg, sign-extended immediate` (register + immediate, 64-bit
+/// operand width).
 ///
-/// Encoding: `REX.W + 0x81 + ModRM(11, subcode, rm) + imm32`.
+/// The on-wire encoding is width-adaptive: when `imm` fits in a signed 8-bit
+/// range the encoder emits the shorter `REX.W + 0x83 + ModRM + imm8` form
+/// (4 bytes), otherwise it falls back to `REX.W + 0x81 + ModRM + imm32`
+/// (7 bytes). The CPU sign-extends either immediate to 64 bits, so the
+/// semantics are identical; this is a pure code-size optimisation.
 ///
 /// `subcode` selects the opcode extension (ModRM.reg field):
 /// - 0 → ADD
@@ -338,14 +342,18 @@ fn emit_rex_w(buf: &mut CodeBuffer, r: u8, x: u8, b: u8) {
 /// - 4 → AND
 /// - 5 → SUB
 /// - 7 → CMP
-///
-/// The CPU sign-extends `imm32` to 64 bits.
 fn emit_reg_imm32(buf: &mut CodeBuffer, subcode: u8, reg: Reg64, imm: i32) {
     let rm = reg_num(reg);
     emit_rex_w(buf, 0, 0, rm >> 3);
-    buf.emit_u8(0x81); // opcode: r/m64, imm32 form
-    buf.emit_u8(0b11_000_000 | ((subcode & 7) << 3) | (rm & 7));
-    buf.emit_i32(imm);
+    if let Ok(imm8) = i8::try_from(imm) {
+        buf.emit_u8(0x83); // opcode: r/m64, sign-extended imm8 form
+        buf.emit_u8(0b11_000_000 | ((subcode & 7) << 3) | (rm & 7));
+        buf.emit_u8(imm8 as u8);
+    } else {
+        buf.emit_u8(0x81); // opcode: r/m64, imm32 form
+        buf.emit_u8(0b11_000_000 | ((subcode & 7) << 3) | (rm & 7));
+        buf.emit_i32(imm);
+    }
 }
 
 fn emit_modrm_sib_mem(buf: &mut CodeBuffer, reg_field: u8, base: Reg64, disp: i32) {
@@ -409,6 +417,20 @@ fn emit_shift_right_imm8(buf: &mut CodeBuffer, reg: Reg64, imm: u8) {
 }
 
 fn emit_mem8_disp0(buf: &mut CodeBuffer, opcode: u8, subcode: u8, reg: Reg64, imm: u8) {
+    emit_mem8_disp0_no_imm(buf, opcode, subcode, reg);
+    buf.emit_u8(imm);
+}
+
+/// Emit `REX + opcode + ModRM(01, subcode, rm) + disp8(0)` without an
+/// immediate byte.
+///
+/// Used by opcodes whose r/m form takes no immediate operand (e.g.
+/// `inc`/`dec byte [reg]` via the `0xFE` group). Same SIB-free restriction as
+/// [`emit_mem8_disp0`]: the low three bits of the register number must not be
+/// `4` because the encoder does not emit a SIB byte. The `mod=01 + disp8=0`
+/// form dodges the `[RIP+disp32]` aliasing that `mod=00 + rm&7==5` would
+/// otherwise trigger (relevant for R13).
+fn emit_mem8_disp0_no_imm(buf: &mut CodeBuffer, opcode: u8, subcode: u8, reg: Reg64) {
     let rm = reg_num(reg);
     assert!(
         (rm & 7) != 4,
@@ -419,7 +441,6 @@ fn emit_mem8_disp0(buf: &mut CodeBuffer, opcode: u8, subcode: u8, reg: Reg64, im
     buf.emit_u8(opcode);
     buf.emit_u8(0b01_000_000 | ((subcode & 7) << 3) | (rm & 7));
     buf.emit_u8(0x00);
-    buf.emit_u8(imm);
 }
 
 /// Emit a conditional near jump: `0F cc rel32`.
@@ -542,6 +563,22 @@ fn encode_inst(buf: &mut CodeBuffer, inst: &AsmInst) {
         // because codegen only issues this form with R13.
         AsmInst::AddMem8Imm8(reg, imm) => {
             emit_mem8_disp0(buf, 0x80, 0, *reg, *imm as u8);
+        }
+
+        // inc byte ptr [reg+0].
+        //
+        // Encoding: REX.W + 0xFE + ModRM(01, 0, rm) + disp8(0). 0xFE is the
+        // byte INC/DEC group, with ModRM.reg = 0 selecting INC.
+        AsmInst::IncMem8(reg) => {
+            emit_mem8_disp0_no_imm(buf, 0xFE, 0, *reg);
+        }
+
+        // dec byte ptr [reg+0].
+        //
+        // Encoding: REX.W + 0xFE + ModRM(01, 1, rm) + disp8(0). Same byte
+        // INC/DEC group as INC, with ModRM.reg = 1 selecting DEC.
+        AsmInst::DecMem8(reg) => {
+            emit_mem8_disp0_no_imm(buf, 0xFE, 1, *reg);
         }
 
         // mov byte ptr [reg+0], imm8.
@@ -720,6 +757,76 @@ mod tests {
                 0x4c, 0x8b, 0x5c, 0x24, 0x10, //
             ]
         );
+    }
+
+    #[test]
+    fn inc_dec_mem8_on_r13_encode_to_four_bytes() {
+        let program = AsmProgram {
+            insts: vec![AsmInst::IncMem8(Reg64::R13), AsmInst::DecMem8(Reg64::R13)],
+        };
+        let encoded = encode_program(&program);
+        // REX.W|B=0x49, opcode 0xFE, ModRM(mod=01 reg=0/1 rm=5)=0x45/0x4D, disp8=0x00.
+        assert_eq!(
+            encoded.text,
+            vec![
+                0x49, 0xFE, 0x45, 0x00, //
+                0x49, 0xFE, 0x4D, 0x00,
+            ]
+        );
+    }
+
+    #[test]
+    fn reg_imm_uses_imm8_form_for_small_values() {
+        // add rax, 1: REX.W + 0x83 /0 + ModRM + imm8 = 4 bytes.
+        let program = AsmProgram {
+            insts: vec![AsmInst::AddRegImm32(Reg64::Rax, 1)],
+        };
+        let encoded = encode_program(&program);
+        assert_eq!(encoded.text.len(), 4);
+        assert_eq!(encoded.text, vec![0x48, 0x83, 0xC0, 0x01]);
+    }
+
+    #[test]
+    fn reg_imm_uses_imm8_form_for_negative_small_values() {
+        // sub via AddRegImm32(-1): REX.W + 0x83 /0 + ModRM + 0xFF = 4 bytes.
+        let program = AsmProgram {
+            insts: vec![AsmInst::AddRegImm32(Reg64::Rax, -1)],
+        };
+        let encoded = encode_program(&program);
+        assert_eq!(encoded.text.len(), 4);
+        assert_eq!(encoded.text[3], 0xFF);
+    }
+
+    #[test]
+    fn reg_imm_falls_back_to_imm32_for_large_values() {
+        // add rax, 0x1000: REX.W + 0x81 /0 + ModRM + imm32 = 7 bytes.
+        let program = AsmProgram {
+            insts: vec![AsmInst::AddRegImm32(Reg64::Rax, 0x1000)],
+        };
+        let encoded = encode_program(&program);
+        assert_eq!(encoded.text.len(), 7);
+        assert_eq!(encoded.text, vec![0x48, 0x81, 0xC0, 0x00, 0x10, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn reg_imm_imm8_boundary_128_uses_imm32_form() {
+        // +128 does not fit i8 (range -128..=127), so falls back to imm32.
+        let program = AsmProgram {
+            insts: vec![AsmInst::AddRegImm32(Reg64::Rax, 128)],
+        };
+        let encoded = encode_program(&program);
+        assert_eq!(encoded.text.len(), 7);
+    }
+
+    #[test]
+    fn cmp_reg_imm_also_uses_imm8_when_small() {
+        let program = AsmProgram {
+            insts: vec![AsmInst::CmpRegImm32(Reg64::Rax, 0)],
+        };
+        let encoded = encode_program(&program);
+        // REX.W + 0x83 /7 + ModRM + imm8 = 4 bytes.
+        assert_eq!(encoded.text.len(), 4);
+        assert_eq!(encoded.text[1], 0x83);
     }
 
     #[test]

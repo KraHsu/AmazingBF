@@ -274,6 +274,16 @@ fn format_inst_asm(out: &mut String, inst: &AsmInst) {
             .unwrap();
         }
 
+        AsmInst::IncMem8(reg) => {
+            // BF single `+`: short form of `add [reg], 1`.
+            writeln!(out, "    inc     byte [{}]", reg_name(*reg)).unwrap();
+        }
+
+        AsmInst::DecMem8(reg) => {
+            // BF single `-`: short form of `add [reg], -1`.
+            writeln!(out, "    dec     byte [{}]", reg_name(*reg)).unwrap();
+        }
+
         AsmInst::MovMem8Imm8(reg, imm) => {
             // Optimised cell assignment (e.g. `[-]` folded into `set 0`).
             writeln!(out, "    mov     byte [{}], 0x{:02x}", reg_name(*reg), imm).unwrap();
