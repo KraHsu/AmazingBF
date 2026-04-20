@@ -1,0 +1,14 @@
+// Exercises multiple inlined calls of the same function plus nested calls
+// as expressions, to verify temp-cell lifetime across frames.
+fn square(x: u8) -> u8 {
+    return x * x;
+}
+
+let a: u8 = 0;
+scan(a);
+let s1: u8 = square(a);
+let s2: u8 = square(a) + square(a);
+print(s1);
+putchar(10);
+print(s2);
+putchar(10);

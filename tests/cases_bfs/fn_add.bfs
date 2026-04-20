@@ -1,0 +1,12 @@
+// Basic function with scalar parameters and a scalar return value.
+fn add(a: u8, b: u8) -> u8 {
+    return a + b;
+}
+
+let x: u8 = 0;
+let y: u8 = 0;
+scan(x);
+scan(y);
+let z: u8 = add(x, y);
+print(z);
+putchar(10);

@@ -68,8 +68,21 @@ let ny: u8 = 0;
 let hit: u8 = 0;
 let heart_x: u8 = 0;
 let end_color: u8 = 0;
-let ex: u16 = 0;
-let ey: u16 = 0;
+let ex: u8 = 0;
+let ey: u8 = 0;
+
+// Title indicator: 16x16 yellow square in centre, drawn before the title
+// loop so it's visible while the user reads the title. Erased once a real
+// key arrives. The pre-loop publish runs when getchar blocks on input.
+j = 0;
+while j < 16 {
+    tmp = 0;
+    while tmp < 16 {
+        setpixel(120 + tmp, 120 + j, 252);
+        tmp = tmp + 1;
+    }
+    j = j + 1;
+}
 
 // ---- Title loop: increment seed every tick, exit on first real key ----
 while started == 0 {
@@ -80,6 +93,17 @@ while started == 0 {
     if key > 0 {
         started = 1;
     }
+}
+
+// Erase the title indicator.
+j = 0;
+while j < 16 {
+    tmp = 0;
+    while tmp < 16 {
+        setpixel(120 + tmp, 120 + j, 0);
+        tmp = tmp + 1;
+    }
+    j = j + 1;
 }
 
 // ---- Initial HUD ----
@@ -109,28 +133,6 @@ setpixel(px - 1, 247, 28);
 setpixel(px, 247, 28);
 setpixel(px + 1, 247, 28);
 setpixel(px + 2, 247, 28);
-
-// Title indicator: 16x16 yellow square in centre, erased after first press.
-j = 0;
-while j < 16 {
-    tmp = 0;
-    while tmp < 16 {
-        setpixel(120 + tmp, 120 + j, 252);
-        tmp = tmp + 1;
-    }
-    j = j + 1;
-}
-
-// Erase the title indicator.
-j = 0;
-while j < 16 {
-    tmp = 0;
-    while tmp < 16 {
-        setpixel(120 + tmp, 120 + j, 0);
-        tmp = tmp + 1;
-    }
-    j = j + 1;
-}
 
 // ---- Main game loop ----
 while running > 0 {
@@ -581,9 +583,9 @@ while running > 0 {
                 b0_y = 0;
                 tmp = seed % 4;
                 if tmp == 0 { b0_color = 3; }
-                if tmp == 1 { b0_color = 28; }
-                if tmp == 2 { b0_color = 224; }
-                if tmp == 3 { b0_color = 252; }
+                else { if tmp == 1 { b0_color = 28; }
+                else { if tmp == 2 { b0_color = 224; }
+                else { b0_color = 252; } } }
                 bx = b0_x;
                 bc = b0_color;
                 dy = 0;
@@ -602,9 +604,9 @@ while running > 0 {
                     b1_y = 0;
                     tmp = seed % 4;
                     if tmp == 0 { b1_color = 3; }
-                    if tmp == 1 { b1_color = 28; }
-                    if tmp == 2 { b1_color = 224; }
-                    if tmp == 3 { b1_color = 252; }
+                    else { if tmp == 1 { b1_color = 28; }
+                    else { if tmp == 2 { b1_color = 224; }
+                    else { b1_color = 252; } } }
                     bx = b1_x;
                     bc = b1_color;
                     dy = 0;
@@ -623,9 +625,9 @@ while running > 0 {
                         b2_y = 0;
                         tmp = seed % 4;
                         if tmp == 0 { b2_color = 3; }
-                        if tmp == 1 { b2_color = 28; }
-                        if tmp == 2 { b2_color = 224; }
-                        if tmp == 3 { b2_color = 252; }
+                        else { if tmp == 1 { b2_color = 28; }
+                        else { if tmp == 2 { b2_color = 224; }
+                        else { b2_color = 252; } } }
                         bx = b2_x;
                         bc = b2_color;
                         dy = 0;
@@ -658,106 +660,81 @@ while running > 0 {
 
         if hearts == 0 { running = 0; }
         if score >= 10 { running = 0; }
-    }
-
-    if key == 97 {
-        if px >= 8 {
-            setpixel(px, 245, 0);
-            setpixel(px - 1, 246, 0);
-            setpixel(px, 246, 0);
-            setpixel(px + 1, 246, 0);
-            setpixel(px - 2, 247, 0);
-            setpixel(px - 1, 247, 0);
-            setpixel(px, 247, 0);
-            setpixel(px + 1, 247, 0);
-            setpixel(px + 2, 247, 0);
-            px = px - 4;
-            setpixel(px, 245, 28);
-            setpixel(px - 1, 246, 28);
-            setpixel(px, 246, 28);
-            setpixel(px + 1, 246, 28);
-            setpixel(px - 2, 247, 28);
-            setpixel(px - 1, 247, 28);
-            setpixel(px, 247, 28);
-            setpixel(px + 1, 247, 28);
-            setpixel(px + 2, 247, 28);
-        }
-    }
-    if key == 100 {
-        if px <= 244 {
-            setpixel(px, 245, 0);
-            setpixel(px - 1, 246, 0);
-            setpixel(px, 246, 0);
-            setpixel(px + 1, 246, 0);
-            setpixel(px - 2, 247, 0);
-            setpixel(px - 1, 247, 0);
-            setpixel(px, 247, 0);
-            setpixel(px + 1, 247, 0);
-            setpixel(px + 2, 247, 0);
-            px = px + 4;
-            setpixel(px, 245, 28);
-            setpixel(px - 1, 246, 28);
-            setpixel(px, 246, 28);
-            setpixel(px + 1, 246, 28);
-            setpixel(px - 2, 247, 28);
-            setpixel(px - 1, 247, 28);
-            setpixel(px, 247, 28);
-            setpixel(px + 1, 247, 28);
-            setpixel(px + 2, 247, 28);
-        }
-    }
-    if key == 32 {
-        if u0_active == 0 {
-            u0_active = 1;
-            u0_x = px;
-            u0_y = 238;
-            dy = 0;
-            while dy < 6 {
-                setpixel(px, 238 + dy, 252);
-                setpixel(px + 1, 238 + dy, 252);
-                dy = dy + 1;
+    } else {
+        // Input frame: key != 0, so tick work is skipped.
+        if key == 97 {
+            if px >= 8 {
+                setpixel(px, 245, 0);
+                setpixel(px - 1, 246, 0);
+                setpixel(px, 246, 0);
+                setpixel(px + 1, 246, 0);
+                setpixel(px - 2, 247, 0);
+                setpixel(px - 1, 247, 0);
+                setpixel(px, 247, 0);
+                setpixel(px + 1, 247, 0);
+                setpixel(px + 2, 247, 0);
+                px = px - 4;
+                setpixel(px, 245, 28);
+                setpixel(px - 1, 246, 28);
+                setpixel(px, 246, 28);
+                setpixel(px + 1, 246, 28);
+                setpixel(px - 2, 247, 28);
+                setpixel(px - 1, 247, 28);
+                setpixel(px, 247, 28);
+                setpixel(px + 1, 247, 28);
+                setpixel(px + 2, 247, 28);
             }
-        } else {
-            if u1_active == 0 {
-                u1_active = 1;
-                u1_x = px;
-                u1_y = 238;
+        }
+        if key == 100 {
+            if px <= 244 {
+                setpixel(px, 245, 0);
+                setpixel(px - 1, 246, 0);
+                setpixel(px, 246, 0);
+                setpixel(px + 1, 246, 0);
+                setpixel(px - 2, 247, 0);
+                setpixel(px - 1, 247, 0);
+                setpixel(px, 247, 0);
+                setpixel(px + 1, 247, 0);
+                setpixel(px + 2, 247, 0);
+                px = px + 4;
+                setpixel(px, 245, 28);
+                setpixel(px - 1, 246, 28);
+                setpixel(px, 246, 28);
+                setpixel(px + 1, 246, 28);
+                setpixel(px - 2, 247, 28);
+                setpixel(px - 1, 247, 28);
+                setpixel(px, 247, 28);
+                setpixel(px + 1, 247, 28);
+                setpixel(px + 2, 247, 28);
+            }
+        }
+        if key == 32 || key == 119 {
+            if u0_active == 0 {
+                u0_active = 1;
+                u0_x = px;
+                u0_y = 238;
                 dy = 0;
                 while dy < 6 {
                     setpixel(px, 238 + dy, 252);
                     setpixel(px + 1, 238 + dy, 252);
                     dy = dy + 1;
                 }
-            }
-        }
-    }
-    if key == 119 {
-        if u0_active == 0 {
-            u0_active = 1;
-            u0_x = px;
-            u0_y = 238;
-            dy = 0;
-            while dy < 6 {
-                setpixel(px, 238 + dy, 252);
-                setpixel(px + 1, 238 + dy, 252);
-                dy = dy + 1;
-            }
-        } else {
-            if u1_active == 0 {
-                u1_active = 1;
-                u1_x = px;
-                u1_y = 238;
-                dy = 0;
-                while dy < 6 {
-                    setpixel(px, 238 + dy, 252);
-                    setpixel(px + 1, 238 + dy, 252);
-                    dy = dy + 1;
+            } else {
+                if u1_active == 0 {
+                    u1_active = 1;
+                    u1_x = px;
+                    u1_y = 238;
+                    dy = 0;
+                    while dy < 6 {
+                        setpixel(px, 238 + dy, 252);
+                        setpixel(px + 1, 238 + dy, 252);
+                        dy = dy + 1;
+                    }
                 }
             }
         }
+        if key == 27 || key == 113 { running = 0; }
     }
-    if key == 27 { running = 0; }
-    if key == 113 { running = 0; }
 }
 
 // ---- End screen ----

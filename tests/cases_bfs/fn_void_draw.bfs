@@ -1,0 +1,13 @@
+// Void function: prints N copies of a byte. Exercises the no-return path.
+fn dash(n: u8) {
+    let i: u8 = 0;
+    while i < n {
+        putchar(45);
+        i = i + 1;
+    }
+}
+
+dash(3);
+putchar(10);
+dash(5);
+putchar(10);

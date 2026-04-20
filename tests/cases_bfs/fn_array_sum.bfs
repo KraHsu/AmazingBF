@@ -1,0 +1,20 @@
+// Array parameter passed by reference: the callee sums elements in place.
+fn sum(arr: [u8; 5]) -> u8 {
+    let i: u8 = 0;
+    let s: u8 = 0;
+    while i < 5 {
+        s = s + arr[i];
+        i = i + 1;
+    }
+    return s;
+}
+
+let nums: [u8; 5];
+let i: u8 = 0;
+while i < 5 {
+    scan(nums[i]);
+    i = i + 1;
+}
+let r: u8 = sum(nums);
+print(r);
+putchar(10);
