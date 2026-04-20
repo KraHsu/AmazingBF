@@ -25,6 +25,7 @@ use crate::driver::config::{
 use crate::driver::pipeline::build_frontend;
 use crate::interp::engine::Interpreter;
 use crate::ir::hir::HirProgram;
+use crate::ir::lir_opt::optimize_lir;
 use crate::ir::lower::lower_to_lir;
 use crate::logging::{log_debug, log_info};
 use crate::runtime::host::NullHost;
@@ -119,7 +120,7 @@ fn run_compile(config: &DriverConfig, hir: &HirProgram) -> Result<()> {
 }
 
 fn run_dump(hir: &HirProgram) {
-    let lir = lower_to_lir(hir);
+    let lir = optimize_lir(lower_to_lir(hir));
     log_debug(format!("lowered lir (lir_insts={})", lir.len()));
     let asm = compile_lir_to_asm(&lir);
     log_debug(format!(
@@ -150,7 +151,7 @@ fn compile_linux_asm(hir: &HirProgram, opt_level: OptLevel) -> Result<AsmProgram
         }
     }
 
-    let lir = lower_to_lir(hir);
+    let lir = optimize_lir(lower_to_lir(hir));
     log_debug(format!("lowered lir (lir_insts={})", lir.len()));
     Ok(compile_lir_to_asm(&lir))
 }
@@ -170,7 +171,7 @@ fn compile_windows_program(hir: &HirProgram, opt_level: OptLevel) -> Result<Wind
         }
     }
 
-    let lir = lower_to_lir(hir);
+    let lir = optimize_lir(lower_to_lir(hir));
     log_debug(format!("lowered lir (lir_insts={})", lir.len()));
     Ok(compile_lir_to_windows_program(&lir))
 }

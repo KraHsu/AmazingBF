@@ -2,5 +2,6 @@
 
 pub(crate) mod hir;
 pub(crate) mod lir;
+pub(crate) mod lir_opt;
 pub(crate) mod lower;
 pub(crate) mod optimize;
