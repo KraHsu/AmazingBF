@@ -1,9 +1,19 @@
 //! Bidirectional tape storage shared by interpreter and backend.
 //!
 //! The `Tape` backs both positive and negative cell indices by splitting
-//! storage into two `Vec<u8>` halves that grow on demand. `TapeStats` captures
-//! runtime usage (pointer range, growth, total movement) so `--interp-debug`
-//! can summarize behaviour after a program finishes.
+//! storage into two `Vec<u8>` halves. Each half grows via geometric
+//! doubling on out-of-range pointer movement — when the pointer escapes
+//! the currently allocated side, the side is resized to
+//! `max(needed, old_len * 2)` (with a small lower bound on the left side
+//! whose initial length is zero). Doubling amortises allocation cost to
+//! O(1) per cell touched and keeps cadence independent of the pointer's
+//! step size, while exactly-needed resizing would degrade to O(n) for
+//! single-step walks past the boundary. All storage lives in safe
+//! `Vec<u8>`; `#![forbid(unsafe_code)]` rules out `mmap`.
+//!
+//! `TapeStats` captures runtime usage (pointer range, growth, total
+//! movement) so `--interp-debug` can summarize behaviour after a program
+//! finishes.
 
 /// Statistics collected while a [`Tape`] is in use (pointer range, growth, move totals).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -16,8 +26,10 @@ pub(crate) struct TapeStats {
     pub(crate) ptr_min: isize,
     /// Largest tape index the pointer visited.
     pub(crate) ptr_max: isize,
-    /// Cells added to the right side beyond `initial_len`.
-    pub(crate) right_growth: usize,
+    /// Bytes appended to the right side beyond `initial_len` across all
+    /// doubling events. Measures allocated capacity growth, not the
+    /// highest cell visited.
+    pub(crate) right_grew_bytes: usize,
     /// Sum of absolute pointer deltas when moving left (`<` / negative HIR `Move`).
     pub(crate) move_left_units: u64,
     /// Sum of pointer deltas when moving right (`>` / positive HIR `Move`).
@@ -61,7 +73,7 @@ impl Tape {
                 final_len: len,
                 ptr_min: 0,
                 ptr_max: 0,
-                right_growth: 0,
+                right_grew_bytes: 0,
                 move_left_units: 0,
                 move_right_units: 0,
             },
@@ -132,13 +144,19 @@ impl Tape {
             let needed = self.ptr as usize + 1;
             if needed > self.right.len() {
                 let old_len = self.right.len();
-                self.right.resize(needed, 0);
-                self.stats.right_growth += self.right.len() - old_len;
+                let new_len = needed.max(old_len.saturating_mul(2));
+                self.right.resize(new_len, 0);
+                self.stats.right_grew_bytes += new_len - old_len;
             }
         } else {
             let needed = (-self.ptr) as usize;
             if needed > self.left.len() {
-                self.left.resize(needed, 0);
+                // The left half starts empty, so `old_len * 2` is zero on
+                // the first grow; fall back to a small floor so a single
+                // `<` does not trigger per-step reallocations afterwards.
+                let old_len = self.left.len();
+                let new_len = needed.max(old_len.saturating_mul(2)).max(8);
+                self.left.resize(new_len, 0);
             }
         }
 
@@ -152,6 +170,8 @@ mod tests {
 
     #[test]
     fn stats_track_right_growth_and_span() {
+        // needed = 11 exceeds `old_len * 2 = 8`, so the doubling rule falls
+        // back to the exact needed size.
         let mut t = Tape::new(4);
         t.move_ptr(10);
         let s = t.stats();
@@ -159,10 +179,22 @@ mod tests {
         assert_eq!(s.final_len, 11);
         assert_eq!(s.ptr_min, 0);
         assert_eq!(s.ptr_max, 10);
-        assert_eq!(s.right_growth, 7);
+        assert_eq!(s.right_grew_bytes, 7);
         assert_eq!(s.move_right_units, 10);
         assert_eq!(s.move_left_units, 0);
         assert_eq!(s.visited_span(), 11);
+    }
+
+    #[test]
+    fn doubling_overshoots_needed_on_small_move() {
+        // needed = 6 fits inside `old_len * 2 = 8`, so the resize lands on 8
+        // rather than the exact needed size — the point of geometric growth.
+        let mut t = Tape::new(4);
+        t.move_ptr(5);
+        let s = t.stats();
+        assert_eq!(s.final_len, 8);
+        assert_eq!(s.right_grew_bytes, 4);
+        assert_eq!(s.ptr_max, 5);
     }
 
     #[test]

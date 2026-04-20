@@ -67,12 +67,12 @@ fn run_interpret(config: &DriverConfig, hir: &HirProgram) -> Result<()> {
         let s = interp.tape.stats();
         eprintln!(
             "[interp-debug] tape initial_cells={} final_cells={} visited_span={} \
-             right_growth_cells={} ptr_min={} ptr_max={} \
+             right_grew_bytes={} ptr_min={} ptr_max={} \
              move_left_units={} move_right_units={}",
             s.initial_len,
             s.final_len,
             s.visited_span(),
-            s.right_growth,
+            s.right_grew_bytes,
             s.ptr_min,
             s.ptr_max,
             s.move_left_units,
