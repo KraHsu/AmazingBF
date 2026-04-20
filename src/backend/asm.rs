@@ -130,8 +130,9 @@ impl fmt::Display for AsmLabel {
 /// 5. Addressing / stack slots / RIP-relative: `LeaRegMem`, `LeaRegLabel`,
 ///    `MovMemReg64`, `MovRegMem64`.
 /// 6. Shifts: `ShrRegImm8`.
-/// 7. Control flow: `Jz`, `Jnz`, `Jb`, `Jae`, `Jl`, `Jge`, `Jmp`, `Call`,
-///    `CallMemLabel`, `Ret`.
+/// 7. Control flow: `Jz`, `Jnz`, `Jb`, `Jae`, `Jl`, `Jge`, `Jmp` (rel32
+///    forms), plus the `*Short` rel8 counterparts produced by branch
+///    relaxation; `Call`, `CallMemLabel`, `Ret`.
 /// 8. String ops: `Cld`, `RepMovsb`.
 /// 9. System call: `Syscall`.
 /// 10. Raw machine code: `RawBytes` (used by `-O3` pre-assembled paths).
@@ -237,36 +238,89 @@ pub enum AsmInst {
     /// `jz label` — conditional jump when ZF=1 (result was zero).
     ///
     /// Used by BF `[`: skip the loop body when the current cell is zero.
+    /// Encoded as the 6-byte `0F 84 rel32` form; the relax pass narrows
+    /// in-range variants to [`AsmInst::JzShort`].
     Jz(AsmLabel),
 
     /// `jnz label` — conditional jump when ZF=0 (result was non-zero).
     ///
     /// Used by BF `]`: jump back to the loop head when the current cell is
-    /// non-zero.
+    /// non-zero. Narrowed by the relax pass to [`AsmInst::JnzShort`] where the
+    /// target sits within rel8 range.
     Jnz(AsmLabel),
 
     /// `jb label` — unsigned branch when CF=1 (below).
     ///
-    /// Used by tape bounds-checking: pointer < tape base.
+    /// Used by tape bounds-checking: pointer < tape base. Narrowed by the
+    /// relax pass to [`AsmInst::JbShort`] where in-range.
     Jb(AsmLabel),
 
     /// `jae label` — unsigned branch when CF=0 (above or equal).
     ///
-    /// Used by tape bounds-checking: pointer >= tape end.
+    /// Used by tape bounds-checking: pointer >= tape end. Narrowed by the
+    /// relax pass to [`AsmInst::JaeShort`] where in-range.
     Jae(AsmLabel),
 
     /// `jl label` — signed branch when SF≠OF (less than).
     ///
-    /// Used to detect a negative mmap return value (an error).
+    /// Used to detect a negative mmap return value (an error). Narrowed by
+    /// the relax pass to [`AsmInst::JlShort`] where in-range.
     Jl(AsmLabel),
 
     /// `jge label` — signed branch when SF=OF (greater than or equal).
     ///
-    /// Used to terminate the tape-growth loop.
+    /// Used to terminate the tape-growth loop. Narrowed by the relax pass to
+    /// [`AsmInst::JgeShort`] where in-range.
     Jge(AsmLabel),
 
     /// `jmp label` — unconditional jump.
+    ///
+    /// Encoded as the 5-byte `E9 rel32` form; narrowed by the relax pass to
+    /// [`AsmInst::JmpShort`] where the target sits within rel8 range.
     Jmp(AsmLabel),
+
+    /// `jz label` (short form, 2 bytes: `74 rel8`).
+    ///
+    /// Produced only by the branch-relaxation pass when the target fits the
+    /// signed 8-bit range measured from the instruction that follows this
+    /// one.
+    JzShort(AsmLabel),
+
+    /// `jnz label` (short form, 2 bytes: `75 rel8`).
+    ///
+    /// Produced only by the branch-relaxation pass; same rel8 constraint as
+    /// [`AsmInst::JzShort`].
+    JnzShort(AsmLabel),
+
+    /// `jb label` (short form, 2 bytes: `72 rel8`).
+    ///
+    /// Produced only by the branch-relaxation pass; same rel8 constraint as
+    /// [`AsmInst::JzShort`].
+    JbShort(AsmLabel),
+
+    /// `jae label` (short form, 2 bytes: `73 rel8`).
+    ///
+    /// Produced only by the branch-relaxation pass; same rel8 constraint as
+    /// [`AsmInst::JzShort`].
+    JaeShort(AsmLabel),
+
+    /// `jl label` (short form, 2 bytes: `7C rel8`).
+    ///
+    /// Produced only by the branch-relaxation pass; same rel8 constraint as
+    /// [`AsmInst::JzShort`].
+    JlShort(AsmLabel),
+
+    /// `jge label` (short form, 2 bytes: `7D rel8`).
+    ///
+    /// Produced only by the branch-relaxation pass; same rel8 constraint as
+    /// [`AsmInst::JzShort`].
+    JgeShort(AsmLabel),
+
+    /// `jmp label` (short form, 2 bytes: `EB rel8`).
+    ///
+    /// Produced only by the branch-relaxation pass; same rel8 constraint as
+    /// [`AsmInst::JzShort`].
+    JmpShort(AsmLabel),
 
     /// `call label` — function call.
     ///

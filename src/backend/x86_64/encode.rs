@@ -71,9 +71,12 @@ pub(crate) struct EncodedInst {
 
 /// Kind of a fixup.
 ///
-/// Only one variant today: a 32-bit relative displacement whose base point is
-/// the next instruction's IP. This covers every near jump (JMP / Jcc) and
-/// near CALL that the Brainfuck backend emits.
+/// Two variants cover every near jump, CALL, and RIP-relative helper that the
+/// Brainfuck backend emits:
+/// - [`FixupKind::Rel32FromNextInsn`] — 4-byte displacement for long Jcc /
+///   JMP / CALL.
+/// - [`FixupKind::Rel8FromNextInsn`] — 1-byte displacement for the short Jcc
+///   / JMP forms introduced by the relaxation pass.
 #[derive(Debug, Clone, Copy)]
 enum FixupKind {
     /// 32-bit signed relative displacement, relative to the four bytes that
@@ -84,6 +87,17 @@ enum FixupKind {
     /// The `+4` reflects that by the time the CPU executes the jump, RIP has
     /// already advanced past the `rel32` field.
     Rel32FromNextInsn,
+
+    /// 8-bit signed relative displacement, relative to the byte that follows
+    /// the fixup site.
+    ///
+    /// `rel8 = target_offset - (fixup_at + 1)`
+    ///
+    /// Panics in [`CodeBuffer::finish`] when the resolved displacement does
+    /// not fit in `i8`. Only the relaxation pass in
+    /// [`crate::backend::x86_64::relax`] is allowed to emit this fixup kind,
+    /// and only after confirming the jump sits within rel8 range.
+    Rel8FromNextInsn,
 }
 
 /// A record of a placeholder that still needs to be patched.
@@ -184,7 +198,7 @@ impl CodeBuffer {
 
     /// Emit a 4-byte zero placeholder and record the matching fixup.
     ///
-    /// This is the core helper for every jump / call: reserve space now,
+    /// This is the core helper for every long jump / call: reserve space now,
     /// patch in the real displacement later.
     fn emit_rel32_fixup(&mut self, label: AsmLabel) {
         let at = self.pos();
@@ -193,6 +207,18 @@ impl CodeBuffer {
             label,
             at,
             kind: FixupKind::Rel32FromNextInsn,
+        });
+    }
+
+    /// Emit a 1-byte zero placeholder for the short Jcc / JMP forms and
+    /// record the matching rel8 fixup.
+    fn emit_rel8_fixup(&mut self, label: AsmLabel) {
+        let at = self.pos();
+        self.emit_u8(0); // one-byte zero placeholder
+        self.fixups.push(Fixup {
+            label,
+            at,
+            kind: FixupKind::Rel8FromNextInsn,
         });
     }
 
@@ -222,19 +248,21 @@ impl CodeBuffer {
                 .unwrap_or_else(|| panic!("unknown label: {:?}", fixup.label))
                 as i64;
 
-            // Next-instruction IP = fixup site + 4 (the rel32 field width).
-            let next_ip = (fixup.at + 4) as i64;
-
-            // Relative displacement = target - next_ip.
-            let rel = target - next_ip;
-
-            // Safety: the displacement must fit in a 32-bit signed integer.
-            let rel32 = i32::try_from(rel).expect("rel32 out of range");
-
             match fixup.kind {
                 FixupKind::Rel32FromNextInsn => {
-                    // Write the displacement back into the placeholder slot.
+                    // Next-instruction IP = fixup site + 4 (the rel32 field width).
+                    let next_ip = (fixup.at + 4) as i64;
+                    let rel = target - next_ip;
+                    let rel32 = i32::try_from(rel).expect("rel32 out of range");
                     self.bytes[fixup.at..fixup.at + 4].copy_from_slice(&rel32.to_le_bytes());
+                }
+                FixupKind::Rel8FromNextInsn => {
+                    // Next-instruction IP = fixup site + 1 (the rel8 field width).
+                    let next_ip = (fixup.at + 1) as i64;
+                    let rel = target - next_ip;
+                    let rel8 = i8::try_from(rel)
+                        .unwrap_or_else(|_| panic!("rel8 out of range for {:?}", fixup.label));
+                    self.bytes[fixup.at] = rel8 as u8;
                 }
             }
         }
@@ -453,6 +481,16 @@ fn emit_jcc_rel32(buf: &mut CodeBuffer, cc: u8, label: AsmLabel) {
     buf.emit_rel32_fixup(label); // 32-bit relative displacement (fixup)
 }
 
+/// Emit a short conditional / unconditional jump: `opcode rel8`.
+///
+/// The short Jcc and JMP forms share this single-byte-opcode + single-byte
+/// displacement shape. Only the relaxation pass emits these variants, after
+/// verifying the target sits within rel8 range.
+fn emit_short_jump(buf: &mut CodeBuffer, opcode: u8, label: AsmLabel) {
+    buf.emit_u8(opcode);
+    buf.emit_rel8_fixup(label);
+}
+
 /// Encode a single `AsmInst` into the code buffer.
 ///
 /// Per-instruction encoding details live in the matching match arm.
@@ -610,6 +648,17 @@ fn encode_inst(buf: &mut CodeBuffer, inst: &AsmInst) {
             buf.emit_u8(0xE9);
             buf.emit_rel32_fixup(*label);
         }
+
+        // Short conditional / unconditional jumps: single-byte opcode + rel8.
+        // Produced only by the relaxation pass in
+        // `crate::backend::x86_64::relax`.
+        AsmInst::JzShort(label) => emit_short_jump(buf, 0x74, *label),
+        AsmInst::JnzShort(label) => emit_short_jump(buf, 0x75, *label),
+        AsmInst::JbShort(label) => emit_short_jump(buf, 0x72, *label),
+        AsmInst::JaeShort(label) => emit_short_jump(buf, 0x73, *label),
+        AsmInst::JlShort(label) => emit_short_jump(buf, 0x7C, *label),
+        AsmInst::JgeShort(label) => emit_short_jump(buf, 0x7D, *label),
+        AsmInst::JmpShort(label) => emit_short_jump(buf, 0xEB, *label),
 
         // Near call: 0xE8 + rel32. CALL implicitly pushes RIP then jumps.
         AsmInst::Call(label) => {

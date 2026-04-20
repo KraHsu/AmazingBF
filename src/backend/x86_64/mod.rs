@@ -7,6 +7,7 @@
 pub(crate) mod elf;
 pub(crate) mod encode;
 pub(crate) mod pe;
+pub(crate) mod relax;
 pub(crate) mod windows;
 
 /// Debug-output module.

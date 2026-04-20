@@ -10,6 +10,7 @@ use crate::backend::codegen::{
     compile_lir_to_asm, compile_precomputed_stdout_asm, compile_trivial_exit_asm,
 };
 use crate::backend::x86_64::debug;
+use crate::backend::x86_64::relax::relax_jumps;
 use crate::backend::x86_64::windows::{
     WindowsProgram, compile_lir_to_windows_program, compile_precomputed_stdout_program,
     compile_trivial_exit_program,
@@ -88,12 +89,13 @@ fn run_compile(config: &DriverConfig, hir: &HirProgram) -> Result<()> {
     let hex_listing_path = artifact_path(&output, HEX_LISTING_EXT);
     let (asm, executable) = match config.target {
         CompileTarget::X86_64Linux => {
-            let asm = compile_linux_asm(hir, config.opt_level)?;
+            let asm = relax_jumps(compile_linux_asm(hir, config.opt_level)?);
             let executable = compile_asm_to_elf(&asm);
             (asm, executable)
         }
         CompileTarget::X86_64Windows => {
-            let program = compile_windows_program(hir, config.opt_level)?;
+            let mut program = compile_windows_program(hir, config.opt_level)?;
+            program.asm = relax_jumps(program.asm);
             let executable = compile_windows_program_to_pe(&program);
             (program.asm, executable)
         }

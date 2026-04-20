@@ -344,6 +344,49 @@ fn format_inst_asm(out: &mut String, inst: &AsmInst) {
             writeln!(out, "    jmp     {}", label_name(*label)).unwrap();
         }
 
+        // Short jumps (rel8 forms emitted by branch relaxation).
+        AsmInst::JzShort(label) => {
+            writeln!(out, "    jz      {}           ; short", label_name(*label)).unwrap();
+        }
+        AsmInst::JnzShort(label) => {
+            writeln!(out, "    jnz     {}           ; short", label_name(*label)).unwrap();
+        }
+        AsmInst::JbShort(label) => {
+            writeln!(
+                out,
+                "    jb      {}           ; short, unsigned below",
+                label_name(*label)
+            )
+            .unwrap();
+        }
+        AsmInst::JaeShort(label) => {
+            writeln!(
+                out,
+                "    jae     {}           ; short, unsigned above or equal",
+                label_name(*label)
+            )
+            .unwrap();
+        }
+        AsmInst::JlShort(label) => {
+            writeln!(
+                out,
+                "    jl      {}           ; short, signed less",
+                label_name(*label)
+            )
+            .unwrap();
+        }
+        AsmInst::JgeShort(label) => {
+            writeln!(
+                out,
+                "    jge     {}           ; short, signed greater or equal",
+                label_name(*label)
+            )
+            .unwrap();
+        }
+        AsmInst::JmpShort(label) => {
+            writeln!(out, "    jmp     {}           ; short", label_name(*label)).unwrap();
+        }
+
         // Calls and returns.
         AsmInst::Call(label) => {
             writeln!(out, "    call    {}", label_name(*label)).unwrap();
