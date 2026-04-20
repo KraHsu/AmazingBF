@@ -50,6 +50,12 @@ function start() {
 
   invoke('subscribe_frames', { channel });
 
+  // Tick pulse: inject a reserved byte (0) into the key queue ~30 Hz so BFS
+  // programs can advance world state without requiring player input. Real
+  // keypresses never produce 0 (see the `code > 0` gate below), so 0 is a
+  // safe sentinel for "world tick, no input".
+  setInterval(() => invoke('send_key', { key: 0 }), 33);
+
   document.addEventListener('keydown', (e) => {
     let code = 0;
     if (e.key.length === 1) {

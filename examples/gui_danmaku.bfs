@@ -1,0 +1,778 @@
+// @gui
+// gui_danmaku.bfs — simple bullet-hell demo on the 256x256 BFS GUI.
+//
+// Destroy 50 falling blocks before three hearts run out. Blocks accelerate
+// with score: speed = 2 + score / 15. Hearts live in the upper-right corner;
+// block spawn x is capped to [0, 207] so blocks never overlap the HUD.
+//
+// Controls:
+//   a / d           move the triangle left / right
+//   w / space       fire a bullet upward
+//   q / Escape      quit
+//
+// Seed: a u8 is incremented every ~33 ms tick while the title frame is up,
+// sampled implicitly at the player's first keypress. The tick is injected by
+// gui-assets/renderer.js as a reserved 0-byte on the key queue, so the world
+// keeps advancing even when no key is pressed.
+//
+// Perf note: pools are unrolled (3 block slots, 2 bullet slots) instead of
+// arrays — arr_read/arr_write expand to O(n) tape scans per access, which
+// saturates the 30 Hz tick budget. LCG uses a small multiplier for the same
+// reason: bfsc compiles u8 * k via repeated add, so keep k small.
+//
+// Run with:  bf-gui gui_danmaku.bfs
+
+// ---- State ----
+let started: u8 = 0;
+let running: u8 = 1;
+let seed: u8 = 0;
+let key: u8 = 0;
+
+let px: u8 = 124;
+let hearts: u8 = 3;
+let score: u8 = 0;
+let speed: u8 = 2;
+let spawn_timer: u8 = 0;
+
+let b0_active: u8 = 0;
+let b0_x: u8 = 0;
+let b0_y: u8 = 0;
+let b0_color: u8 = 0;
+let b1_active: u8 = 0;
+let b1_x: u8 = 0;
+let b1_y: u8 = 0;
+let b1_color: u8 = 0;
+let b2_active: u8 = 0;
+let b2_x: u8 = 0;
+let b2_y: u8 = 0;
+let b2_color: u8 = 0;
+
+let u0_active: u8 = 0;
+let u0_x: u8 = 0;
+let u0_y: u8 = 0;
+let u1_active: u8 = 0;
+let u1_x: u8 = 0;
+let u1_y: u8 = 0;
+
+let i: u8 = 0;
+let j: u8 = 0;
+let tmp: u8 = 0;
+let dx: u8 = 0;
+let dy: u8 = 0;
+let bx: u8 = 0;
+let by: u8 = 0;
+let bc: u8 = 0;
+let ux: u8 = 0;
+let uy: u8 = 0;
+let ny: u8 = 0;
+let hit: u8 = 0;
+let heart_x: u8 = 0;
+let end_color: u8 = 0;
+let ex: u16 = 0;
+let ey: u16 = 0;
+
+// ---- Title loop: increment seed every tick, exit on first real key ----
+while started == 0 {
+    getchar(key);
+    if key == 0 {
+        seed = seed + 1;
+    }
+    if key > 0 {
+        started = 1;
+    }
+}
+
+// ---- Initial HUD ----
+// Three hearts as 8x8 red squares at y=4, base x = 216, 232, 248.
+i = 0;
+while i < 3 {
+    heart_x = 216 + i * 16;
+    j = 0;
+    while j < 8 {
+        tmp = 0;
+        while tmp < 8 {
+            setpixel(heart_x + tmp, 4 + j, 224);
+            tmp = tmp + 1;
+        }
+        j = j + 1;
+    }
+    i = i + 1;
+}
+
+// Player triangle centred at (px, y=245..247).
+setpixel(px, 245, 28);
+setpixel(px - 1, 246, 28);
+setpixel(px, 246, 28);
+setpixel(px + 1, 246, 28);
+setpixel(px - 2, 247, 28);
+setpixel(px - 1, 247, 28);
+setpixel(px, 247, 28);
+setpixel(px + 1, 247, 28);
+setpixel(px + 2, 247, 28);
+
+// Title indicator: 16x16 yellow square in centre, erased after first press.
+j = 0;
+while j < 16 {
+    tmp = 0;
+    while tmp < 16 {
+        setpixel(120 + tmp, 120 + j, 252);
+        tmp = tmp + 1;
+    }
+    j = j + 1;
+}
+
+// Erase the title indicator.
+j = 0;
+while j < 16 {
+    tmp = 0;
+    while tmp < 16 {
+        setpixel(120 + tmp, 120 + j, 0);
+        tmp = tmp + 1;
+    }
+    j = j + 1;
+}
+
+// ---- Main game loop ----
+while running > 0 {
+    getchar(key);
+
+    if key == 0 {
+        // World tick.
+        seed = seed * 5 + 11;
+
+        // Bullet 0: move up by 4.
+        if u0_active > 0 {
+            ux = u0_x;
+            uy = u0_y;
+            dy = 0;
+            while dy < 6 {
+                setpixel(ux, uy + dy, 0);
+                setpixel(ux + 1, uy + dy, 0);
+                dy = dy + 1;
+            }
+            if uy >= 4 {
+                uy = uy - 4;
+                u0_y = uy;
+                dy = 0;
+                while dy < 6 {
+                    setpixel(ux, uy + dy, 252);
+                    setpixel(ux + 1, uy + dy, 252);
+                    dy = dy + 1;
+                }
+            } else {
+                u0_active = 0;
+            }
+        }
+        // Bullet 1: move up by 4.
+        if u1_active > 0 {
+            ux = u1_x;
+            uy = u1_y;
+            dy = 0;
+            while dy < 6 {
+                setpixel(ux, uy + dy, 0);
+                setpixel(ux + 1, uy + dy, 0);
+                dy = dy + 1;
+            }
+            if uy >= 4 {
+                uy = uy - 4;
+                u1_y = uy;
+                dy = 0;
+                while dy < 6 {
+                    setpixel(ux, uy + dy, 252);
+                    setpixel(ux + 1, uy + dy, 252);
+                    dy = dy + 1;
+                }
+            } else {
+                u1_active = 0;
+            }
+        }
+
+        // Block 0: fall by `speed`.
+        if b0_active > 0 {
+            bx = b0_x;
+            by = b0_y;
+            bc = b0_color;
+            dy = 0;
+            while dy < 8 {
+                dx = 0;
+                while dx < 8 {
+                    setpixel(bx + dx, by + dy, 0);
+                    dx = dx + 1;
+                }
+                dy = dy + 1;
+            }
+            ny = by + speed;
+            if ny >= 240 {
+                hit = 0;
+                if bx + 8 > px - 4 {
+                    if bx < px + 4 {
+                        hit = 1;
+                    }
+                }
+                if hit == 1 {
+                    hearts = hearts - 1;
+                    heart_x = 216 + hearts * 16;
+                    j = 0;
+                    while j < 8 {
+                        tmp = 0;
+                        while tmp < 8 {
+                            setpixel(heart_x + tmp, 4 + j, 0);
+                            tmp = tmp + 1;
+                        }
+                        j = j + 1;
+                    }
+                }
+                b0_active = 0;
+            } else {
+                b0_y = ny;
+                dy = 0;
+                while dy < 8 {
+                    dx = 0;
+                    while dx < 8 {
+                        setpixel(bx + dx, ny + dy, bc);
+                        dx = dx + 1;
+                    }
+                    dy = dy + 1;
+                }
+            }
+        }
+        // Block 1.
+        if b1_active > 0 {
+            bx = b1_x;
+            by = b1_y;
+            bc = b1_color;
+            dy = 0;
+            while dy < 8 {
+                dx = 0;
+                while dx < 8 {
+                    setpixel(bx + dx, by + dy, 0);
+                    dx = dx + 1;
+                }
+                dy = dy + 1;
+            }
+            ny = by + speed;
+            if ny >= 240 {
+                hit = 0;
+                if bx + 8 > px - 4 {
+                    if bx < px + 4 {
+                        hit = 1;
+                    }
+                }
+                if hit == 1 {
+                    hearts = hearts - 1;
+                    heart_x = 216 + hearts * 16;
+                    j = 0;
+                    while j < 8 {
+                        tmp = 0;
+                        while tmp < 8 {
+                            setpixel(heart_x + tmp, 4 + j, 0);
+                            tmp = tmp + 1;
+                        }
+                        j = j + 1;
+                    }
+                }
+                b1_active = 0;
+            } else {
+                b1_y = ny;
+                dy = 0;
+                while dy < 8 {
+                    dx = 0;
+                    while dx < 8 {
+                        setpixel(bx + dx, ny + dy, bc);
+                        dx = dx + 1;
+                    }
+                    dy = dy + 1;
+                }
+            }
+        }
+        // Block 2.
+        if b2_active > 0 {
+            bx = b2_x;
+            by = b2_y;
+            bc = b2_color;
+            dy = 0;
+            while dy < 8 {
+                dx = 0;
+                while dx < 8 {
+                    setpixel(bx + dx, by + dy, 0);
+                    dx = dx + 1;
+                }
+                dy = dy + 1;
+            }
+            ny = by + speed;
+            if ny >= 240 {
+                hit = 0;
+                if bx + 8 > px - 4 {
+                    if bx < px + 4 {
+                        hit = 1;
+                    }
+                }
+                if hit == 1 {
+                    hearts = hearts - 1;
+                    heart_x = 216 + hearts * 16;
+                    j = 0;
+                    while j < 8 {
+                        tmp = 0;
+                        while tmp < 8 {
+                            setpixel(heart_x + tmp, 4 + j, 0);
+                            tmp = tmp + 1;
+                        }
+                        j = j + 1;
+                    }
+                }
+                b2_active = 0;
+            } else {
+                b2_y = ny;
+                dy = 0;
+                while dy < 8 {
+                    dx = 0;
+                    while dx < 8 {
+                        setpixel(bx + dx, ny + dy, bc);
+                        dx = dx + 1;
+                    }
+                    dy = dy + 1;
+                }
+            }
+        }
+
+        // Bullet × block collisions (2 bullets × 3 blocks, unrolled).
+        // u0 × b0
+        if u0_active > 0 {
+            if b0_active > 0 {
+                ux = u0_x;
+                uy = u0_y;
+                bx = b0_x;
+                by = b0_y;
+                hit = 0;
+                if ux + 2 > bx {
+                    if ux < bx + 8 {
+                        if uy + 6 > by {
+                            if uy < by + 8 {
+                                hit = 1;
+                            }
+                        }
+                    }
+                }
+                if hit == 1 {
+                    dy = 0;
+                    while dy < 8 {
+                        dx = 0;
+                        while dx < 8 {
+                            setpixel(bx + dx, by + dy, 0);
+                            dx = dx + 1;
+                        }
+                        dy = dy + 1;
+                    }
+                    b0_active = 0;
+                    dy = 0;
+                    while dy < 6 {
+                        setpixel(ux, uy + dy, 0);
+                        setpixel(ux + 1, uy + dy, 0);
+                        dy = dy + 1;
+                    }
+                    u0_active = 0;
+                    score = score + 1;
+                }
+            }
+        }
+        // u0 × b1
+        if u0_active > 0 {
+            if b1_active > 0 {
+                ux = u0_x;
+                uy = u0_y;
+                bx = b1_x;
+                by = b1_y;
+                hit = 0;
+                if ux + 2 > bx {
+                    if ux < bx + 8 {
+                        if uy + 6 > by {
+                            if uy < by + 8 {
+                                hit = 1;
+                            }
+                        }
+                    }
+                }
+                if hit == 1 {
+                    dy = 0;
+                    while dy < 8 {
+                        dx = 0;
+                        while dx < 8 {
+                            setpixel(bx + dx, by + dy, 0);
+                            dx = dx + 1;
+                        }
+                        dy = dy + 1;
+                    }
+                    b1_active = 0;
+                    dy = 0;
+                    while dy < 6 {
+                        setpixel(ux, uy + dy, 0);
+                        setpixel(ux + 1, uy + dy, 0);
+                        dy = dy + 1;
+                    }
+                    u0_active = 0;
+                    score = score + 1;
+                }
+            }
+        }
+        // u0 × b2
+        if u0_active > 0 {
+            if b2_active > 0 {
+                ux = u0_x;
+                uy = u0_y;
+                bx = b2_x;
+                by = b2_y;
+                hit = 0;
+                if ux + 2 > bx {
+                    if ux < bx + 8 {
+                        if uy + 6 > by {
+                            if uy < by + 8 {
+                                hit = 1;
+                            }
+                        }
+                    }
+                }
+                if hit == 1 {
+                    dy = 0;
+                    while dy < 8 {
+                        dx = 0;
+                        while dx < 8 {
+                            setpixel(bx + dx, by + dy, 0);
+                            dx = dx + 1;
+                        }
+                        dy = dy + 1;
+                    }
+                    b2_active = 0;
+                    dy = 0;
+                    while dy < 6 {
+                        setpixel(ux, uy + dy, 0);
+                        setpixel(ux + 1, uy + dy, 0);
+                        dy = dy + 1;
+                    }
+                    u0_active = 0;
+                    score = score + 1;
+                }
+            }
+        }
+        // u1 × b0
+        if u1_active > 0 {
+            if b0_active > 0 {
+                ux = u1_x;
+                uy = u1_y;
+                bx = b0_x;
+                by = b0_y;
+                hit = 0;
+                if ux + 2 > bx {
+                    if ux < bx + 8 {
+                        if uy + 6 > by {
+                            if uy < by + 8 {
+                                hit = 1;
+                            }
+                        }
+                    }
+                }
+                if hit == 1 {
+                    dy = 0;
+                    while dy < 8 {
+                        dx = 0;
+                        while dx < 8 {
+                            setpixel(bx + dx, by + dy, 0);
+                            dx = dx + 1;
+                        }
+                        dy = dy + 1;
+                    }
+                    b0_active = 0;
+                    dy = 0;
+                    while dy < 6 {
+                        setpixel(ux, uy + dy, 0);
+                        setpixel(ux + 1, uy + dy, 0);
+                        dy = dy + 1;
+                    }
+                    u1_active = 0;
+                    score = score + 1;
+                }
+            }
+        }
+        // u1 × b1
+        if u1_active > 0 {
+            if b1_active > 0 {
+                ux = u1_x;
+                uy = u1_y;
+                bx = b1_x;
+                by = b1_y;
+                hit = 0;
+                if ux + 2 > bx {
+                    if ux < bx + 8 {
+                        if uy + 6 > by {
+                            if uy < by + 8 {
+                                hit = 1;
+                            }
+                        }
+                    }
+                }
+                if hit == 1 {
+                    dy = 0;
+                    while dy < 8 {
+                        dx = 0;
+                        while dx < 8 {
+                            setpixel(bx + dx, by + dy, 0);
+                            dx = dx + 1;
+                        }
+                        dy = dy + 1;
+                    }
+                    b1_active = 0;
+                    dy = 0;
+                    while dy < 6 {
+                        setpixel(ux, uy + dy, 0);
+                        setpixel(ux + 1, uy + dy, 0);
+                        dy = dy + 1;
+                    }
+                    u1_active = 0;
+                    score = score + 1;
+                }
+            }
+        }
+        // u1 × b2
+        if u1_active > 0 {
+            if b2_active > 0 {
+                ux = u1_x;
+                uy = u1_y;
+                bx = b2_x;
+                by = b2_y;
+                hit = 0;
+                if ux + 2 > bx {
+                    if ux < bx + 8 {
+                        if uy + 6 > by {
+                            if uy < by + 8 {
+                                hit = 1;
+                            }
+                        }
+                    }
+                }
+                if hit == 1 {
+                    dy = 0;
+                    while dy < 8 {
+                        dx = 0;
+                        while dx < 8 {
+                            setpixel(bx + dx, by + dy, 0);
+                            dx = dx + 1;
+                        }
+                        dy = dy + 1;
+                    }
+                    b2_active = 0;
+                    dy = 0;
+                    while dy < 6 {
+                        setpixel(ux, uy + dy, 0);
+                        setpixel(ux + 1, uy + dy, 0);
+                        dy = dy + 1;
+                    }
+                    u1_active = 0;
+                    score = score + 1;
+                }
+            }
+        }
+
+        // Spawn every 6 ticks if a slot is free.
+        spawn_timer = spawn_timer + 1;
+        if spawn_timer >= 6 {
+            spawn_timer = 0;
+            if b0_active == 0 {
+                b0_active = 1;
+                b0_x = seed % 208;
+                b0_y = 0;
+                tmp = seed % 4;
+                if tmp == 0 { b0_color = 3; }
+                if tmp == 1 { b0_color = 28; }
+                if tmp == 2 { b0_color = 224; }
+                if tmp == 3 { b0_color = 252; }
+                bx = b0_x;
+                bc = b0_color;
+                dy = 0;
+                while dy < 8 {
+                    dx = 0;
+                    while dx < 8 {
+                        setpixel(bx + dx, dy, bc);
+                        dx = dx + 1;
+                    }
+                    dy = dy + 1;
+                }
+            } else {
+                if b1_active == 0 {
+                    b1_active = 1;
+                    b1_x = seed % 208;
+                    b1_y = 0;
+                    tmp = seed % 4;
+                    if tmp == 0 { b1_color = 3; }
+                    if tmp == 1 { b1_color = 28; }
+                    if tmp == 2 { b1_color = 224; }
+                    if tmp == 3 { b1_color = 252; }
+                    bx = b1_x;
+                    bc = b1_color;
+                    dy = 0;
+                    while dy < 8 {
+                        dx = 0;
+                        while dx < 8 {
+                            setpixel(bx + dx, dy, bc);
+                            dx = dx + 1;
+                        }
+                        dy = dy + 1;
+                    }
+                } else {
+                    if b2_active == 0 {
+                        b2_active = 1;
+                        b2_x = seed % 208;
+                        b2_y = 0;
+                        tmp = seed % 4;
+                        if tmp == 0 { b2_color = 3; }
+                        if tmp == 1 { b2_color = 28; }
+                        if tmp == 2 { b2_color = 224; }
+                        if tmp == 3 { b2_color = 252; }
+                        bx = b2_x;
+                        bc = b2_color;
+                        dy = 0;
+                        while dy < 8 {
+                            dx = 0;
+                            while dx < 8 {
+                                setpixel(bx + dx, dy, bc);
+                                dx = dx + 1;
+                            }
+                            dy = dy + 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Difficulty ramp.
+        speed = 2 + score / 15;
+
+        // Re-assert player triangle (block erase may have clobbered it).
+        setpixel(px, 245, 28);
+        setpixel(px - 1, 246, 28);
+        setpixel(px, 246, 28);
+        setpixel(px + 1, 246, 28);
+        setpixel(px - 2, 247, 28);
+        setpixel(px - 1, 247, 28);
+        setpixel(px, 247, 28);
+        setpixel(px + 1, 247, 28);
+        setpixel(px + 2, 247, 28);
+
+        if hearts == 0 { running = 0; }
+        if score >= 10 { running = 0; }
+    }
+
+    if key == 97 {
+        if px >= 8 {
+            setpixel(px, 245, 0);
+            setpixel(px - 1, 246, 0);
+            setpixel(px, 246, 0);
+            setpixel(px + 1, 246, 0);
+            setpixel(px - 2, 247, 0);
+            setpixel(px - 1, 247, 0);
+            setpixel(px, 247, 0);
+            setpixel(px + 1, 247, 0);
+            setpixel(px + 2, 247, 0);
+            px = px - 4;
+            setpixel(px, 245, 28);
+            setpixel(px - 1, 246, 28);
+            setpixel(px, 246, 28);
+            setpixel(px + 1, 246, 28);
+            setpixel(px - 2, 247, 28);
+            setpixel(px - 1, 247, 28);
+            setpixel(px, 247, 28);
+            setpixel(px + 1, 247, 28);
+            setpixel(px + 2, 247, 28);
+        }
+    }
+    if key == 100 {
+        if px <= 244 {
+            setpixel(px, 245, 0);
+            setpixel(px - 1, 246, 0);
+            setpixel(px, 246, 0);
+            setpixel(px + 1, 246, 0);
+            setpixel(px - 2, 247, 0);
+            setpixel(px - 1, 247, 0);
+            setpixel(px, 247, 0);
+            setpixel(px + 1, 247, 0);
+            setpixel(px + 2, 247, 0);
+            px = px + 4;
+            setpixel(px, 245, 28);
+            setpixel(px - 1, 246, 28);
+            setpixel(px, 246, 28);
+            setpixel(px + 1, 246, 28);
+            setpixel(px - 2, 247, 28);
+            setpixel(px - 1, 247, 28);
+            setpixel(px, 247, 28);
+            setpixel(px + 1, 247, 28);
+            setpixel(px + 2, 247, 28);
+        }
+    }
+    if key == 32 {
+        if u0_active == 0 {
+            u0_active = 1;
+            u0_x = px;
+            u0_y = 238;
+            dy = 0;
+            while dy < 6 {
+                setpixel(px, 238 + dy, 252);
+                setpixel(px + 1, 238 + dy, 252);
+                dy = dy + 1;
+            }
+        } else {
+            if u1_active == 0 {
+                u1_active = 1;
+                u1_x = px;
+                u1_y = 238;
+                dy = 0;
+                while dy < 6 {
+                    setpixel(px, 238 + dy, 252);
+                    setpixel(px + 1, 238 + dy, 252);
+                    dy = dy + 1;
+                }
+            }
+        }
+    }
+    if key == 119 {
+        if u0_active == 0 {
+            u0_active = 1;
+            u0_x = px;
+            u0_y = 238;
+            dy = 0;
+            while dy < 6 {
+                setpixel(px, 238 + dy, 252);
+                setpixel(px + 1, 238 + dy, 252);
+                dy = dy + 1;
+            }
+        } else {
+            if u1_active == 0 {
+                u1_active = 1;
+                u1_x = px;
+                u1_y = 238;
+                dy = 0;
+                while dy < 6 {
+                    setpixel(px, 238 + dy, 252);
+                    setpixel(px + 1, 238 + dy, 252);
+                    dy = dy + 1;
+                }
+            }
+        }
+    }
+    if key == 27 { running = 0; }
+    if key == 113 { running = 0; }
+}
+
+// ---- End screen ----
+if score >= 10 {
+    end_color = 28;
+} else {
+    end_color = 224;
+}
+ey = 100;
+while ey < 156 {
+    ex = 100;
+    while ex < 156 {
+        setpixel(ex, ey, end_color);
+        ex = ex + 1;
+    }
+    ey = ey + 1;
+}
+getchar(key);
