@@ -199,7 +199,10 @@ impl<'a> Parser<'a> {
                 };
                 self.expect(&Token::Colon)?;
                 let pty = self.parse_type()?;
-                params.push(Param { name: pname, ty: pty });
+                params.push(Param {
+                    name: pname,
+                    ty: pty,
+                });
                 if !self.match_tok(&Token::Comma) {
                     break;
                 }

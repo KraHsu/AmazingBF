@@ -365,11 +365,7 @@ fn check_lval(
     Ok(())
 }
 
-fn check_expr(
-    expr: &Expr,
-    sym: &HashMap<String, TypeAnn>,
-    fns: &FnTable,
-) -> Result<(), BfscError> {
+fn check_expr(expr: &Expr, sym: &HashMap<String, TypeAnn>, fns: &FnTable) -> Result<(), BfscError> {
     match expr {
         Expr::Int(_) => {}
         Expr::Var(name) => {
@@ -393,9 +389,9 @@ fn check_expr(
         }
         Expr::UnOp(_, e) => check_expr(e, sym, fns)?,
         Expr::Call(name, args) => {
-            let sig = fns.get(name.as_str()).ok_or_else(|| {
-                BfscError::Type(format!("call to undefined function '{name}'"))
-            })?;
+            let sig = fns
+                .get(name.as_str())
+                .ok_or_else(|| BfscError::Type(format!("call to undefined function '{name}'")))?;
             if sig.ret_ty.is_none() {
                 return Err(BfscError::Type(format!(
                     "void function '{name}' cannot be used in an expression"

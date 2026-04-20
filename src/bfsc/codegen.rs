@@ -1615,7 +1615,9 @@ impl<'a> BfEmitter<'a> {
                 // so each call gets its own copy of the local.
                 let layout = if self.in_fn_scope() {
                     let (base, width, array_len, scalar_ty) = match ty {
-                        TypeAnn::Scalar(st) => (self.talloc_n(st.cell_width()), st.cell_width(), None, *st),
+                        TypeAnn::Scalar(st) => {
+                            (self.talloc_n(st.cell_width()), st.cell_width(), None, *st)
+                        }
                         TypeAnn::Array(st, len) => {
                             let total = st.cell_width() * (*len as usize);
                             (self.talloc_n(total), total, Some(*len as usize), *st)
