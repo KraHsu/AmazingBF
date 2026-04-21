@@ -24,6 +24,10 @@ criterion = { version = "0.5", default-features = false, features = ["cargo_benc
 name = "standard_suite"
 harness = false
 
+[[bench]]
+name = "compile_levels"
+harness = false
+
 [build-dependencies]
 tauri-build = { version = "2", optional = true }
 

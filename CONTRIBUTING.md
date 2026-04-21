@@ -5,8 +5,9 @@
 - Use Rust `1.94` or newer (same as `rust-version` in `Cargo.toml`).
 - Run `cargo fmt` before sending changes.
 - Run `cargo clippy --all-targets -- -D warnings` for lint checks.
-- Run `cargo test` for the fast regression suite.
-- Run `cargo test --test compile_pipeline -- --ignored --nocapture` only when you need the slow compile-mode benchmark-style regression.
+- Run `cargo test` for the regression suite.
+- Run `cargo bench --bench compile_levels` for the compile-then-run timing table over `tests/cases/*.bf` at `-O0..3`.
+- Run `cargo bench --bench standard_suite` for per-level interp / exec timings on the matslina BF suite (supports Criterion `--save-baseline` / `--baseline`).
 
 ## Architecture Rules
 
@@ -26,8 +27,14 @@
 
 - `tests/cases_pipeline.rs` covers end-to-end interpreter and compiler output against fixtures.
 - `tests/windows_target.rs` covers PE64 layout and cross-target behavior.
-- `tests/compile_pipeline.rs` is intentionally slow and ignored by default.
+- `tests/compile_artifacts.rs` validates ELF/PE artifacts, `.asm`/`.lst` output, and EOF semantics across O0–O3.
 - `tests/cases/*.bf` are fixtures, not Rust source files; keep fixture naming aligned across `.bf`, `.in`, `.out`, and `.md`.
+
+## Benchmarks
+
+- `benches/compile_levels.rs` owns compile + run timing tables over `tests/cases/*.bf` (custom harness; no Criterion).
+- `benches/standard_suite.rs` owns interp/exec timings on the matslina BF programs (Criterion).
+- Both are developer-local; CI runs `cargo test` only.
 
 ## Documentation
 

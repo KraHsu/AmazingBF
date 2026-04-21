@@ -5,8 +5,9 @@
 - 使用 Rust `1.94` 或更新版本（与 `Cargo.toml` 中的 `rust-version` 一致）。
 - 提交更改前运行 `cargo fmt`。
 - 运行 `cargo clippy --all-targets -- -D warnings` 进行代码规范检查。
-- 运行 `cargo test` 执行快速回归测试。
-- 仅在需要进行较慢的编译模式基准回归测试时，运行 `cargo test --test compile_pipeline -- --ignored --nocapture`。
+- 运行 `cargo test` 执行回归测试。
+- 运行 `cargo bench --bench compile_levels` 跑 `tests/cases/*.bf` 在 `-O0..3` 下的「编译 + 运行」耗时总表。
+- 运行 `cargo bench --bench standard_suite` 跑 matslina BF 套件在各优化级别下的解释/执行耗时（支持 Criterion 的 `--save-baseline` / `--baseline`）。
 
 ## 架构规则
 
@@ -26,8 +27,14 @@
 
 - `tests/cases_pipeline.rs` 覆盖解释器和编译器输出的端到端测试（基于测试用例）。
 - `tests/windows_target.rs` 覆盖 PE64 布局和跨目标行为。
-- `tests/compile_pipeline.rs` 有意设计为较慢测试，默认被忽略。
+- `tests/compile_artifacts.rs` 在 O0–O3 下校验 ELF/PE 产物、`.asm`/`.lst` 输出以及 EOF 语义。
 - `tests/cases/*.bf` 为测试用例文件，而非 Rust 源文件；需保持 `.bf`、`.in`、`.out` 和 `.md` 的命名一致。
+
+## 基准测试
+
+- `benches/compile_levels.rs` 负责 `tests/cases/*.bf` 的编译 + 运行耗时总表（自定义 harness，不依赖 Criterion）。
+- `benches/standard_suite.rs` 负责 matslina BF 程序的解释/执行耗时（基于 Criterion）。
+- 两者均为开发者本地运行；CI 仅执行 `cargo test`。
 
 ## 文档
 

@@ -317,7 +317,65 @@ Test categories:
 * `cases_pipeline.rs`: interpreter vs compiler output validation
 * `bfsc_pipeline.rs`: BFS compiler end-to-end — `.bfs` → `bfsc` → `AmazingBF` → compare `.out`
 * `windows_target.rs`: PE64 structure and cross-compilation
-* `compile_pipeline.rs`: slower compile benchmarks (`#[ignore]`)
+* `compile_artifacts.rs`: ELF/PE artifact validity, `.asm`/`.lst` emission, and EOF semantics across O0–O3
+
+---
+
+## Benchmarks
+
+Two benchmark harnesses live under `benches/`; both are developer-local (CI runs `cargo test` only).
+
+### `compile_levels` (compile + run timings, 9 cases)
+
+Custom-main harness (no Criterion). For each `tests/cases/*.bf` × `-O0..3`, runs `TRIALS = 10` compile-then-run cycles, printing per-case mean/min/max compile ms and run ms plus a grand-total table summing per-case means for every opt level. On Unix the first trial per cell also captures max RSS via `/usr/bin/time`. Artifact correctness (ELF/PE, `.asm`/`.lst`, EOF stdout) is **not** re-validated here — that's the job of `tests/compile_artifacts.rs`.
+
+Run it:
+
+```bash
+cargo bench --bench compile_levels
+```
+
+Reference totals — **sum of per-case mean times** in milliseconds (compile time rises with optimization; run time usually drops). Recorded on an Intel Core i9-14900K; treat as indicative only.
+
+**Linux (`x86_64-linux`):**
+
+```text
+=== TOTALS (sum of per-case mean times over 9 cases) ===
+lvl      sum_compile_mean_ms        sum_run_mean_ms
+O0                  3429.332                918.855
+O1                  3484.395                 88.178
+O2                  3799.838                 87.838
+O3                  3809.176                 85.724
+ALL_O              14522.741               1180.596
+```
+
+**Windows (`x86_64-windows`):**
+
+```text
+=== TOTALS (sum of per-case mean times over 9 cases) ===
+lvl      sum_compile_mean_ms        sum_run_mean_ms
+O0                  4412.682               1151.832
+O1                  4440.346                223.700
+O2                  4789.201                193.640
+O3                  4770.761                194.311
+ALL_O              18412.990               1763.483
+```
+
+### `standard_suite` (runtime across opt levels, matslina BF programs)
+
+Criterion harness that benchmarks interpretation and native-compiled execution on a curated set of canonical BF programs (`long`, `dbfi`, `factor`, `mandelbrot`, `hanoi`) under O0–O3 where tractable.
+
+```bash
+cargo bench --bench standard_suite
+```
+
+Criterion baseline workflow (save a baseline before a change, compare after):
+
+```bash
+cargo bench --bench standard_suite -- --save-baseline main
+# ... make changes ...
+cargo bench --bench standard_suite -- --baseline main
+```
 
 ---
 
@@ -360,40 +418,6 @@ Offset    Hex                                          Assembly
           0f 05                                        syscall
 
 ; total 130 bytes machine code
-```
-
-### Reference timings (`compile_pipeline`, 9 cases)
-
-Each table is the **sum of per-case mean times** in milliseconds (compile time rises with optimization; run time usually drops). Recorded on an Intel Core i9-14900K; treat as indicative only.
-
-**Linux (`x86_64-linux`):**
-
-```text
-=== TOTALS (sum of per-case mean times over 9 cases) ===
-lvl      sum_compile_mean_ms        sum_run_mean_ms
-O0                  3429.332                918.855
-O1                  3484.395                 88.178
-O2                  3799.838                 87.838
-O3                  3809.176                 85.724
-ALL_O              14522.741               1180.596
-```
-
-**Windows (`x86_64-windows`):**
-
-```text
-=== TOTALS (sum of per-case mean times over 9 cases) ===
-lvl      sum_compile_mean_ms        sum_run_mean_ms
-O0                  4412.682               1151.832
-O1                  4440.346                223.700
-O2                  4789.201                193.640
-O3                  4770.761                194.311
-ALL_O              18412.990               1763.483
-```
-
-Approximate reproduction:
-
-```bash
-cargo test --test compile_pipeline -- --ignored --nocapture
 ```
 
 ---

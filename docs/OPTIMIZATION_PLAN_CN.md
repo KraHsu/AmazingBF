@@ -36,7 +36,7 @@
 
 - 单层 `match` 派发（`engine.rs:66-132`），无 threaded dispatch / 无超级指令
 - `Tape` 用 `Vec<u8>` 左右拼接（`tape.rs:34-209`），`Vec::resize` 同步增长；**与 `CLAUDE.md` 所述 “mmap + doubling” 不一致**
-- 仅 `tests/compile_pipeline.rs`（`#[ignore]`）一个宏观 benchmark；**无 criterion、无微基准**
+- 基准基础设施（E5）已落地：`benches/standard_suite.rs`（Criterion，matslina 套件的解释/执行）与 `benches/compile_levels.rs`（自定义 harness，`tests/cases/*.bf` 的编译+运行耗时总表）。`tests/compile_artifacts.rs` 仅做产物正确性校验
 
 ---
 
@@ -166,7 +166,7 @@ Phase F 全部不在近期依赖图内。
 | Backend | `src/backend/x86_64/elf.rs`, `src/backend/x86_64/windows.rs` | D3 buffered I/O |
 | Runtime | `src/interp/engine.rs`, `src/runtime/{tape,io,host}.rs` | Phase E |
 | Bench | `benches/`（新） | E5 |
-| Tests | `tests/cases_pipeline.rs`, `tests/compile_pipeline.rs` | 每阶段新增 pass 后回归 |
+| Tests | `tests/cases_pipeline.rs`, `tests/compile_artifacts.rs` | 每阶段新增 pass 后回归 |
 
 ---
 
@@ -175,7 +175,7 @@ Phase F 全部不在近期依赖图内。
 - 每个 TODO 合入前：`cargo test && cargo clippy --all-targets -- -D warnings && cargo fmt --check`
 - 正确性回归：`tests/cases_pipeline.rs`、`tests/bfsc_pipeline.rs`、`tests/windows_target.rs` 全绿
 - 性能回归：E5 落地后，每个 Phase B / C / D pass 均需提交 criterion 对比（factor / mandelbrot / hanoi / dbfi / long / awib-0.4 基准集，解释和编译各一组）
-- 慢基准：`cargo test --test compile_pipeline -- --ignored --nocapture` 对比 pre / post
+- 慢基准：`cargo bench --bench compile_levels` 对比 pre / post
 - 二进制大小：对 D1 / D2 记录编译产物 `.text` 字节数变化
 
 ---

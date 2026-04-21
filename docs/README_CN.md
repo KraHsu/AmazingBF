@@ -316,7 +316,65 @@ cargo test
 * `cases_pipeline.rs`：解释器与编译器输出对照
 * `bfsc_pipeline.rs`：BFS 编译器端到端测试——`.bfs` → `bfsc` → `AmazingBF` → 与 `.out` 比对
 * `windows_target.rs`：PE64 结构与交叉编译
-* `compile_pipeline.rs`：较慢的编译基准（`#[ignore]`）
+* `compile_artifacts.rs`：O0–O3 下 ELF/PE 产物的合法性、`.asm`/`.lst` 输出以及 EOF 语义
+
+---
+
+## 基准测试
+
+`benches/` 下提供两套基准，均为开发者本地使用（CI 仅执行 `cargo test`）。
+
+### `compile_levels`（编译 + 运行耗时，9 个用例）
+
+自定义 `main` 入口（不使用 Criterion）。针对 `tests/cases/*.bf` × `-O0..3` 的每个组合做 `TRIALS = 10` 轮「先编译、后运行」循环，打印每个用例的 compile ms / run ms 均值/最小/最大，并在末尾给出每个优化级别下「每个用例均值之和」的总表。在 Unix 上，每组合的首轮还会通过 `/usr/bin/time` 采集 max RSS。**不再重复校验** ELF/PE / `.asm` / `.lst` / EOF 正确性——该部分已交由 `tests/compile_artifacts.rs` 负责。
+
+运行：
+
+```bash
+cargo bench --bench compile_levels
+```
+
+参考总表——**每个用例平均耗时的总和**（毫秒）：编译时间通常随级别上升，运行时间往往下降。数据在 Intel Core i9-14900K 上采集，仅供参考。
+
+**Linux（`x86_64-linux`）：**
+
+```text
+=== TOTALS (sum of per-case mean times over 9 cases) ===
+lvl      sum_compile_mean_ms        sum_run_mean_ms
+O0                  3429.332                918.855
+O1                  3484.395                 88.178
+O2                  3799.838                 87.838
+O3                  3809.176                 85.724
+ALL_O              14522.741               1180.596
+```
+
+**Windows（`x86_64-windows`）：**
+
+```text
+=== TOTALS (sum of per-case mean times over 9 cases) ===
+lvl      sum_compile_mean_ms        sum_run_mean_ms
+O0                  4412.682               1151.832
+O1                  4440.346                223.700
+O2                  4789.201                193.640
+O3                  4770.761                194.311
+ALL_O              18412.990               1763.483
+```
+
+### `standard_suite`（跨优化级别的运行时基准，matslina BF 程序）
+
+基于 Criterion 的基准，覆盖 `long`、`dbfi`、`factor`、`mandelbrot`、`hanoi` 等 matslina 经典 BF 程序在可行的 O0–O3 下解释与原生编译执行两条路径。
+
+```bash
+cargo bench --bench standard_suite
+```
+
+Criterion 基线对比（修改前先保存基线，修改后再对比）：
+
+```bash
+cargo bench --bench standard_suite -- --save-baseline main
+# ... 修改代码 ...
+cargo bench --bench standard_suite -- --baseline main
+```
 
 ---
 
@@ -359,40 +417,6 @@ Offset    Hex                                          Assembly
           0f 05                                        syscall                      ; exit(0)
 
 ; 总计 130 字节机器码
-```
-
-### 参考耗时（`compile_pipeline`，9 个用例）
-
-下表为各优化级别下 **每个用例平均耗时的总和**（毫秒）：编译时间通常随级别上升，运行时间往往下降。数据在 Intel Core i9-14900K 上采集，仅供参考。
-
-**Linux（`x86_64-linux`）：**
-
-```text
-=== TOTALS (sum of per-case mean times over 9 cases) ===
-lvl      sum_compile_mean_ms        sum_run_mean_ms
-O0                  3429.332                918.855
-O1                  3484.395                 88.178
-O2                  3799.838                 87.838
-O3                  3809.176                 85.724
-ALL_O              14522.741               1180.596
-```
-
-**Windows（`x86_64-windows`）：**
-
-```text
-=== TOTALS (sum of per-case mean times over 9 cases) ===
-lvl      sum_compile_mean_ms        sum_run_mean_ms
-O0                  4412.682               1151.832
-O1                  4440.346                223.700
-O2                  4789.201                193.640
-O3                  4770.761                194.311
-ALL_O              18412.990               1763.483
-```
-
-可用下列命令复现：
-
-```bash
-cargo test --test compile_pipeline -- --ignored --nocapture
 ```
 
 ---
