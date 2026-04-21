@@ -44,6 +44,22 @@ pub(crate) enum LirInst {
     /// Overwrite the current cell with an immediate value.
     CellSet(u8),
 
+    /// Add `delta` (mod 256) to the cell at `data_ptr + off`.
+    ///
+    /// Produced by the `lir_postpone` pass (B4 / C3). `off` is the signed
+    /// displacement from the current `data_ptr`; the pass guarantees
+    /// `off ∈ [-127, 127]` so codegen can always use a single-byte
+    /// displacement. `off == 0` is canonicalised to `CellAdd(delta)` by the
+    /// pass so the short `inc`/`dec` forms stay reachable.
+    CellAddAt { off: isize, delta: i32 },
+
+    /// Overwrite the cell at `data_ptr + off` with `val`.
+    ///
+    /// Produced by the `lir_postpone` pass (B4 / C3) with the same `off`
+    /// range guarantee as [`LirInst::CellAddAt`]. `off == 0` is
+    /// canonicalised to `CellSet(val)` by the pass.
+    CellSetAt { off: isize, val: u8 },
+
     /// Same semantics as [`crate::ir::hir::HirInst::LinearMul`].
     LinearMul(Vec<(isize, i32)>),
 

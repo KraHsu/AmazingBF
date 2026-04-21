@@ -4,7 +4,7 @@
 
 > 范围：HIR 层 analysis + passes、LIR 层 peephole 新层、Backend/codegen、Interpreter + runtime，加一节长期目标。
 > 原则：向后兼容 O0–O3 CLI 语义；保持 `#![forbid(unsafe_code)]`；保持 `std`-only；分层边界不跨越。
-> 英文版暂缺；按 `CLAUDE.md` 的双语规则，在任一 TODO 实际进入实施时再补 `docs/OPTIMIZATION_PLAN.md`。
+> 双语：英文同伴版位于 `docs/OPTIMIZATION_PLAN.md`，与本文件同步更新。
 
 ---
 
@@ -14,10 +14,10 @@
 
 - HIR 变体：`Move(isize)` / `Add(i32)` / `PutByte` / `GetByte` / `Zero` / `LinearMul(Vec<(isize,i32)>)` / `Loop(Vec<HirInst>)`
 - **O0** `optimize_o0`（`optimize.rs:38-42`）：相邻 `Move/Add` 融合，单次遍历
-- **O1** `optimize_o1`（`optimize.rs:46-49`）：O0 融合 + `try_scan_loop` / `is_byte_clear_loop` / `try_linear_loop`（`optimize.rs:136-199`）+ 局部 `ConstEnv`（`optimize.rs:202-254`）+ `push_o1` peephole（`optimize.rs:349-369`）
-- **O2** `try_optimize_o2`（`optimize.rs:60-73`）：对 O1 不动点迭代，4096 上限
+- **O1** `optimize_o1`（`optimize.rs:60-68`）：O0 融合 + `try_scan_loop` / `is_byte_clear_loop` / `try_linear_loop`（`optimize.rs:151-197`）+ 基于 A1 `TapeState` 的常量传播（`optimize.rs:219-307`）+ `push_o1` peephole（`optimize.rs:309-329`）+ **B1 DSE**（`src/ir/dse.rs`）串联在管线末端
+- **O2** `try_optimize_o2`（`optimize.rs:74-87`）：对 O1 不动点迭代（含 DSE），4096 上限
 - **O3**：不是独立 HIR pass，在 `src/driver/run.rs:138-176` 做整程序折叠（无 `PutByte` → `exit(0)`；无 `GetByte` → 离线跑完再 `write + exit`）
-- **分析基础设施**：仅 O1 的 `ConstEnv`（同一 block 内绝对 tape 索引上已知字节值），**无 SSA**、**无 dataflow**、**无 range / liveness**
+- **分析基础设施**：`src/ir/analysis/` 下的 A1 `TapeState` / A2 `LoopEffect` / A3 `CellLattice` 四点格 / A4 `run_forward` forward dataflow 骨架全部落地（57 单元测试覆盖）。A1+A3 已接入 O1 的常量传播（A3 的 `add_wrapping` 驱动 `TapeState::apply` 的 `Add` 分支）；A2 / A4 仍是待接入的基础设施，等待后续 B2 / B3 / B5 等消费者
 
 ### 1.2 LIR 层（`src/ir/lir.rs`, `src/ir/lower.rs`）
 
@@ -46,38 +46,29 @@
 
 ### Phase A — 分析基础设施（其它大部分 pass 的前提）
 
-- **A1 符号 tape 状态**：为 HIR 引入 per-block 的符号 tape 状态，以 block 入口 `data_ptr` 为原点，记录每个已访问偏移上的 (known value, taint) 和 pointer 当前偏移。支持 `merge` 和 `clobber`（I/O、未分析的 `Loop` 触发）。扩展 O1 的 `ConstEnv` 而非替换。
-  - 关键文件：`src/ir/optimize.rs`；新建 `src/ir/analysis/`
-- **A2 Pointer-delta 抽象解释**：对任意 HIR 片段计算 `(min_off, max_off, net_delta)`。产出：
-  ```rust
-  struct LoopEffect {
-      net_ptr_delta: Option<isize>,
-      touched: Range<isize>,
-      reads_cell: bool,
-      writes_cell: bool,
-      has_io: bool,
-  }
-  ```
-  `LinearMul` 的识别条件可以用它重写得更通用。
-- **A3 Cell 值抽象格**：每格 `Top | Const(u8) | NonZero | Zero`。A1 的 tape 状态升级为该格上的映射，为 DSE 和 known-zero loop 消除提供支撑。
-- **A4 跨 block dataflow 框架**：forward data-flow 的通用骨架（worklist + transfer function）；`Loop` 将 block 作为 join 点。首个客户是 live-cell 分析。
+- **A1 符号 tape 状态** · **[已实现]**：`src/ir/analysis/tape_state.rs` 的 `TapeState` 以 block 入口 `data_ptr` 为原点，`BTreeMap<isize, CellLattice>` 记录每个已访问偏移上的格值与当前 ptr 偏移，含 `merge_in_place`（ptr 不一致退化为 pessimistic）、`clobber_all`（I/O 之外的 `Loop` / `Scan` / `LinearMul` 触发）。已接入 O1 的 `optimize_block_o1_with_parent_env`，通过 `ConstPropXfer: Transfer<TapeState>` 驱动符号执行。
+- **A2 Pointer-delta 抽象解释** · **[已实现]**：`src/ir/analysis/loop_effect.rs` 的 `LoopEffect::analyze` 产出 `{ net_ptr_delta, touched, reads_cell, writes_cell, has_io }`，辅以 `pointer_delta_range` 计算 `(min_off, max_off, net_delta)`。目前作为骨架，`try_linear_loop` 尚未迁移到它上面（B3 会接入）。
+- **A3 Cell 值抽象格** · **[已实现]**：`src/ir/analysis/lattice.rs` 的 `CellLattice { Top, NonZero, Zero, Const(u8) }` 提供 `meet` / `add_wrapping` / `is_zero` / `is_nonzero` / `known_u8`。`TapeState::apply` 的 `Add(k)` 分支改为 `current.add_wrapping(k)`，把转移从 "literal-equivalence" 升级到真正的格语义；`NonZero` 在 `merge_in_place` 产生的 cross-block 事实中得以保留。
+- **A4 跨 block dataflow 框架** · **[已实现]**：`src/ir/analysis/dataflow.rs` 提供 `Fact` / `Transfer` 两个 trait 与 `run_forward` 驱动；`transfer_loop` 以 64 iters 为上限做格上的不动点迭代，fail-safe 退回 `Fact::bottom()`。对 `Option<TapeState>` 与 `TapeState` 两种 Fact 的实现到位。目前 `run_forward` 仅在单测中使用，首个正式消费者（live-cell 分析，为 B5 LICM 铺路）待后续 phase 接入。
 
-**依赖：A1 → A2 → A3 → A4。**
+**依赖：A1 → A2 → A3 → A4 均已就绪，Phase B 可展开。**
 
 ### Phase B — HIR pass 扩充（依赖 Phase A）
 
-- **B1 Dead store elimination**：基于 A3 + A4 的 live-cell 分析，消除后续被覆盖、中间没有读的 `Add` / `Zero`。当前 `push_o1` 只处理连续 `Add, Zero` 对。
+- **B1 Dead store elimination** · **[已实现]**：`src/ir/dse.rs` 的 `dead_store_elimination` 做前向句法重写——虚拟指针 + `BTreeMap<isize, usize>` pending 写集。某 offset 的写被后续同 offset 写覆盖且中间无读时丢弃前者。`Loop` / `Scan` / `LinearMul` 作为 barrier 清空 pending 并递归进入 `Loop` body；`PutByte` / `Add` 提交（读到）前写，`GetByte` / `Zero` 无条件覆盖前写，`GetByte` 本身不可丢（输入副作用）。覆盖 `push_o1` 错过的 Move 间隔、GetByte 覆盖两类场景。串联在 `optimize_o1` 末端，O2 不动点循环自动受益。最终实现纯句法，不消费 A4 `run_forward`（A3 `CellLattice` 留给后续 B2 / B5 的 cross-block 变体使用）。
+  - 文件：`src/ir/dse.rs`；集成点 `src/ir/optimize.rs:optimize_o1`
 - **B2 已知零格循环消除的跨 block 扩展**：O1 只在 block 入口 `ConstEnv` 做；A3 允许在 `Loop` 边界识别 `value_at_ptr == Zero` 并整块丢弃。
 - **B3 LinearMul 泛化**：当前 `try_linear_loop`（`optimize.rs:136-168`）要求 net pointer delta 为 0 且头格 `-1`。借助 A2 放宽到：
   - 头格 `-k` 且 `gcd(k, 256) == 1`（仍保证终止）
   - 嵌套 `LinearMul` 体可在外层被识别（当前 body 含 `Loop` 立刻放弃）
   - 提供 `LinearMul` 的 fused copy 形式（因子仅 ±1 的列）
-- **B4 Pointer postponement（指针延后 / 偏移化）**：业界标准命名（[Nayuki](https://www.nayuki.io/page/optimizing-brainfuck-compiler)、[matslina](https://github.com/matslina/bfoptimization) 称 “operation offsets”，bfc 称 “postponing movements”）。对任一 straight-line block（无 `Loop` / 无 I/O），以入口 `data_ptr` 为原点跟踪 virtual offset，把 `Move(d1); Add(k); Move(d2); Add(j); ...` 重写为按偏移聚合的读写，仅在 block 出口 / 进入 loop / 进入 I/O 前提交一次实 `Move`。这是后续 C3 displacement 形式的真正前提，也严格包含旧 “balanced-pointer canonicalization” 思路。可能需要新增 HIR 变体 `AddAt { off, delta }` / `SetAt { off, val }`，或将职责推迟到 LIR（见 C3）。
+- **B4 Pointer postponement（指针延后 / 偏移化）** · **[已实现]**：业界标准命名（[Nayuki](https://www.nayuki.io/page/optimizing-brainfuck-compiler)、[matslina](https://github.com/matslina/bfoptimization) 称 “operation offsets”，bfc 称 “postponing movements”）。最终落实为 LIR-only 方案（不新增 HIR 变体，避免污染 HIR interpreter 与现有 pattern detector）：`src/ir/lir_postpone.rs` 的 `postpone_pointer_adds` 按 straight-line window 累积 `virt_ptr: isize` 与 `pending: BTreeMap<isize, PendingOp>`，遇到 barrier（`Label` / `JumpIfZero` / `JumpIfNonZero` / `Scan` / `LinearMul` / `PutByte` / `GetByte` 以及上一次 pass 残留的 `CellAddAt` / `CellSetAt`）或 `virt_ptr` 要越 disp8 边界时触发 flush；flush 前按 `(lo, hi)` 两极发探针 `PtrAdd`，由后端的 `ensure_tape_contains_r15` 对接 tape 倍增，利用 tape 映射的连续性保证窗口内所有偏移都已被 bounds check。disp 范围限定在 `[-127, 127]`（disp32 推迟到 C2 落地后放宽）。挂在 `-O1` 及以上的 `optimize_lir(lower_to_lir(hir))` 之前。
+  - 文件：`src/ir/lir_postpone.rs`（18 单测含安全证明）；集成点 `src/driver/run.rs:build_optimized_lir`
 - **B5 Loop-invariant code motion**：A3 识别被 loop 读但不被改写的 cell；将其 loop-pre 赋值保留在 loop 外，避免反复 reload。BF 上实用性偏弱，但 SSA-化后几乎免费。
 - **B6 小 loop 展开**：进入 loop 时头格值已知（A3）且 body 为 affine 时，编译期直接计算 `Add` / `Zero` 序列，不必生成 `LinearMul`。
 - **B7 Deep balanced loop（K6 算法，选配）**：[Oizys](https://github.com/jjcmoon/Oizys) 提出的 K6 算法对嵌套 balanced loop 做统一分析，覆盖 `try_linear_loop` + `try_scan_loop` 无法触达的程序类。作为 B3 / B4 稳定后的研究性扩展。
 
-**依赖：B1–B3 直接依赖 A；B4 是 C3 的前置；B5 / B6 可并行；B7 依赖 B3 + B4 + A2。**
+**依赖：B1 已落地（句法形式）；B2 / B3 直接依赖 A；B4 是 C3 的前置；B5 / B6 可并行；B7 依赖 B3 + B4 + A2。**
 
 ### Phase C — LIR peephole 新层
 
@@ -85,7 +76,8 @@
 
 - **C1 LIR peephole 基础 pass** · **[已实现]**：合并相邻 `PtrAdd`、消除零 delta、折叠 `CellSet(0); CellAdd(k)` → `CellSet(k)`、`CellSet(a); CellSet(b)` → `CellSet(b)`。落地在 `src/ir/lir_opt.rs`，挂在 `lower_to_lir` 之后；`Label` / `JumpIfZero` / `JumpIfNonZero` / `Scan` / `LinearMul` / `PutByte` / `GetByte` 作为自然 barrier。
 - **C2 Bounds-check hoisting / batching**：连续 `PtrAdd` 只在总 delta 的极值上做一次 bounds check（当前每个 `PtrAdd` 独立检查，`codegen.rs:78-107`）。需要向后端传递 “已检查区间” 标记，考虑在 LIR 引入 `PtrAddChecked { delta, lo_extent, hi_extent }` 或新 op。
-- **C3 Displacement 形式下降**：B4 的 pointer postponement 输出的 `AddAt { off, delta }` / `SetAt` 直接降到 LIR 的 `CellAddAt { off, delta }` / `CellSetAt { off, val }`，后端发 `add byte [r13 + disp8], imm` / `mov byte [r13 + disp], imm`，省一次指针更新和一次 bounds check。x86_64 disp8 范围 ±127 恰好覆盖绝大多数 straight-line block 的偏移跨度；超出用 disp32。
+- **C3 Displacement 形式下降** · **[已实现]**：`LirInst::CellAddAt { off, delta }` / `CellSetAt { off, val }` 两个新变体（`src/ir/lir.rs`）承载 B4 flush 产物；后端在 `src/backend/codegen.rs` 将其翻译为 `AsmInst::AddMem8ImmDisp8` / `MovMem8ImmDisp8`（`src/backend/asm.rs`），编码由 `src/backend/x86_64/encode.rs` 的 `emit_mem8_disp8` 发出 `add byte [r13 + disp8], imm8` / `mov byte [r13 + disp8], imm8`（ModRM mod=01，以 R13 为基址时 `(rm & 7) == 5` 避开 SIB 歧义，对应机器码 `49 80 45 <disp> <imm>` / `49 C6 45 <disp> <imm>`）。`off == 0` 在 codegen 中 `debug_assert!` 已被 B4 canonicalise 回 `CellAdd` / `CellSet`（保留 D1 的 inc/dec 短形）；disp 通过 `i8::try_from` 断言 ∈ `[-128, 127]`。disp32 推迟到 C2 落地——原因：超 disp8 的偏移必须配合区间 bounds-check，否则 `ensure_tape_contains_r15` 的单点语义被打破。LIR peephole (`src/ir/lir_opt.rs`) 扩展了 4 条同 offset 折叠规则（`CellAddAt;CellAddAt`、`CellSetAt;CellAddAt`、`CellSetAt;CellSetAt`、`CellAddAt;CellSetAt`），跨 offset 不合并。
+  - 文件：`src/ir/lir.rs`、`src/backend/asm.rs`、`src/backend/x86_64/encode.rs`、`src/backend/codegen.rs`、`src/ir/lir_opt.rs`
 - **C4 Scan / Zero 传递 size 提示**：让后端知道某个 `Scan` 之前的 tape 区段是否已检查过 bound，决定是否内联边界检查。
 
 **依赖：C1 独立；C2 依赖 A2 的 range；C3 依赖 B4；C4 依赖 C2。**
@@ -135,18 +127,18 @@ E5 (bench)  ──────────────────────�
                                               ▼
 A1 → A2 → A3 → A4                        （回归衡量）
   │    │    │    │
-  │    │    │    └→ B1 (DSE)
+  │    │    │    └→ B1 (DSE) ✓
   │    │    └→ B2 (zero-loop), B5 (LICM), B6 (unroll)
-  │    └→ B3 (LinearMul 泛化), B4 (pointer postponement), B7 (K6)
+  │    └→ B3 (LinearMul 泛化), B4 (pointer postponement) ✓, B7 (K6)
   │         │
-  │         └→ C3 (displacement) → D2 / D4
+  │         └→ C3 (displacement) ✓ → D2 / D4
   │
   └→ C2 (bounds batching) → D2 (SIMD)
 
 C1 (LIR peephole)、D1 (指令选择)、D3 (buffered I/O)、
 E1 / E2 (superinstruction + threaded dispatch)、
 E3 (SIMD tape)、E4 (tape 倍增) 均可并行启动。
-已落地：E5、C1、D1、E4。
+已落地：E5、C1、D1、E4、Phase A (A1–A4)、B1、B4、C3。
 
 Phase F 全部不在近期依赖图内。
 ```
@@ -159,7 +151,8 @@ Phase F 全部不在近期依赖图内。
 |---|---|---|
 | HIR | `src/ir/hir.rs` | B3 / B4 若需新变体 |
 | HIR | `src/ir/optimize.rs` | Phase A / B 主修改点 |
-| HIR | `src/ir/analysis/`（新） | A1–A4 骨架 |
+| HIR | `src/ir/analysis/` | A1–A4 骨架（已落地） |
+| HIR | `src/ir/dse.rs` | B1 DSE（已落地） |
 | LIR | `src/ir/lir.rs`, `src/ir/lower.rs` | B / C 可能新增 `PtrAddChecked` / `CellAddAt` |
 | LIR | `src/ir/lir_opt.rs`（新） | Phase C 主场 |
 | Backend | `src/backend/codegen.rs`, `src/backend/x86_64/encode.rs`, `src/backend/asm.rs` | Phase D |

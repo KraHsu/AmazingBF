@@ -289,6 +289,32 @@ fn format_inst_asm(out: &mut String, inst: &AsmInst) {
             writeln!(out, "    mov     byte [{}], 0x{:02x}", reg_name(*reg), imm).unwrap();
         }
 
+        AsmInst::AddMem8ImmDisp8(reg, disp, imm) => {
+            // B4/C3 displacement add: `add byte [reg + disp], imm`.
+            writeln!(
+                out,
+                "    add     byte [{}{}{}], 0x{:02x}",
+                reg_name(*reg),
+                if *disp < 0 { " - " } else { " + " },
+                format_signed_hex_i32(i32::from(disp.abs())),
+                *imm as u8
+            )
+            .unwrap();
+        }
+
+        AsmInst::MovMem8ImmDisp8(reg, disp, imm) => {
+            // B4/C3 displacement set: `mov byte [reg + disp], imm`.
+            writeln!(
+                out,
+                "    mov     byte [{}{}{}], 0x{:02x}",
+                reg_name(*reg),
+                if *disp < 0 { " - " } else { " + " },
+                format_signed_hex_i32(i32::from(disp.abs())),
+                imm
+            )
+            .unwrap();
+        }
+
         AsmInst::CmpMem8Imm8(reg, imm) => {
             // Zero check used by BF `[` / `]`.
             writeln!(out, "    cmp     byte [{}], 0x{:02x}", reg_name(*reg), imm).unwrap();

@@ -26,7 +26,9 @@ use crate::driver::config::{
 use crate::driver::pipeline::build_frontend;
 use crate::interp::engine::Interpreter;
 use crate::ir::hir::HirProgram;
+use crate::ir::lir::LirProgram;
 use crate::ir::lir_opt::optimize_lir;
+use crate::ir::lir_postpone::postpone_pointer_adds;
 use crate::ir::lower::lower_to_lir;
 use crate::logging::{log_debug, log_info};
 use crate::runtime::host::NullHost;
@@ -47,7 +49,7 @@ pub(crate) fn run(config: DriverConfig) -> Result<()> {
     match config.mode {
         RunMode::Interpret => run_interpret(&config, &frontend.hir)?,
         RunMode::Compile => run_compile(&config, &frontend.hir)?,
-        RunMode::Dump => run_dump(&frontend.hir),
+        RunMode::Dump => run_dump(&frontend.hir, config.opt_level),
     }
 
     log_info("pipeline finished");
@@ -121,8 +123,8 @@ fn run_compile(config: &DriverConfig, hir: &HirProgram) -> Result<()> {
     Ok(())
 }
 
-fn run_dump(hir: &HirProgram) {
-    let lir = optimize_lir(lower_to_lir(hir));
+fn run_dump(hir: &HirProgram, opt_level: OptLevel) {
+    let lir = build_optimized_lir(hir, opt_level);
     log_debug(format!("lowered lir (lir_insts={})", lir.len()));
     let asm = compile_lir_to_asm(&lir);
     log_debug(format!(
@@ -153,7 +155,7 @@ fn compile_linux_asm(hir: &HirProgram, opt_level: OptLevel) -> Result<AsmProgram
         }
     }
 
-    let lir = optimize_lir(lower_to_lir(hir));
+    let lir = build_optimized_lir(hir, opt_level);
     log_debug(format!("lowered lir (lir_insts={})", lir.len()));
     Ok(compile_lir_to_asm(&lir))
 }
@@ -173,7 +175,22 @@ fn compile_windows_program(hir: &HirProgram, opt_level: OptLevel) -> Result<Wind
         }
     }
 
-    let lir = optimize_lir(lower_to_lir(hir));
+    let lir = build_optimized_lir(hir, opt_level);
     log_debug(format!("lowered lir (lir_insts={})", lir.len()));
     Ok(compile_lir_to_windows_program(&lir))
+}
+
+/// Lower HIR to LIR and run the LIR-level passes.
+///
+/// At `-O0` the pipeline stays a mechanical 1:1 lowering plus the basic
+/// peephole fold (`PtrAdd` / `CellAdd` adjacency). From `-O1` onwards
+/// [`postpone_pointer_adds`] runs before the peephole to expose
+/// displacement-form writes for x86_64 codegen.
+fn build_optimized_lir(hir: &HirProgram, opt_level: OptLevel) -> LirProgram {
+    let lowered = lower_to_lir(hir);
+    if opt_level == OptLevel::O0 {
+        optimize_lir(lowered)
+    } else {
+        optimize_lir(postpone_pointer_adds(lowered))
+    }
 }

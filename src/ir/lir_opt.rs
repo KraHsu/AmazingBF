@@ -18,6 +18,14 @@
 //! 3. `CellSet(v); CellAdd(k)` → `CellSet((v+k) mod 256)`
 //! 4. `CellSet(_); CellSet(b)` → `CellSet(b)` (first write is dead)
 //! 5. `CellAdd(_); CellSet(v)` → `CellSet(v)` (first update is dead)
+//!
+//! The displacement-form writes produced by [`crate::ir::lir_postpone`] share
+//! the same rules **when both touch the same offset**; cross-offset pairs
+//! never fold (they target independent cells):
+//! 6. `CellAddAt(off, a); CellAddAt(off, b)` → `CellAddAt(off, a+b)`
+//! 7. `CellSetAt(off, v); CellAddAt(off, k)` → `CellSetAt(off, (v+k) mod 256)`
+//! 8. `CellSetAt(off, _); CellSetAt(off, b)` → `CellSetAt(off, b)`
+//! 9. `CellAddAt(off, _); CellSetAt(off, v)` → `CellSetAt(off, v)`
 
 use crate::ir::lir::{LirInst, LirProgram};
 
@@ -68,6 +76,40 @@ fn fold_push(out: &mut Vec<LirInst>, incoming: LirInst) {
         }
         (Some(LirInst::CellAdd(_)), LirInst::CellSet(v)) => {
             FoldOutcome::Replace(LirInst::CellSet(*v))
+        }
+        (
+            Some(LirInst::CellAddAt { off: o1, delta: a }),
+            LirInst::CellAddAt { off: o2, delta: b },
+        ) if o1 == o2 => {
+            let sum = a.wrapping_add(*b);
+            if sum.rem_euclid(256) == 0 {
+                FoldOutcome::Drop
+            } else {
+                FoldOutcome::Replace(LirInst::CellAddAt {
+                    off: *o1,
+                    delta: sum,
+                })
+            }
+        }
+        (
+            Some(LirInst::CellSetAt { off: o1, val: v }),
+            LirInst::CellAddAt { off: o2, delta: k },
+        ) if o1 == o2 => {
+            let folded = ((*v as i32) + *k).rem_euclid(256) as u8;
+            FoldOutcome::Replace(LirInst::CellSetAt {
+                off: *o1,
+                val: folded,
+            })
+        }
+        (Some(LirInst::CellSetAt { off: o1, .. }), LirInst::CellSetAt { off: o2, val: b })
+            if o1 == o2 =>
+        {
+            FoldOutcome::Replace(LirInst::CellSetAt { off: *o1, val: *b })
+        }
+        (Some(LirInst::CellAddAt { off: o1, .. }), LirInst::CellSetAt { off: o2, val: v })
+            if o1 == o2 =>
+        {
+            FoldOutcome::Replace(LirInst::CellSetAt { off: *o1, val: *v })
         }
         _ => FoldOutcome::Keep,
     };
@@ -246,5 +288,80 @@ mod tests {
     fn singleton_program_passes_through() {
         let out = run(vec![LirInst::CellAdd(3)]);
         assert_eq!(out, vec![LirInst::CellAdd(3)]);
+    }
+
+    #[test]
+    fn fold_cell_add_at_same_offset() {
+        let out = run(vec![
+            LirInst::CellAddAt { off: 3, delta: 1 },
+            LirInst::CellAddAt { off: 3, delta: 2 },
+        ]);
+        assert_eq!(out, vec![LirInst::CellAddAt { off: 3, delta: 3 }]);
+    }
+
+    #[test]
+    fn fold_cell_add_at_same_offset_cancels_mod_256() {
+        let out = run(vec![
+            LirInst::CellAddAt { off: 3, delta: 100 },
+            LirInst::CellAddAt { off: 3, delta: 156 },
+        ]);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn fold_cell_add_at_different_offset_keeps_both() {
+        let out = run(vec![
+            LirInst::CellAddAt { off: 3, delta: 1 },
+            LirInst::CellAddAt { off: 4, delta: 1 },
+        ]);
+        assert_eq!(
+            out,
+            vec![
+                LirInst::CellAddAt { off: 3, delta: 1 },
+                LirInst::CellAddAt { off: 4, delta: 1 },
+            ]
+        );
+    }
+
+    #[test]
+    fn fold_cell_set_at_then_cell_add_at_same_offset() {
+        let out = run(vec![
+            LirInst::CellSetAt { off: 3, val: 5 },
+            LirInst::CellAddAt { off: 3, delta: 10 },
+        ]);
+        assert_eq!(out, vec![LirInst::CellSetAt { off: 3, val: 15 }]);
+    }
+
+    #[test]
+    fn fold_cell_set_at_then_cell_set_at_same_offset_keeps_last() {
+        let out = run(vec![
+            LirInst::CellSetAt { off: 3, val: 5 },
+            LirInst::CellSetAt { off: 3, val: 9 },
+        ]);
+        assert_eq!(out, vec![LirInst::CellSetAt { off: 3, val: 9 }]);
+    }
+
+    #[test]
+    fn fold_cell_add_at_then_cell_set_at_same_offset_keeps_set() {
+        let out = run(vec![
+            LirInst::CellAddAt { off: 3, delta: 7 },
+            LirInst::CellSetAt { off: 3, val: 9 },
+        ]);
+        assert_eq!(out, vec![LirInst::CellSetAt { off: 3, val: 9 }]);
+    }
+
+    #[test]
+    fn fold_cell_set_at_different_offset_keeps_both() {
+        let out = run(vec![
+            LirInst::CellSetAt { off: 3, val: 5 },
+            LirInst::CellSetAt { off: 4, val: 9 },
+        ]);
+        assert_eq!(
+            out,
+            vec![
+                LirInst::CellSetAt { off: 3, val: 5 },
+                LirInst::CellSetAt { off: 4, val: 9 },
+            ]
+        );
     }
 }

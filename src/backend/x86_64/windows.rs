@@ -292,6 +292,27 @@ pub fn compile_lir_to_windows_program(lir: &LirProgram) -> WindowsProgram {
                 }
             }
             LirInst::CellSet(v) => out.push(AsmInst::MovMem8Imm8(Reg64::R13, *v)),
+            LirInst::CellAddAt { off, delta } => {
+                debug_assert!(
+                    *off != 0,
+                    "CellAddAt(off=0) should be canonicalised to CellAdd"
+                );
+                let disp = i8::try_from(*off)
+                    .expect("B4 invariant: CellAddAt offset must fit in i8 (disp8)");
+                let imm = ((*delta % 256) + 256) % 256;
+                if imm != 0 {
+                    out.push(AsmInst::AddMem8ImmDisp8(Reg64::R13, disp, imm as u8 as i8));
+                }
+            }
+            LirInst::CellSetAt { off, val } => {
+                debug_assert!(
+                    *off != 0,
+                    "CellSetAt(off=0) should be canonicalised to CellSet"
+                );
+                let disp = i8::try_from(*off)
+                    .expect("B4 invariant: CellSetAt offset must fit in i8 (disp8)");
+                out.push(AsmInst::MovMem8ImmDisp8(Reg64::R13, disp, *val));
+            }
             LirInst::PutByte => emit_put_byte(
                 &mut out,
                 imports.iat_label(Kernel32Import::WriteFile),

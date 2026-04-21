@@ -449,6 +449,27 @@ fn emit_mem8_disp0(buf: &mut CodeBuffer, opcode: u8, subcode: u8, reg: Reg64, im
     buf.emit_u8(imm);
 }
 
+/// Emit `REX + opcode + ModRM(01, subcode, rm) + disp8 + imm8` — byte ALU /
+/// mov with a signed 8-bit displacement.
+///
+/// Used by the LIR `lir_postpone` pass's displacement forms. Same SIB-free
+/// restriction as [`emit_mem8_disp0`] — the encoder panics if the base
+/// register needs a SIB byte (low three bits == 4). Codegen hard-pins the
+/// base to R13, so this never fires in practice.
+fn emit_mem8_disp8(buf: &mut CodeBuffer, opcode: u8, subcode: u8, reg: Reg64, disp: i8, imm: u8) {
+    let rm = reg_num(reg);
+    assert!(
+        (rm & 7) != 4,
+        "mem8 disp8 encoding requires SIB for register {:?}",
+        reg
+    );
+    emit_rex_w(buf, 0, 0, rm >> 3);
+    buf.emit_u8(opcode);
+    buf.emit_u8(0b01_000_000 | ((subcode & 7) << 3) | (rm & 7));
+    buf.emit_u8(disp as u8);
+    buf.emit_u8(imm);
+}
+
 /// Emit `REX + opcode + ModRM(01, subcode, rm) + disp8(0)` without an
 /// immediate byte.
 ///
@@ -625,6 +646,22 @@ fn encode_inst(buf: &mut CodeBuffer, inst: &AsmInst) {
         // 0xC6 is the opcode for MOV r/m8, imm8.
         AsmInst::MovMem8Imm8(reg, imm) => {
             emit_mem8_disp0(buf, 0xC6, 0, *reg, *imm);
+        }
+
+        // add byte ptr [reg + disp8], imm8.
+        //
+        // Encoding: REX.W + 0x80 + ModRM(01, 0, rm) + disp8 + imm8.
+        // Same byte ALU group / subcode as AddMem8Imm8; only ModRM.disp8
+        // changes. Same SIB-free restriction.
+        AsmInst::AddMem8ImmDisp8(reg, disp, imm) => {
+            emit_mem8_disp8(buf, 0x80, 0, *reg, *disp, *imm as u8);
+        }
+
+        // mov byte ptr [reg + disp8], imm8.
+        //
+        // Encoding: REX.W + 0xC6 + ModRM(01, 0, rm) + disp8 + imm8.
+        AsmInst::MovMem8ImmDisp8(reg, disp, imm) => {
+            emit_mem8_disp8(buf, 0xC6, 0, *reg, *disp, *imm);
         }
 
         // cmp byte ptr [reg+0], imm8.
@@ -876,6 +913,49 @@ mod tests {
         // REX.W + 0x83 /7 + ModRM + imm8 = 4 bytes.
         assert_eq!(encoded.text.len(), 4);
         assert_eq!(encoded.text[1], 0x83);
+    }
+
+    #[test]
+    fn add_mem8_imm_disp8_on_r13_positive_disp() {
+        // add byte [r13 + 5], 3
+        // REX.W|B=0x49, opcode=0x80, ModRM(mod=01 reg=0 rm=5)=0x45,
+        // disp8=0x05, imm8=0x03.
+        let program = AsmProgram {
+            insts: vec![AsmInst::AddMem8ImmDisp8(Reg64::R13, 5, 3)],
+        };
+        let encoded = encode_program(&program);
+        assert_eq!(encoded.text, vec![0x49, 0x80, 0x45, 0x05, 0x03]);
+    }
+
+    #[test]
+    fn add_mem8_imm_disp8_on_r13_negative_disp_sign_extends() {
+        // add byte [r13 - 1], 1
+        // disp8=0xFF (two's complement −1).
+        let program = AsmProgram {
+            insts: vec![AsmInst::AddMem8ImmDisp8(Reg64::R13, -1, 1)],
+        };
+        let encoded = encode_program(&program);
+        assert_eq!(encoded.text, vec![0x49, 0x80, 0x45, 0xFF, 0x01]);
+    }
+
+    #[test]
+    fn mov_mem8_imm_disp8_on_r13_max_positive_disp() {
+        // mov byte [r13 + 127], 0x41
+        // REX.W|B=0x49, opcode=0xC6, ModRM=0x45, disp8=0x7F, imm8=0x41.
+        let program = AsmProgram {
+            insts: vec![AsmInst::MovMem8ImmDisp8(Reg64::R13, 127, 0x41)],
+        };
+        let encoded = encode_program(&program);
+        assert_eq!(encoded.text, vec![0x49, 0xC6, 0x45, 0x7F, 0x41]);
+    }
+
+    #[test]
+    #[should_panic(expected = "mem8 disp8 encoding requires SIB")]
+    fn mem8_disp8_rejects_r12_without_sib_support() {
+        let program = AsmProgram {
+            insts: vec![AsmInst::AddMem8ImmDisp8(Reg64::R12, 1, 1)],
+        };
+        let _ = encode_program(&program);
     }
 
     #[test]

@@ -229,6 +229,22 @@ pub enum AsmInst {
     /// `CellSet(0)`. Same SIB-free restriction as `AddMem8Imm8`.
     MovMem8Imm8(Reg64, u8),
 
+    /// `add byte ptr [reg + disp8], imm8` — add an 8-bit immediate to the
+    /// byte at `reg + signed-disp8`.
+    ///
+    /// Produced by the LIR `lir_postpone` pass (B4 / C3). `disp` is the
+    /// signed 8-bit displacement; `imm` is the signed 8-bit immediate. Same
+    /// SIB-free restriction as [`AsmInst::AddMem8Imm8`] — codegen hard-pins
+    /// the base register to R13.
+    AddMem8ImmDisp8(Reg64, i8, i8),
+
+    /// `mov byte ptr [reg + disp8], imm8` — store an 8-bit immediate at
+    /// `reg + signed-disp8`.
+    ///
+    /// Produced by the LIR `lir_postpone` pass (B4 / C3). Same SIB-free
+    /// restriction as [`AsmInst::MovMem8Imm8`].
+    MovMem8ImmDisp8(Reg64, i8, u8),
+
     /// `cmp byte ptr [reg], imm8` — compare a memory byte with an immediate.
     ///
     /// Used by BF `[` / `]` to decide whether the current cell is zero. Same

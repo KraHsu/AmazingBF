@@ -206,6 +206,38 @@ pub fn compile_lir_to_asm(lir: &LirProgram) -> AsmProgram {
                 out.push(AsmInst::MovMem8Imm8(Reg64::R13, *v));
             }
 
+            // CellAddAt { off, delta }: add imm8 to the cell at [r13 + off].
+            //
+            // Produced only by the `lir_postpone` pass, which guarantees
+            // `off ∈ [-127, 127]` and canonicalises `off == 0` into the
+            // plain `CellAdd` form above (so the inc/dec short form stays
+            // reachable).
+            LirInst::CellAddAt { off, delta } => {
+                debug_assert!(
+                    *off != 0,
+                    "CellAddAt(off=0) should be canonicalised to CellAdd"
+                );
+                let disp = i8::try_from(*off)
+                    .expect("B4 invariant: CellAddAt offset must fit in i8 (disp8)");
+                let imm = ((*delta % 256) + 256) % 256;
+                if imm != 0 {
+                    out.push(AsmInst::AddMem8ImmDisp8(Reg64::R13, disp, imm as u8 as i8));
+                }
+            }
+
+            // CellSetAt { off, val }: store imm8 into the cell at [r13 + off].
+            //
+            // Same off-range invariant as CellAddAt.
+            LirInst::CellSetAt { off, val } => {
+                debug_assert!(
+                    *off != 0,
+                    "CellSetAt(off=0) should be canonicalised to CellSet"
+                );
+                let disp = i8::try_from(*off)
+                    .expect("B4 invariant: CellSetAt offset must fit in i8 (disp8)");
+                out.push(AsmInst::MovMem8ImmDisp8(Reg64::R13, disp, *val));
+            }
+
             // PutByte: emit the current cell (`.`).
             //
             // Linux `sys_write(fd=1, buf=data_ptr, count=1)`.
@@ -681,6 +713,101 @@ mod tests {
         assert!(
             encoded.text.len() > 400,
             "130 output bytes should use disp8 + disp32 mov-to-[rsp+i] encodings"
+        );
+    }
+
+    #[test]
+    fn cell_add_at_emits_disp8_add() {
+        let asm = compile_lir_to_asm(&LirProgram {
+            insts: vec![LirInst::CellAddAt { off: 3, delta: 5 }],
+        });
+        assert!(
+            asm.insts
+                .contains(&AsmInst::AddMem8ImmDisp8(Reg64::R13, 3, 5)),
+            "CellAddAt(3,5) should lower to AddMem8ImmDisp8(R13, 3, 5)"
+        );
+    }
+
+    #[test]
+    fn cell_set_at_emits_disp8_mov() {
+        let asm = compile_lir_to_asm(&LirProgram {
+            insts: vec![LirInst::CellSetAt { off: -4, val: 0x41 }],
+        });
+        assert!(
+            asm.insts
+                .contains(&AsmInst::MovMem8ImmDisp8(Reg64::R13, -4, 0x41)),
+            "CellSetAt(-4, 0x41) should lower to MovMem8ImmDisp8(R13, -4, 0x41)"
+        );
+    }
+
+    #[test]
+    fn cell_add_at_normalises_negative_delta() {
+        let asm = compile_lir_to_asm(&LirProgram {
+            insts: vec![LirInst::CellAddAt { off: 2, delta: -3 }],
+        });
+        // -3 mod 256 == 253 == 0xFD == -3 as i8.
+        assert!(
+            asm.insts
+                .contains(&AsmInst::AddMem8ImmDisp8(Reg64::R13, 2, -3)),
+            "CellAddAt(2,-3) should normalise delta and emit signed 0xFD byte"
+        );
+    }
+
+    #[test]
+    fn cell_add_at_with_zero_delta_emits_nothing() {
+        let asm = compile_lir_to_asm(&LirProgram {
+            insts: vec![LirInst::CellAddAt { off: 3, delta: 256 }],
+        });
+        for inst in &asm.insts {
+            assert!(
+                !matches!(inst, AsmInst::AddMem8ImmDisp8(_, 3, _)),
+                "CellAddAt(3, 256) should produce no disp8 add (imm mod 256 == 0)"
+            );
+        }
+    }
+
+    /// Golden byte-string regression for `>>+<<<+` under the B4 + C3 pipeline.
+    ///
+    /// The mechanical lowering is
+    /// `PtrAdd(2); CellAdd(1); PtrAdd(-3); CellAdd(1)`. After
+    /// [`crate::ir::lir_postpone::postpone_pointer_adds`] the two writes land
+    /// at offsets `-1` and `2` relative to the probed base, so the encoded
+    /// `.text` must contain the two disp8 byte sequences
+    /// `49 80 45 FF 01` and `49 80 45 02 01` (`add byte [r13 - 1], 1` and
+    /// `add byte [r13 + 2], 1`). Catches regressions where either the pass
+    /// forgets to emit displacement writes or the encoder drops the REX byte.
+    #[test]
+    fn postpone_plus_codegen_produces_disp8_add_bytes_for_scattered_writes() {
+        use crate::ir::lir_opt::optimize_lir;
+        use crate::ir::lir_postpone::postpone_pointer_adds;
+
+        let input = LirProgram {
+            insts: vec![
+                LirInst::PtrAdd(2),
+                LirInst::CellAdd(1),
+                LirInst::PtrAdd(-3),
+                LirInst::CellAdd(1),
+            ],
+        };
+        let optimized = optimize_lir(postpone_pointer_adds(input));
+        let asm = compile_lir_to_asm(&optimized);
+        let encoded = crate::backend::x86_64::encode::encode_program(&asm);
+
+        let add_at_neg1: &[u8] = &[0x49, 0x80, 0x45, 0xFF, 0x01];
+        let add_at_pos2: &[u8] = &[0x49, 0x80, 0x45, 0x02, 0x01];
+        assert!(
+            encoded
+                .text
+                .windows(add_at_neg1.len())
+                .any(|w| w == add_at_neg1),
+            "expected disp8 add at [r13 - 1] (49 80 45 FF 01) in encoded .text"
+        );
+        assert!(
+            encoded
+                .text
+                .windows(add_at_pos2.len())
+                .any(|w| w == add_at_pos2),
+            "expected disp8 add at [r13 + 2] (49 80 45 02 01) in encoded .text"
         );
     }
 
