@@ -9,7 +9,21 @@
 
 use std::collections::BTreeMap;
 
+use crate::ir::analysis::dataflow::Transfer;
+use crate::ir::analysis::tape_state::TapeState;
 use crate::ir::hir::{HirInst, HirProgram};
+
+/// Constant-propagation transfer function for the O1 rewrite pass. Thin
+/// wrapper over [`TapeState::apply`] so the pass drives its symbolic
+/// execution through the shared analysis API rather than calling `apply`
+/// directly.
+struct ConstPropXfer;
+
+impl Transfer<TapeState> for ConstPropXfer {
+    fn transfer_inst(&self, fact: &mut TapeState, inst: &HirInst) {
+        fact.apply(inst);
+    }
+}
 
 /// Errors produced by the optimization pipeline.
 #[derive(Debug)]
@@ -198,61 +212,6 @@ fn try_loop_specialize(inner: &[HirInst]) -> Option<HirInst> {
     None
 }
 
-/// Known BF tape cells (byte) at absolute indices; missing ⇒ unknown (not assumed 0).
-struct ConstEnv {
-    ptr: isize,
-    known: BTreeMap<isize, u8>,
-}
-
-impl ConstEnv {
-    fn new_block() -> Self {
-        Self {
-            ptr: 0,
-            known: BTreeMap::new(),
-        }
-    }
-
-    /// Whole-program entry: tape all zeros.
-    fn new_program() -> Self {
-        let mut k = BTreeMap::new();
-        k.insert(0, 0);
-        Self { ptr: 0, known: k }
-    }
-
-    fn value_at_ptr(&self) -> Option<u8> {
-        self.known.get(&self.ptr).copied()
-    }
-
-    fn after_control_flow(&mut self) {
-        self.known.clear();
-    }
-
-    fn apply_inst(&mut self, inst: &HirInst) {
-        match inst {
-            HirInst::Move(d) => self.ptr += *d,
-            HirInst::Add(k) => {
-                if let Some(v) = self.known.get(&self.ptr).copied() {
-                    let next = (v as i32 + k).rem_euclid(256) as u8;
-                    self.known.insert(self.ptr, next);
-                }
-            }
-            HirInst::Zero => {
-                self.known.insert(self.ptr, 0);
-            }
-            HirInst::LinearMul(_) | HirInst::Scan(_) => {
-                self.after_control_flow();
-            }
-            HirInst::GetByte => {
-                self.known.remove(&self.ptr);
-            }
-            HirInst::PutByte => {}
-            HirInst::Loop(_) => {
-                self.after_control_flow();
-            }
-        }
-    }
-}
-
 fn optimize_block_o1(insts: Vec<HirInst>) -> Vec<HirInst> {
     optimize_block_o1_with_parent_env(insts, false)
 }
@@ -260,10 +219,11 @@ fn optimize_block_o1(insts: Vec<HirInst>) -> Vec<HirInst> {
 fn optimize_block_o1_with_parent_env(insts: Vec<HirInst>, nested: bool) -> Vec<HirInst> {
     let insts = fuse_add_move(insts);
     let mut env = if nested {
-        ConstEnv::new_block()
+        TapeState::new_block()
     } else {
-        ConstEnv::new_program()
+        TapeState::new_program()
     };
+    let xfer = ConstPropXfer;
 
     let mut out = Vec::new();
     let mut i = 0;
@@ -285,7 +245,7 @@ fn optimize_block_o1_with_parent_env(insts: Vec<HirInst>, nested: bool) -> Vec<H
 
                 if total != 0 {
                     let inst = HirInst::Add(total);
-                    env.apply_inst(&inst);
+                    xfer.transfer_inst(&mut env, &inst);
                     push_o1(&mut out, inst);
                 }
             }
@@ -305,7 +265,7 @@ fn optimize_block_o1_with_parent_env(insts: Vec<HirInst>, nested: bool) -> Vec<H
 
                 if total != 0 {
                     let inst = HirInst::Move(total);
-                    env.apply_inst(&inst);
+                    xfer.transfer_inst(&mut env, &inst);
                     push_o1(&mut out, inst);
                 }
             }
@@ -319,24 +279,24 @@ fn optimize_block_o1_with_parent_env(insts: Vec<HirInst>, nested: bool) -> Vec<H
                         continue;
                     }
                     push_o1(&mut out, HirInst::Loop(inner));
-                    env.after_control_flow();
+                    env.clobber_all();
                     i += 1;
                     continue;
                 }
 
                 if let Some(spec) = try_loop_specialize(&inner) {
-                    env.apply_inst(&spec);
+                    xfer.transfer_inst(&mut env, &spec);
                     push_o1(&mut out, spec);
                 } else {
                     push_o1(&mut out, HirInst::Loop(inner));
-                    env.after_control_flow();
+                    env.clobber_all();
                 }
                 i += 1;
             }
 
             other => {
                 let inst = other.clone();
-                env.apply_inst(&inst);
+                xfer.transfer_inst(&mut env, &inst);
                 push_o1(&mut out, inst);
                 i += 1;
             }
