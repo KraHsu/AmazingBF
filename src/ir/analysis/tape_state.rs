@@ -2,15 +2,15 @@
 //!
 //! Tracks the data pointer offset (relative to the block entry) and a sparse
 //! map of cell facts expressed in the [`CellLattice`] four-point domain.
-//! `apply` transfers a single [`HirInst`] with the same semantics previously
-//! inlined as `ConstEnv` in `ir::optimize`.
+//! `apply` transfers a single [`HirInst`] through the lattice, delegating
+//! the `Add(k)` case to [`CellLattice::add_wrapping`] so the four lattice
+//! points (`Top` / `NonZero` / `Zero` / `Const(_)`) propagate consistently.
 //!
-//! Migration note (A3b): cells now carry `CellLattice` instead of the
-//! `Option<u8>` placeholder, but the transfer function is deliberately
-//! conservative — `Add(k)` on `Top` stays `Top` (no promotion to `NonZero`
-//! or `Const(_)`). This keeps the fact set byte-for-byte equivalent to the
-//! old `ConstEnv`, so existing `O1`/`O2` consumers observe no IR drift.
-//! Later passes will enrich the transfer to exploit `NonZero`/`Const` facts.
+//! In a straight-line fragment seeded from `new_program()` or `new_block()`
+//! the only lattice points reachable are `Top`, `Zero`, and `Const(_)`, so
+//! the behaviour is byte-for-byte identical to the older `ConstEnv`.
+//! `NonZero` only materialises via [`merge_in_place`] at control-flow joins,
+//! which is where the richer transfer actually pays off.
 //!
 //! Absence of a key in [`TapeState::cells`] represents `Top` (unknown).
 
@@ -131,13 +131,12 @@ impl TapeState {
         match inst {
             HirInst::Move(d) => self.ptr += *d,
             HirInst::Add(k) => {
-                // Literal-equivalence mode: only refine when the cell is
-                // already a known constant (Zero or Const(_)); otherwise
-                // leave Top/NonZero untouched. A later pass will tighten
-                // the transfer to exploit non-zero / zero lattice points.
-                if let Some(v) = self.lattice_at(self.ptr).known_u8() {
-                    let next = (v as i32 + *k).rem_euclid(256) as u8;
-                    self.cells.insert(self.ptr, CellLattice::set_const(next));
+                let current = self.lattice_at(self.ptr);
+                let next = current.add_wrapping(*k);
+                if matches!(next, CellLattice::Top) {
+                    self.cells.remove(&self.ptr);
+                } else {
+                    self.cells.insert(self.ptr, next);
                 }
             }
             HirInst::Zero => {
@@ -333,6 +332,42 @@ mod tests {
         a.apply(&HirInst::Add(5));
         assert!(a.is_pessimistic());
         assert_eq!(a.lattice_at(0), CellLattice::Top);
+    }
+
+    #[test]
+    fn add_on_nonzero_full_period_preserves_nonzero() {
+        // Construct a NonZero cell via a merge of two distinct non-zero consts,
+        // then verify that Add(256) keeps it NonZero (full-period shift).
+        let mut a = TapeState::new_block();
+        a.apply(&HirInst::Zero);
+        a.apply(&HirInst::Add(3));
+        let mut b = TapeState::new_block();
+        b.apply(&HirInst::Zero);
+        b.apply(&HirInst::Add(5));
+        a.merge_in_place(&b);
+        assert_eq!(a.lattice_at(0), CellLattice::NonZero);
+
+        a.apply(&HirInst::Add(256));
+        assert_eq!(a.lattice_at(0), CellLattice::NonZero);
+    }
+
+    #[test]
+    fn add_on_nonzero_partial_shift_retreats_to_top() {
+        // Same NonZero construction, then Add(1) which could cross zero.
+        let mut a = TapeState::new_block();
+        a.apply(&HirInst::Zero);
+        a.apply(&HirInst::Add(3));
+        let mut b = TapeState::new_block();
+        b.apply(&HirInst::Zero);
+        b.apply(&HirInst::Add(5));
+        a.merge_in_place(&b);
+        assert_eq!(a.lattice_at(0), CellLattice::NonZero);
+
+        a.apply(&HirInst::Add(1));
+        assert_eq!(a.lattice_at(0), CellLattice::Top);
+        // The sparse map must not retain a stale NonZero entry after the
+        // retreat; absence == Top by convention.
+        assert_eq!(a.value_at_ptr(), None);
     }
 
     #[test]

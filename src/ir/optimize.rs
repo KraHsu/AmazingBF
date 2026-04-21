@@ -11,6 +11,7 @@ use std::collections::BTreeMap;
 
 use crate::ir::analysis::dataflow::Transfer;
 use crate::ir::analysis::tape_state::TapeState;
+use crate::ir::dse::dead_store_elimination;
 use crate::ir::hir::{HirInst, HirProgram};
 
 /// Constant-propagation transfer function for the O1 rewrite pass. Thin
@@ -56,11 +57,14 @@ pub(crate) fn optimize_o0(program: HirProgram) -> HirProgram {
 }
 
 /// `-O1`: single pass over each block — fusion, affine / scan / clear loops, peephole on `Zero`,
-/// constant propagation for dead empty-loop removal, and local `Zero`/`Add` simplification.
+/// constant propagation for dead empty-loop removal, and local `Zero`/`Add` simplification,
+/// followed by a forward dead-store-elimination sweep (pass B1). The DSE sweep is idempotent
+/// in isolation but can unlock further fusion/specialization when iterated by `-O2`.
 pub(crate) fn optimize_o1(program: HirProgram) -> HirProgram {
-    HirProgram {
+    let rewritten = HirProgram {
         insts: optimize_block_o1(program.insts),
-    }
+    };
+    dead_store_elimination(rewritten)
 }
 
 /// `-O2`: repeat the `-O1` pipeline until the HIR reaches a fixed point (no further changes).
