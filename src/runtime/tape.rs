@@ -128,6 +128,56 @@ impl Tape {
         };
     }
 
+    /// Wrapping-add `delta` to the cell at `self.ptr + off`, growing the
+    /// tape on demand if the target index is out of the current bounds.
+    /// Does **not** move `self.ptr` and does **not** register move-unit
+    /// stats for the virtual visit — meant for compound ops like
+    /// `LinearMul` that touch several offsets without walking the
+    /// pointer.  `ptr_min` / `ptr_max` / `right_grew_bytes` / `final_len`
+    /// are updated so the tape-usage summary still reflects the cell
+    /// the op actually read or wrote.
+    pub(crate) fn add_at(&mut self, off: isize, delta: i32) {
+        let target = self.ptr + off;
+        self.ensure_range(target);
+        let cell = if target >= 0 {
+            &mut self.right[target as usize]
+        } else {
+            &mut self.left[(-target - 1) as usize]
+        };
+        *cell = if delta >= 0 {
+            cell.wrapping_add(delta as u8)
+        } else {
+            cell.wrapping_sub((-delta) as u8)
+        };
+    }
+
+    /// Shared tape-growth helper for `move_ptr` / `add_at`.  Grows the
+    /// appropriate side geometrically (with the left-side-8 floor) and
+    /// updates `ptr_min` / `ptr_max` / `right_grew_bytes` / `final_len`.
+    fn ensure_range(&mut self, target: isize) {
+        self.stats.ptr_min = self.stats.ptr_min.min(target);
+        self.stats.ptr_max = self.stats.ptr_max.max(target);
+
+        if target >= 0 {
+            let needed = target as usize + 1;
+            if needed > self.right.len() {
+                let old_len = self.right.len();
+                let new_len = needed.max(old_len.saturating_mul(2));
+                self.right.resize(new_len, 0);
+                self.stats.right_grew_bytes += new_len - old_len;
+            }
+        } else {
+            let needed = (-target) as usize;
+            if needed > self.left.len() {
+                let old_len = self.left.len();
+                let new_len = needed.max(old_len.saturating_mul(2)).max(8);
+                self.left.resize(new_len, 0);
+            }
+        }
+
+        self.stats.final_len = self.right.len() + self.left.len();
+    }
+
     /// Moves the pointer by `delta`. Grows the tape automatically in both directions.
     pub(crate) fn move_ptr(&mut self, delta: isize) {
         match delta.cmp(&0) {
@@ -137,30 +187,7 @@ impl Tape {
         }
 
         self.ptr += delta;
-        self.stats.ptr_min = self.stats.ptr_min.min(self.ptr);
-        self.stats.ptr_max = self.stats.ptr_max.max(self.ptr);
-
-        if self.ptr >= 0 {
-            let needed = self.ptr as usize + 1;
-            if needed > self.right.len() {
-                let old_len = self.right.len();
-                let new_len = needed.max(old_len.saturating_mul(2));
-                self.right.resize(new_len, 0);
-                self.stats.right_grew_bytes += new_len - old_len;
-            }
-        } else {
-            let needed = (-self.ptr) as usize;
-            if needed > self.left.len() {
-                // The left half starts empty, so `old_len * 2` is zero on
-                // the first grow; fall back to a small floor so a single
-                // `<` does not trigger per-step reallocations afterwards.
-                let old_len = self.left.len();
-                let new_len = needed.max(old_len.saturating_mul(2)).max(8);
-                self.left.resize(new_len, 0);
-            }
-        }
-
-        self.stats.final_len = self.right.len() + self.left.len();
+        self.ensure_range(self.ptr);
     }
 }
 
@@ -236,5 +263,55 @@ mod tests {
         assert_eq!(s.ptr_min, -65536);
         assert_eq!(s.ptr_max, 0);
         assert_eq!(s.visited_span(), 65537);
+    }
+
+    #[test]
+    fn add_at_targets_offset_without_moving_ptr() {
+        // add_at(3, 7) writes cell[3] but leaves ptr at 0.
+        let mut t = Tape::new(8);
+        t.add_at(3, 7);
+        assert_eq!(t.ptr(), 0);
+        t.move_ptr(3);
+        assert_eq!(t.current(), 7);
+        t.move_ptr(-3);
+        // No move-unit stats from the add_at itself; only the two
+        // inspection `move_ptr` calls count.
+        let s = t.stats();
+        assert_eq!(s.move_right_units, 3);
+        assert_eq!(s.move_left_units, 3);
+    }
+
+    #[test]
+    fn add_at_wraps_byte_on_overflow() {
+        let mut t = Tape::new(4);
+        t.set_current(250);
+        t.add_at(0, 10); // 250 + 10 = 260 ≡ 4 (mod 256)
+        assert_eq!(t.current(), 4);
+        t.add_at(0, -5); // 4 - 5 ≡ 255
+        assert_eq!(t.current(), 255);
+    }
+
+    #[test]
+    fn add_at_grows_tape_on_out_of_range_offset() {
+        let mut t = Tape::new(4);
+        assert_eq!(t.stats().final_len, 4);
+        t.add_at(10, 1);
+        // Grows right side to cover offset 10; ptr stays at 0.
+        let s = t.stats();
+        assert!(s.final_len >= 11);
+        assert_eq!(s.ptr_max, 10);
+        assert_eq!(t.ptr(), 0);
+        assert_eq!(s.move_right_units, 0);
+    }
+
+    #[test]
+    fn add_at_grows_left_side_for_negative_offset() {
+        let mut t = Tape::new(4);
+        t.add_at(-3, 42);
+        assert_eq!(t.ptr(), 0);
+        t.move_ptr(-3);
+        assert_eq!(t.current(), 42);
+        let s = t.stats();
+        assert_eq!(s.ptr_min, -3);
     }
 }

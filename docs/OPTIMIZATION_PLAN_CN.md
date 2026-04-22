@@ -105,7 +105,8 @@
   - 文件：`src/interp/bytecode.rs`（新）、`src/interp/lower.rs`（新，13 单测）、`src/interp/engine.rs`、`src/interp/mod.rs`
 - **E2 Threaded dispatch** · **[已实现]**：`InterpOp::tag()` 返回稠密 opcode 索引（安全 `match` 实现，因 `#![forbid(unsafe_code)]` 禁用 `mem::transmute`/repr 透视）；新增 `src/interp/handlers.rs`，11 个 `fn(&mut Interpreter<I, H>, &InterpOp, usize) -> Result<usize, RuntimeError>` handler 构成 `dispatch_table::<I, H>() -> [Handler<I, H>; INTERP_OP_TAG_COUNT]`。`engine.rs::exec_bytecode` 的 monolithic `match` 替换为 `pc = table[op.tag()](self, op, pc)?`——每条 op 变为一次表查 + 一次间接调用，目的是给 CPU 间接跳转预测器提供 per-opcode 的独立预测状态（原 match 只有单一 jump 点）。handler 通过 `if let` 解构对应变体、不匹配路径落入冷 `unreachable!()`。稳定 Rust 无 sibling-tail-call，若 LLVM 未展开则按计划可退回 `match + #[inline(always)]` 保底。
   - 文件：`src/interp/bytecode.rs`、`src/interp/engine.rs`、`src/interp/handlers.rs`（新）
-- **E3 SIMD tape 操作**：`Zero` → `memset`；`LinearMul` 中因子 1 的列 → `copy_from_slice`。`Tape::move_ptr` 的 zero-fill 走 `Vec::resize` 已是 `memset`，但 `LinearMul` 内部仍是标量（`engine.rs:103-111`）。
+- **E3 解释器 LinearMul 快路径** · **[已实现]**：`src/interp/handlers.rs::exec_linear_mul` 对 factor ±1 列短路，跳过 `wrapping_mul` / `rem_euclid` 两条 ALU 指令（`delta = v as i32` / `delta = -(v as i32)`）；所有 factor 统一走 `Tape::add_at(off, delta)` 而非先前的 `move_ptr(off); add_current; move_ptr(-off)` 三联，少 1 次 grow 检查与 2 次 move-unit 统计更新。`src/runtime/tape.rs::add_at` 新增为共享入口，抽出 `ensure_range(target)` 给 `move_ptr` 和 `add_at` 复用；ptr_min / ptr_max / right_grew_bytes 仍正确记录，move_left_units / move_right_units 不再被 LinearMul 的虚拟访问虚增。通用 SIMD 展开（`rep stosb` / 切片 memcpy）留给 D2 / 未来的 interp SIMD。
+  - 文件：`src/runtime/tape.rs`（新 `add_at` + 4 单测覆盖偏移/wrap/双向 grow）、`src/interp/handlers.rs`
 - **E4 Tape 后端重构** · **[已实现，方案调整]**：原方案要求 mmap + centered-copy，但与 `#![forbid(unsafe_code)]` 冲突。改为在现有 `Vec<u8>` 左右拼接布局上换上几何倍增（`new_len = max(needed, old_len * 2)`，左半因初始空载另设 8 字节下限）：均摊 O(1) 每访问格，避免单步走过边界触发 O(n) resize。`TapeStats::right_growth` 更名为 `right_grew_bytes` 以明确语义。后续若决定为共享 backend tape 再引入 mmap 版本，可在不破坏 forbid(unsafe) 的前提下通过 runtime feature flag 隔离。
 - **E5 Criterion 微基准套件** · **[已实现]**：新增 `benches/`，采用 [matslina 标准基准集](https://github.com/matslina/bfoptimization) 的子集——**factor.b**、**mandelbrot.b**、**hanoi.b**、**dbfi.b**、**long.b** 以及 **awib-0.4.b**。按 O0 / O1 / O2 / O3 × (interpret, compile+run) 交叉衡量。这套程序覆盖不同 contraction 比例（40%–75%）和不同 hot-loop 模式，是 BF 优化文献的既定 benchmark；参考文献给出的参考加速范围：hanoi.b ≈ 130×、mandelbrot.b 数十倍、awib-0.4 ≈ 2.4×（全部优化 vs 无优化）。作为 A–D 所有 pass 的回归衡量基线。
 
@@ -143,8 +144,8 @@ A1 → A2 → A3 → A4                        （回归衡量）
 C1 (LIR peephole) ✓、D1 (指令选择) ✓、
 D3 (buffered I/O — 解释器侧 ✓ / 后端侧 pending)、
 E1 / E2 (superinstruction + threaded dispatch) ✓、
-E3 (SIMD tape)、E4 (tape 倍增) ✓ 均可并行启动。
-已落地：E5、C1、D1、E4、Phase A (A1–A4)、B1、B2、B3、B4、B6、C2、C3、C4、E1、E2、D3 (解释器侧)。
+E3 (interp LinearMul ±1 快路径) ✓、E4 (tape 倍增) ✓ 均可并行启动。
+已落地：E5、C1、D1、E4、Phase A (A1–A4)、B1、B2、B3、B4、B6、C2、C3、C4、E1、E2、E3、D3 (解释器侧)。
 
 Phase F 全部不在近期依赖图内。
 ```

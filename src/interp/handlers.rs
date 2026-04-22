@@ -145,10 +145,18 @@ fn exec_linear_mul<I: RuntimeIo, H: HostRuntime>(
     let v = interp.tape.current();
     interp.tape.set_current(0);
     for (off, f) in plan.factors.iter() {
-        interp.tape.move_ptr(*off as isize);
-        let delta = mul_add_delta_u8(v, *f as i32);
-        interp.tape.add_current(delta);
-        interp.tape.move_ptr(-(*off as isize));
+        // E3: factor ±1 is the common fused-copy shape (`[->+<]`,
+        // `[->-<]`, … after B3 rescaling).  Skipping the `wrapping_mul`
+        // / `rem_euclid` avoids two ALU ops per factor.  All factors
+        // update via `Tape::add_at` so we pay one bounds/grow check
+        // instead of two `move_ptr` calls (which also used to
+        // double-count the virtual visit in the move-unit stats).
+        let delta = match *f {
+            1 => v as i32,
+            -1 => -(v as i32),
+            f => mul_add_delta_u8(v, f as i32),
+        };
+        interp.tape.add_at(*off as isize, delta);
     }
 }
 
