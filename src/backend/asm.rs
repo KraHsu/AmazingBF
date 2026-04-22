@@ -45,9 +45,10 @@ pub struct AsmLabel(pub u32);
 
 /// x86_64 general-purpose 64-bit registers actually used by this backend.
 ///
-/// RBP is deliberately omitted: the backend does not establish a stack frame,
-/// and every other register is reused across the Linux / Windows ABIs in the
-/// way described at the top of this module.
+/// The callee-saved `Rbx` / `Rbp` hold the output-buffer write pointer and
+/// end sentinel respectively for the D3 buffered-stdio path; every other
+/// register is reused across the Linux / Windows ABIs in the way described
+/// at the top of this module.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Reg64 {
     /// Accumulator / syscall number / syscall return value.
@@ -56,10 +57,12 @@ pub enum Reg64 {
     Rcx,
     /// Syscall arg 3 / general scratch.
     Rdx,
-    /// Callee-saved general register (not currently used, kept for symmetry).
+    /// Output-buffer write pointer (callee-saved; preserved across syscalls).
     Rbx,
     /// Stack pointer.
     Rsp,
+    /// Output-buffer end sentinel = buffer_base + 4096 (callee-saved).
+    Rbp,
     /// Source pointer for `rep movsb` / syscall arg 2.
     Rsi,
     /// Destination pointer for `rep movsb` / syscall arg 1.
@@ -94,6 +97,7 @@ impl fmt::Display for Reg64 {
             Reg64::Rdx => "rdx",
             Reg64::Rbx => "rbx",
             Reg64::Rsp => "rsp",
+            Reg64::Rbp => "rbp",
             Reg64::Rsi => "rsi",
             Reg64::Rdi => "rdi",
             Reg64::R8 => "r8",
@@ -416,6 +420,21 @@ pub enum AsmInst {
 
     /// `add byte [r13], al` — add `al` into the current tape cell.
     AddMemR13Al,
+
+    /// `mov al, byte [r13]` — load the current tape cell into `al`.
+    ///
+    /// Used by the buffered-stdout `PutByte` emit: reads `*data_ptr` into
+    /// `al` in preparation for `mov [rbx], al`.  R13 encodes with
+    /// `mod=01 + disp8=0` to dodge the `[RIP+disp32]` aliasing that
+    /// `mod=00 + rm&7==5` would otherwise trigger.
+    MovAlMemR13,
+
+    /// `mov byte [rbx], al` — store `al` into the output buffer at the
+    /// current write pointer.
+    ///
+    /// Paired with a following `add rbx, 1` + `cmp rbx, rbp` so the buffer
+    /// flushes when it hits `rbp` (the precomputed end-of-buffer address).
+    MovMemRbxAl,
 }
 
 /// Assembly program: a flat sequence of instructions.

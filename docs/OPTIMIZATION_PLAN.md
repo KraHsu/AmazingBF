@@ -92,8 +92,11 @@ Goal: add `src/ir/lir_opt.rs` after `src/ir/lower.rs` to provide a no-analysis p
   - `Scan(±1)` → `rep scasb` (`al = 0`, `rdi = r13`, `rcx` set large enough) paired with a single bounds tightening. Needs to confirm the Windows ABI has no special requirements for `rep` instructions.
   - Contiguous `Zero` runs (from a future pass that merges them) → `rep stosb`
   - `LinearMul` columns with factor ±1 → `movzx + add`, paired with C3's displacement-form lowering
-- **D3 Buffered I/O** · **[interpreter-side landed / backend-side pending]**: `src/runtime/io.rs::BufferedStdIo` wraps process stdio with a 4 KiB `BufWriter<Stdout>` + `BufReader<Stdin>`. The `RuntimeIo` trait gained a default `flush()` method (no-op); `BufferedStdIo::flush` routes `BufWriter::flush` errors through `IoError::WriteError → RuntimeError::Io` so a late-flush failure surfaces as a runtime error instead of being silently swallowed in `Drop`. `Interpreter::run()` explicitly calls `io.flush()?` at program end, ordered "exec error wins, flush error reported only on exec success". The CLI `run_interpret` path now constructs `BufferedStdIo::new()`, dropping the interpreter's one-`write`-per-byte cost to one per 4 KiB. The native backend (ELF `write` / PE `WriteFile`) still issues one syscall per byte; that half lands in a follow-up (Commit 1b).
-  - Files: `src/runtime/io.rs`, `src/driver/run.rs`, `src/interp/engine.rs`; tests `tests/buffered_io.rs` (>4 KiB stdout + `,` EOF returns 255)
+- **D3 Buffered I/O** · **[interpreter + Linux backend landed / Windows backend pending]**:
+  - **Interpreter side**: `src/runtime/io.rs::BufferedStdIo` wraps process stdio with a 4 KiB `BufWriter<Stdout>` + `BufReader<Stdin>`. The `RuntimeIo` trait gained a default `flush()` method (no-op); `BufferedStdIo::flush` routes `BufWriter::flush` errors through `IoError::WriteError → RuntimeError::Io` so a late-flush failure surfaces as a runtime error instead of being silently swallowed in `Drop`. `Interpreter::run()` explicitly calls `io.flush()?` at program end, ordered "exec error wins, flush error reported only on exec success". The CLI `run_interpret` path constructs `BufferedStdIo::new()` by default.
+  - **Linux backend side**: `src/backend/codegen.rs` adds `emit_init_output_buffer` (mmaps a 4 KiB anonymous region, pins `Rbx = buffer_base = write_ptr` and `Rbp = buffer_base + 4096 = end sentinel`) and `emit_flush_output` (helper subroutine that does `lea rsi, [rbp - 4096]` to recover the base, emits `write(1, base, rbx - base)`, and resets `rbx`). `PutByte` drops from a 5-instruction inline syscall (~42 bytes) to `mov al, [r13]; mov [rbx], al; add rbx, 1; cmp rbx, rbp; jne skip; call flush_output; skip:` (~20 bytes on the hot path, `write` syscall fires only once per 4096 bytes). `GetByte` flushes first so interactive prompts reach stdout before `,` potentially blocks on stdin; `exit(0)` flushes before the exit syscall. New `AsmInst::{MovAlMemR13, MovMemRbxAl}` variants + encoders with three encoding unit tests; `Reg64::Rbp` picks up its first use in this backend and is added to reg_num / Display.
+  - **Windows backend side (pending)**: `src/backend/x86_64/windows.rs`'s `emit_put_byte` / `emit_get_byte` still emit per-byte `WriteFile` / `ReadFile` IAT calls. A follow-up commit will mirror the Linux buffering using the same register convention.
+  - Files: `src/runtime/io.rs`, `src/driver/run.rs`, `src/interp/engine.rs`, `src/backend/asm.rs`, `src/backend/codegen.rs`, `src/backend/x86_64/encode.rs`, `src/backend/x86_64/debug.rs`; tests `tests/buffered_io.rs` (interpreter + Linux compile, both `>4 KiB` plus `,` EOF returns 255) and three new encoding tests in `src/backend/x86_64/encode.rs`
 - **D4 Minimal register allocator**: track the explicit use of `rbx / rax / rcx` for `LinearMul` / loop-head multiplicands and source values (currently `codegen.rs:143-159` hard-codes them). Not a general RA — just a local "redundant-mov elimination" allocator. Paves the way for more aggressive codegen in Phase F.
 - **D5 Jump alignment + branch hints**: align loop heads to 16B; attach `2e` / `3e` branch-hint prefixes to `JumpIfZero` (no-op on Intel, still parsed by AMD) — lowest priority.
 
@@ -142,10 +145,10 @@ A1 → A2 → A3 → A4                        (regression baseline)
   └→ C2 (bounds batching) ✓ → C4 (scan hint) ✓, D2 (SIMD)
 
 C1 (LIR peephole) ✓, D1 (instruction selection) ✓,
-D3 (buffered I/O — interpreter ✓ / backend pending),
+D3 (buffered I/O — interpreter ✓ / Linux backend ✓ / Windows backend pending),
 E1 / E2 (super-instructions + threaded dispatch) ✓,
 E3 (interp LinearMul ±1 fast path) ✓, E4 (tape doubling) ✓ can all start in parallel.
-Landed: E5, C1, D1, E4, Phase A (A1–A4), B1, B2, B3, B4, B6, C2, C3, C4, E1, E2, E3, D3 (interpreter side).
+Landed: E5, C1, D1, E4, Phase A (A1–A4), B1, B2, B3, B4, B6, C2, C3, C4, E1, E2, E3, D3 (interpreter + Linux backend).
 
 Phase F items are all outside the near-term dependency graph.
 ```

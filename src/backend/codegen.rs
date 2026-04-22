@@ -60,12 +60,28 @@ const INTERNAL_LABEL_EXIT_ONE_RAW: u32 = u32::MAX - 1;
 /// Internal label ID: the top of the doubling loop inside `ensure_tape`.
 const INTERNAL_LABEL_GROW_LOOP_RAW: u32 = u32::MAX - 2;
 
+/// Internal label ID: entry point of the `flush_output` helper.
+///
+/// Called by each `PutByte` when the 4 KiB output buffer fills, by every
+/// `GetByte` (so prior `.` bytes reach stdout before `,` blocks on stdin),
+/// and once on the normal `exit(0)` path. The helper emits a single
+/// `write(1, buffer_base, rbx - buffer_base)` syscall and resets `rbx`.
+const INTERNAL_LABEL_FLUSH_OUTPUT_RAW: u32 = u32::MAX - 3;
+
 /// Lowest reserved internal-label ID (inclusive).
 ///
 /// The range `[INTERNAL_LABEL_RESERVED_MIN_RAW, u32::MAX]` is reserved for
 /// labels with fixed semantics and must never be consumed by
 /// `fresh_internal_label()`.
-const INTERNAL_LABEL_RESERVED_MIN_RAW: u32 = INTERNAL_LABEL_GROW_LOOP_RAW;
+const INTERNAL_LABEL_RESERVED_MIN_RAW: u32 = INTERNAL_LABEL_FLUSH_OUTPUT_RAW;
+
+/// 4 KiB output buffer sized to match one filesystem page / the Linux
+/// pipe atomic-write threshold.  The generated binary allocates one
+/// such buffer via `mmap` at program start; `PutByte` accumulates into
+/// it and flushes with a single `write` syscall on buffer-full, on
+/// `GetByte` (to keep interactive prompts visible before stdin blocks),
+/// and once on `exit(0)`.
+const OUTPUT_BUFFER_SIZE: usize = 4096;
 
 /// Starting point for transient internal label IDs.
 ///
@@ -191,6 +207,7 @@ fn emit_ptr_add_checked_out(
 pub fn compile_lir_to_asm(lir: &LirProgram) -> AsmProgram {
     let ensure_tape_label = AsmLabel(INTERNAL_LABEL_ENSURE_TAPE_RAW);
     let exit_one_label = AsmLabel(INTERNAL_LABEL_EXIT_ONE_RAW);
+    let flush_output_label = AsmLabel(INTERNAL_LABEL_FLUSH_OUTPUT_RAW);
 
     // Transient internal-label counter, decrementing from INTERNAL_LABEL_BASE_RAW.
     let mut next_internal_label = INTERNAL_LABEL_BASE_RAW;
@@ -204,8 +221,9 @@ pub fn compile_lir_to_asm(lir: &LirProgram) -> AsmProgram {
     // skip its probes. Barriers clear the window.
     let mut verified_window: Option<(isize, isize)> = None;
 
-    // 1. Initialise the tape (mmap).
+    // 1. Initialise the tape (mmap) and the 4 KiB output buffer.
     emit_init_tape(&mut out, exit_one_label);
+    emit_init_output_buffer(&mut out, exit_one_label);
 
     // 2. Translate LIR instructions.
     for inst in &lir.insts {
@@ -430,15 +448,25 @@ pub fn compile_lir_to_asm(lir: &LirProgram) -> AsmProgram {
                 }
             }
 
-            // PutByte: emit the current cell (`.`).
+            // PutByte: append the current cell to the 4 KiB output buffer.
             //
-            // Linux `sys_write(fd=1, buf=data_ptr, count=1)`.
+            // Buffered path — one `write` syscall per 4 KiB, not per byte:
+            //     mov al, [r13]          ; al = *data_ptr
+            //     mov [rbx], al          ; buffer[write_ptr] = al
+            //     add rbx, 1             ; advance write_ptr
+            //     cmp rbx, rbp           ; rbp = buffer_base + 4096
+            //     jne skip               ; not full yet
+            //     call flush_output      ; flush and reset rbx
+            //   skip:
             LirInst::PutByte => {
-                out.push(AsmInst::MovRegImm64(Reg64::Rax, 1)); // syscall number = 1 (write)
-                out.push(AsmInst::MovRegImm64(Reg64::Rdi, 1)); // fd = 1 (stdout)
-                out.push(AsmInst::MovRegReg(Reg64::Rsi, Reg64::R13)); // buf = data_ptr
-                out.push(AsmInst::MovRegImm64(Reg64::Rdx, 1)); // count = 1
-                out.push(AsmInst::Syscall);
+                let skip = fresh_internal_label(&mut next_internal_label);
+                out.push(AsmInst::MovAlMemR13);
+                out.push(AsmInst::MovMemRbxAl);
+                out.push(AsmInst::AddRegImm32(Reg64::Rbx, 1));
+                out.push(AsmInst::CmpRegReg(Reg64::Rbx, Reg64::Rbp));
+                out.push(AsmInst::Jnz(skip));
+                out.push(AsmInst::Call(flush_output_label));
+                out.push(AsmInst::Label(skip));
                 verified_window = None;
             }
 
@@ -449,7 +477,11 @@ pub fn compile_lir_to_asm(lir: &LirProgram) -> AsmProgram {
             // - return 1: byte read, kernel already stored it at `*data_ptr`.
             // - return 0: EOF → store 255 in the current cell.
             // - return < 0: read failure → exit(1).
+            //
+            // Flushes the output buffer first so interactive prompts reach
+            // stdout before stdin potentially blocks.
             LirInst::GetByte => {
+                out.push(AsmInst::Call(flush_output_label));
                 let done = fresh_internal_label(&mut next_internal_label);
                 out.push(AsmInst::MovRegImm64(Reg64::Rax, 0)); // syscall number = 0 (read)
                 out.push(AsmInst::MovRegImm64(Reg64::Rdi, 0)); // fd = 0 (stdin)
@@ -488,13 +520,15 @@ pub fn compile_lir_to_asm(lir: &LirProgram) -> AsmProgram {
         }
     }
 
-    // 3. Normal termination: exit(0).
+    // 3. Normal termination: flush any buffered output, then exit(0).
+    out.push(AsmInst::Call(flush_output_label));
     out.push(AsmInst::MovRegImm64(Reg64::Rax, 60)); // syscall number = 60 (exit)
     out.push(AsmInst::MovRegImm64(Reg64::Rdi, 0)); // exit code = 0
     out.push(AsmInst::Syscall);
 
     // 4. Helper routines.
     emit_ensure_tape_contains_r15(&mut out, ensure_tape_label, exit_one_label);
+    emit_flush_output(&mut out, flush_output_label);
     emit_exit_one(&mut out, exit_one_label);
 
     AsmProgram { insts: out }
@@ -797,6 +831,81 @@ fn emit_ensure_tape_contains_r15(
     out.push(AsmInst::AddRegReg(Reg64::R13, Reg64::R9)); // + desired_offset
 
     // Return to caller (the CALL in the PtrAdd slow path).
+    out.push(AsmInst::Ret);
+}
+
+/// Emit the 4 KiB output-buffer allocation.
+///
+/// Runs once after [`emit_init_tape`]: mmaps a 4 KiB anonymous region and
+/// pins the two buffer registers used by the `PutByte` fast path:
+///
+/// - `Rbx` = current write pointer, advanced by each `PutByte`; reset to
+///   the buffer base by [`emit_flush_output`].
+/// - `Rbp` = buffer end (= base + 4096); `PutByte`'s `cmp rbx, rbp`
+///   detects a full buffer and triggers a flush.
+///
+/// On mmap failure the generated code jumps to `exit_one_label`, matching
+/// the tape-allocation error path.
+fn emit_init_output_buffer(out: &mut Vec<AsmInst>, exit_one_label: AsmLabel) {
+    // mmap(NULL, OUTPUT_BUFFER_SIZE, PROT_READ|PROT_WRITE,
+    //      MAP_PRIVATE|MAP_ANONYMOUS, -1, 0).
+    out.push(AsmInst::MovRegImm64(Reg64::Rax, 9)); // sys_mmap
+    out.push(AsmInst::MovRegImm64(Reg64::Rdi, 0)); // addr = NULL
+    out.push(AsmInst::MovRegImm64(Reg64::Rsi, OUTPUT_BUFFER_SIZE as i64));
+    out.push(AsmInst::MovRegImm64(Reg64::Rdx, 0x3)); // prot = R|W
+    out.push(AsmInst::MovRegImm64(Reg64::R10, 0x22)); // flags = PRIVATE|ANON
+    out.push(AsmInst::MovRegImm64(Reg64::R8, -1)); // fd
+    out.push(AsmInst::MovRegImm64(Reg64::R9, 0)); // offset
+    out.push(AsmInst::Syscall);
+
+    // mmap error: negative return → exit(1).
+    out.push(AsmInst::CmpRegImm32(Reg64::Rax, 0));
+    out.push(AsmInst::Jl(exit_one_label));
+
+    // Rbx = buffer_base (write pointer starts at the beginning).
+    out.push(AsmInst::MovRegReg(Reg64::Rbx, Reg64::Rax));
+
+    // Rbp = buffer_base + OUTPUT_BUFFER_SIZE (buffer end sentinel).
+    out.push(AsmInst::MovRegReg(Reg64::Rbp, Reg64::Rax));
+    out.push(AsmInst::AddRegImm32(Reg64::Rbp, OUTPUT_BUFFER_SIZE as i32));
+}
+
+/// Emit the `flush_output` helper routine.
+///
+/// Called by `PutByte` on buffer-full, by every `GetByte` (so prior
+/// output reaches stdout before stdin blocks), and once on `exit(0)`.
+/// Writes `rbx - buffer_base` bytes to stdout and resets `rbx` to
+/// `buffer_base`. When no bytes are pending (`rbx == buffer_base`),
+/// `write(1, buf, 0)` is a harmless no-op.
+///
+/// The Linux syscall ABI preserves Rbx and Rbp across the syscall
+/// (only Rcx/R11 are kernel scratch), so the helper can use
+/// `lea rsi, [rbp - OUTPUT_BUFFER_SIZE]` to recover the base both
+/// before the write and to reset the write pointer afterwards.
+fn emit_flush_output(out: &mut Vec<AsmInst>, label: AsmLabel) {
+    out.push(AsmInst::Label(label));
+
+    // rsi = buffer_base = rbp - OUTPUT_BUFFER_SIZE.
+    out.push(AsmInst::LeaRegMem(
+        Reg64::Rsi,
+        Reg64::Rbp,
+        -(OUTPUT_BUFFER_SIZE as i32),
+    ));
+
+    // rdx = count = rbx - buffer_base.
+    out.push(AsmInst::MovRegReg(Reg64::Rdx, Reg64::Rbx));
+    out.push(AsmInst::SubRegReg(Reg64::Rdx, Reg64::Rsi));
+
+    // write(1, buffer_base, count).
+    out.push(AsmInst::MovRegImm64(Reg64::Rax, 1)); // sys_write
+    out.push(AsmInst::MovRegImm64(Reg64::Rdi, 1)); // fd = stdout
+    out.push(AsmInst::Syscall);
+
+    // Reset write pointer to buffer_base.  (Ignoring short writes — BF
+    // programs write to stdout, not to arbitrary file descriptors, so
+    // EINTR / EAGAIN on a 4 KiB write is not a realistic concern.)
+    out.push(AsmInst::MovRegReg(Reg64::Rbx, Reg64::Rsi));
+
     out.push(AsmInst::Ret);
 }
 

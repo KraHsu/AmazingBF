@@ -325,6 +325,7 @@ fn reg_num(reg: Reg64) -> u8 {
         Reg64::Rdx => 2,  // 010
         Reg64::Rbx => 3,  // 011
         Reg64::Rsp => 4,  // 100
+        Reg64::Rbp => 5,  // 101
         Reg64::Rsi => 6,  // 110
         Reg64::Rdi => 7,  // 111
         Reg64::R8 => 8,   // 1_000
@@ -797,6 +798,25 @@ fn encode_inst(buf: &mut CodeBuffer, inst: &AsmInst) {
             buf.emit_u8(0x45);
             buf.emit_u8(0x00);
         }
+
+        // mov al, byte [r13+0]
+        //   REX.B (0x41) + 0x8A + ModRM(mod=01, reg=al=0, rm=r13 low3=5) + disp8(0)
+        //   = 41 8A 45 00
+        AsmInst::MovAlMemR13 => {
+            buf.emit_u8(0x41);
+            buf.emit_u8(0x8A);
+            buf.emit_u8(0x45);
+            buf.emit_u8(0x00);
+        }
+
+        // mov byte [rbx], al
+        //   No REX (all low regs, byte op on rbx is safe).
+        //   0x88 + ModRM(mod=00, reg=al=0, rm=rbx=3)
+        //   = 88 03
+        AsmInst::MovMemRbxAl => {
+            buf.emit_u8(0x88);
+            buf.emit_u8(0x03);
+        }
     }
 }
 
@@ -1039,6 +1059,45 @@ mod tests {
         assert_eq!(
             encoded.text[..7],
             [0x48, 0xff, 0x15, 0x01, 0x00, 0x00, 0x00]
+        );
+    }
+
+    #[test]
+    fn mov_al_mem_r13_uses_disp8_zero_to_avoid_rip_alias() {
+        // mov al, byte [r13] — R13's low 3 bits = 5 would collide with
+        // RIP-relative in mod=00, so the encoder must select
+        // mod=01 + disp8=0.  Expected: 41 8A 45 00.
+        let program = AsmProgram {
+            insts: vec![AsmInst::MovAlMemR13],
+        };
+        let encoded = encode_program(&program);
+        assert_eq!(encoded.text, vec![0x41, 0x8A, 0x45, 0x00]);
+    }
+
+    #[test]
+    fn mov_mem_rbx_al_encodes_without_rex() {
+        // mov byte [rbx], al — no REX (low regs, byte op on rbx is safe).
+        // Expected: 88 03  (opcode=0x88, ModRM mod=00 reg=0 rm=3).
+        let program = AsmProgram {
+            insts: vec![AsmInst::MovMemRbxAl],
+        };
+        let encoded = encode_program(&program);
+        assert_eq!(encoded.text, vec![0x88, 0x03]);
+    }
+
+    #[test]
+    fn lea_rsi_rbp_minus_4096_uses_disp32() {
+        // lea rsi, [rbp - 4096] — disp -4096 does not fit i8, so the
+        // encoder must select mod=10 (disp32).  REX.W=0x48, opcode=0x8D,
+        // ModRM(mod=10, reg=rsi=6, rm=rbp=5) = 0xB5, disp32 = -4096 LE
+        // = 0x00 0xF0 0xFF 0xFF.
+        let program = AsmProgram {
+            insts: vec![AsmInst::LeaRegMem(Reg64::Rsi, Reg64::Rbp, -4096)],
+        };
+        let encoded = encode_program(&program);
+        assert_eq!(
+            encoded.text,
+            vec![0x48, 0x8D, 0xB5, 0x00, 0xF0, 0xFF, 0xFF]
         );
     }
 }

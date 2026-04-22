@@ -70,9 +70,52 @@ fn interp_buffered_stdout_crosses_4kib_boundary() {
     );
 }
 
-/// A `,` past EOF must yield 255 (convention shared with `StdIo` / the native
-/// backend). Sends a single-byte stdin, then reads two bytes and echoes them;
-/// the second read must round-trip as 255.
+/// Same as `interp_buffered_stdout_crosses_4kib_boundary` but for the native
+/// backend — proves the ELF's 4 KiB output buffer + flush-on-exit path emits
+/// the exact same bytes regardless of whether a mid-program buffer flush
+/// occurred.
+#[cfg(not(target_os = "windows"))]
+#[test]
+fn compile_buffered_stdout_crosses_4kib_boundary() {
+    let temp = TempDirGuard::new("amazingbf-buffered-io-compile");
+    let bf_path = temp.path.join("big.bf");
+    let exe_path = temp.path.join("big");
+
+    let mut src = String::from("++++++++[>++++++++<-]>+");
+    src.extend(std::iter::repeat_n('.', 5000));
+    fs::write(&bf_path, src).unwrap();
+
+    let mut compile = Command::cargo_bin("AmazingBF").unwrap();
+    compile
+        .arg(&bf_path)
+        .arg("-q")
+        .arg("-m")
+        .arg("compile")
+        .arg("-o")
+        .arg(&exe_path);
+    let compile_out = compile.output().expect("compile AmazingBF");
+    assert!(
+        compile_out.status.success(),
+        "compile failed: {}",
+        String::from_utf8_lossy(&compile_out.stderr)
+    );
+
+    let run_out = Command::new(&exe_path).output().expect("run compiled exe");
+    assert!(
+        run_out.status.success(),
+        "compiled exe failed: {}",
+        String::from_utf8_lossy(&run_out.stderr)
+    );
+    assert_eq!(run_out.stdout.len(), 5000);
+    assert!(
+        run_out.stdout.iter().all(|&b| b == b'A'),
+        "compiled exe stdout contained non-'A' byte"
+    );
+}
+
+/// A `,` past EOF must yield 255 (convention shared with `BufferedStdIo` /
+/// the native backend). Sends a single-byte stdin, then reads two bytes and
+/// echoes them; the second read must round-trip as 255.
 #[test]
 fn interp_buffered_stdin_returns_255_on_eof() {
     let temp = TempDirGuard::new("amazingbf-buffered-io-eof");

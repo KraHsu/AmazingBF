@@ -44,6 +44,7 @@ fn reg_name(reg: Reg64) -> &'static str {
         Reg64::Rdx => "rdx",
         Reg64::Rbx => "rbx",
         Reg64::Rsp => "rsp",
+        Reg64::Rbp => "rbp",
         Reg64::Rsi => "rsi",
         Reg64::Rdi => "rdi",
         Reg64::R8 => "r8",
@@ -500,6 +501,12 @@ fn format_inst_asm(out: &mut String, inst: &AsmInst) {
         }
         AsmInst::AddMemR13Al => {
             writeln!(out, "    add     byte [r13], al").unwrap();
+        }
+        AsmInst::MovAlMemR13 => {
+            writeln!(out, "    mov     al, byte [r13]").unwrap();
+        }
+        AsmInst::MovMemRbxAl => {
+            writeln!(out, "    mov     byte [rbx], al").unwrap();
         }
     }
 }

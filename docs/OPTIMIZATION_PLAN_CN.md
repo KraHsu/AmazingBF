@@ -92,8 +92,11 @@
   - `Scan(±1)` → `rep scasb`（`al = 0`, `rdi = r13`, `rcx` 设足够大）配合一次 bounds 收紧。需确认 Windows ABI 对 `rep` 指令无特殊要求。
   - `Zero` 连续段（来自未来 pass 合并）→ `rep stosb`
   - `LinearMul` 因子为 ±1 的列 → `movzx + add`，配合 C3 的 displacement 形式下降
-- **D3 Buffered I/O** · **[解释器侧已实现 / 后端侧待落地]**：`src/runtime/io.rs::BufferedStdIo` 以 4 KiB `BufWriter<Stdout>` + `BufReader<Stdin>` 包住进程 stdio；`RuntimeIo` trait 新增默认 `flush()` 方法（no-op），`BufferedStdIo::flush` 通过 `BufWriter::flush` 把延迟 flush 错误经 `IoError::WriteError → RuntimeError::Io` 上抛，避免 `Drop` 中吞错。`Interpreter::run()` 尾部显式调用 `io.flush()?`，按 "exec 错误优先，成功后才报告 flush 错误" 排序。CLI `run_interpret` 已切 `BufferedStdIo::new()`，原先的单字节 `write` syscall 降到 per-4 KiB 一次。后端（ELF `write` / PE `WriteFile`）仍是每字节一次 syscall，按 Commit 1b 独立落地。
-  - 文件：`src/runtime/io.rs`、`src/driver/run.rs`、`src/interp/engine.rs`；测试 `tests/buffered_io.rs`（>4 KiB 输出 + `,` EOF 回 255）
+- **D3 Buffered I/O** · **[解释器 + Linux 后端已实现 / Windows 后端待落地]**：
+  - **解释器侧**：`src/runtime/io.rs::BufferedStdIo` 以 4 KiB `BufWriter<Stdout>` + `BufReader<Stdin>` 包住进程 stdio；`RuntimeIo` trait 新增默认 `flush()` 方法（no-op），`BufferedStdIo::flush` 通过 `BufWriter::flush` 把延迟 flush 错误经 `IoError::WriteError → RuntimeError::Io` 上抛，避免 `Drop` 中吞错。`Interpreter::run()` 尾部显式调用 `io.flush()?`，按 "exec 错误优先，成功后才报告 flush 错误" 排序。CLI `run_interpret` 默认构造 `BufferedStdIo::new()`。
+  - **Linux 后端侧**：`src/backend/codegen.rs` 新增 `emit_init_output_buffer`（`mmap` 4 KiB 匿名区，`Rbx = buffer_base = 写指针`，`Rbp = buffer_base + 4096 = 结束哨兵`）与 `emit_flush_output`（helper 子程序，`lea rsi, [rbp - 4096]` 恢复 base，发 `write(1, base, rbx - base)` 后重置 `rbx`）。`PutByte` 从 5 指令 inline syscall（~42 字节）改为 `mov al, [r13]; mov [rbx], al; add rbx, 1; cmp rbx, rbp; jne skip; call flush_output; skip:`（~20 字节热路径、1/4096 触发 syscall）。`GetByte` 前 `call flush_output` 以便交互式提示在 `,` 可能阻塞前可见；`exit(0)` 前同样 flush。新 `AsmInst::{MovAlMemR13, MovMemRbxAl}` 变体 + 编码与 3 条编码单测；`Reg64::Rbp` 首次被本后端使用，加入 reg_num / Display 表。
+  - **Windows 后端侧（待）**：`src/backend/x86_64/windows.rs` 的 `emit_put_byte` / `emit_get_byte` 仍走 `WriteFile` / `ReadFile` IAT 调用，每字节一次。后续 commit 以相同语义改造。
+  - 文件：`src/runtime/io.rs`、`src/driver/run.rs`、`src/interp/engine.rs`、`src/backend/asm.rs`、`src/backend/codegen.rs`、`src/backend/x86_64/encode.rs`、`src/backend/x86_64/debug.rs`；测试 `tests/buffered_io.rs`（>4 KiB 解释器 + Linux 编译两条 + `,` EOF 回 255）、`src/backend/x86_64/encode.rs` 3 单测
 - **D4 最小寄存器分配器**：为 `LinearMul` / loop 头的乘数与 src 值引入 `rbx / rax / rcx` 的显式使用跟踪（当前 `codegen.rs:143-159` 手工硬编码）。不做通用 RA，仅做 “多余 mov 消除” 级别的局部 allocator。为 Phase F 更激进的 codegen 铺路。
 - **D5 跳转对齐 + 分支提示**：loop 头对齐 16B；给 `JumpIfZero` 加 `2e` / `3e` 分支提示前缀（Intel 上已无效，AMD 仍解析）——优先级最低。
 
@@ -142,10 +145,10 @@ A1 → A2 → A3 → A4                        （回归衡量）
   └→ C2 (bounds batching) ✓ → C4 (scan hint) ✓、D2 (SIMD)
 
 C1 (LIR peephole) ✓、D1 (指令选择) ✓、
-D3 (buffered I/O — 解释器侧 ✓ / 后端侧 pending)、
+D3 (buffered I/O — 解释器 ✓ / Linux 后端 ✓ / Windows 后端 pending)、
 E1 / E2 (superinstruction + threaded dispatch) ✓、
 E3 (interp LinearMul ±1 快路径) ✓、E4 (tape 倍增) ✓ 均可并行启动。
-已落地：E5、C1、D1、E4、Phase A (A1–A4)、B1、B2、B3、B4、B6、C2、C3、C4、E1、E2、E3、D3 (解释器侧)。
+已落地：E5、C1、D1、E4、Phase A (A1–A4)、B1、B2、B3、B4、B6、C2、C3、C4、E1、E2、E3、D3 (解释器 + Linux 后端)。
 
 Phase F 全部不在近期依赖图内。
 ```
