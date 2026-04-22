@@ -348,11 +348,21 @@ fn optimize_block_o1_with_parent_env(insts: Vec<HirInst>, nested: bool) -> Vec<H
             HirInst::Loop(body) => {
                 let inner = optimize_block_o1_with_parent_env(body.clone(), true);
 
+                // B2: when the enclosing block's `TapeState` proves the
+                // head cell is `Zero` at loop entry, the body never runs —
+                // drop the entire `Loop` regardless of inner shape.  This
+                // supersedes the old "empty body + known-zero" check and
+                // also kills redundant `LinearMul` / `Scan` that
+                // `try_loop_specialize` would otherwise emit for a body
+                // that never executes.  The `env` fact is threaded by the
+                // enclosing block's forward walk, so this is cross-block
+                // information relative to the loop header.
+                if env.value_at_ptr() == Some(0) {
+                    i += 1;
+                    continue;
+                }
+
                 if inner.is_empty() {
-                    if env.value_at_ptr() == Some(0) {
-                        i += 1;
-                        continue;
-                    }
                     push_o1(&mut out, HirInst::Loop(inner));
                     env.clobber_all();
                     i += 1;
@@ -424,11 +434,13 @@ mod tests {
 
     #[test]
     fn o1_clears_simple_minus_loop() {
+        // `GetByte;` prefix puts the head cell in `Top`, defeating B2's
+        // known-zero loop drop so the specialisation path is exercised.
         let p = HirProgram {
-            insts: vec![HirInst::Loop(vec![HirInst::Add(-1)])],
+            insts: vec![HirInst::GetByte, HirInst::Loop(vec![HirInst::Add(-1)])],
         };
         let o = optimize_o1(p);
-        assert_eq!(o.insts, vec![HirInst::Zero]);
+        assert_eq!(o.insts, vec![HirInst::GetByte, HirInst::Zero]);
     }
 
     #[test]
@@ -452,26 +464,33 @@ mod tests {
 
     #[test]
     fn o1_copy_loop_to_linear_mul() {
-        // [->+<]
+        // [->+<]  — prefixed with `GetByte` so B2 doesn't drop the
+        // head-zero loop before specialisation runs.
         let p = HirProgram {
-            insts: vec![HirInst::Loop(vec![
-                HirInst::Add(-1),
-                HirInst::Move(1),
-                HirInst::Add(1),
-                HirInst::Move(-1),
-            ])],
+            insts: vec![
+                HirInst::GetByte,
+                HirInst::Loop(vec![
+                    HirInst::Add(-1),
+                    HirInst::Move(1),
+                    HirInst::Add(1),
+                    HirInst::Move(-1),
+                ]),
+            ],
         };
         let o = optimize_o1(p);
-        assert_eq!(o.insts, vec![HirInst::LinearMul(vec![(1, 1)])]);
+        assert_eq!(
+            o.insts,
+            vec![HirInst::GetByte, HirInst::LinearMul(vec![(1, 1)])]
+        );
     }
 
     #[test]
     fn o1_scan_right() {
         let p = HirProgram {
-            insts: vec![HirInst::Loop(vec![HirInst::Move(1)])],
+            insts: vec![HirInst::GetByte, HirInst::Loop(vec![HirInst::Move(1)])],
         };
         let o = optimize_o1(p);
-        assert_eq!(o.insts, vec![HirInst::Scan(1)]);
+        assert_eq!(o.insts, vec![HirInst::GetByte, HirInst::Scan(1)]);
     }
 
     #[test]
@@ -522,33 +541,43 @@ mod tests {
         // [--->+<] : head delta -3 (odd ⇒ terminates), body writes +1 at offset 1.
         // Iteration count n = v · invmod(-(-3), 256) = v · 171 (mod 256).
         // So cell[1] += v · 171 (mod 256), i.e. factor == 171.
+        // `GetByte` prefix makes the head value `Top`, so neither B6 nor B2 fires.
         let p = HirProgram {
-            insts: vec![HirInst::Loop(vec![
-                HirInst::Add(-3),
-                HirInst::Move(1),
-                HirInst::Add(1),
-                HirInst::Move(-1),
-            ])],
+            insts: vec![
+                HirInst::GetByte,
+                HirInst::Loop(vec![
+                    HirInst::Add(-3),
+                    HirInst::Move(1),
+                    HirInst::Add(1),
+                    HirInst::Move(-1),
+                ]),
+            ],
         };
         let o = optimize_o1(p);
-        assert_eq!(o.insts, vec![HirInst::LinearMul(vec![(1, 171)])]);
+        assert_eq!(
+            o.insts,
+            vec![HirInst::GetByte, HirInst::LinearMul(vec![(1, 171)])]
+        );
     }
 
     #[test]
     fn o1_rejects_even_head_delta_loop() {
         // [-->+<] : head delta -2 (even ⇒ can run forever for odd v). Must stay as Loop.
         let p = HirProgram {
-            insts: vec![HirInst::Loop(vec![
-                HirInst::Add(-2),
-                HirInst::Move(1),
-                HirInst::Add(1),
-                HirInst::Move(-1),
-            ])],
+            insts: vec![
+                HirInst::GetByte,
+                HirInst::Loop(vec![
+                    HirInst::Add(-2),
+                    HirInst::Move(1),
+                    HirInst::Add(1),
+                    HirInst::Move(-1),
+                ]),
+            ],
         };
         let o = optimize_o1(p);
         assert!(
-            matches!(o.insts.as_slice(), [HirInst::Loop(_)]),
-            "expected Loop, got {:?}",
+            matches!(o.insts.as_slice(), [HirInst::GetByte, HirInst::Loop(_)]),
+            "expected [GetByte, Loop], got {:?}",
             o.insts
         );
     }
@@ -558,15 +587,21 @@ mod tests {
         // [+++>+<] : head delta +3 is also odd, loop terminates.
         // invmod(3, 256) = 171 ⇒ scale = -171 mod 256 = 85.
         let p = HirProgram {
-            insts: vec![HirInst::Loop(vec![
-                HirInst::Add(3),
-                HirInst::Move(1),
-                HirInst::Add(1),
-                HirInst::Move(-1),
-            ])],
+            insts: vec![
+                HirInst::GetByte,
+                HirInst::Loop(vec![
+                    HirInst::Add(3),
+                    HirInst::Move(1),
+                    HirInst::Add(1),
+                    HirInst::Move(-1),
+                ]),
+            ],
         };
         let o = optimize_o1(p);
-        assert_eq!(o.insts, vec![HirInst::LinearMul(vec![(1, 85)])]);
+        assert_eq!(
+            o.insts,
+            vec![HirInst::GetByte, HirInst::LinearMul(vec![(1, 85)])]
+        );
     }
 
     #[test]
@@ -574,22 +609,22 @@ mod tests {
         // [---] : head decrements by 3 per iter (odd ⇒ terminates).
         // Since only the head is touched, factors == [] → specialise to Zero.
         let p = HirProgram {
-            insts: vec![HirInst::Loop(vec![HirInst::Add(-3)])],
+            insts: vec![HirInst::GetByte, HirInst::Loop(vec![HirInst::Add(-3)])],
         };
         let o = optimize_o1(p);
-        assert_eq!(o.insts, vec![HirInst::Zero]);
+        assert_eq!(o.insts, vec![HirInst::GetByte, HirInst::Zero]);
     }
 
     #[test]
     fn o1_rejects_even_decrement_clear_loop() {
         // [--] : head delta -2 does not clear the cell when v is odd.
         let p = HirProgram {
-            insts: vec![HirInst::Loop(vec![HirInst::Add(-2)])],
+            insts: vec![HirInst::GetByte, HirInst::Loop(vec![HirInst::Add(-2)])],
         };
         let o = optimize_o1(p);
         assert!(
-            matches!(o.insts.as_slice(), [HirInst::Loop(_)]),
-            "expected Loop, got {:?}",
+            matches!(o.insts.as_slice(), [HirInst::GetByte, HirInst::Loop(_)]),
+            "expected [GetByte, Loop], got {:?}",
             o.insts
         );
     }
@@ -599,17 +634,26 @@ mod tests {
         // [--->+>>-<<<] : head delta -3, writes +1 at off 1 and -1 at off 3.
         // Scale = 171. factors = [(1, 171), (3, -171)]. Both ≠ 0 mod 256.
         let p = HirProgram {
-            insts: vec![HirInst::Loop(vec![
-                HirInst::Add(-3),
-                HirInst::Move(1),
-                HirInst::Add(1),
-                HirInst::Move(2),
-                HirInst::Add(-1),
-                HirInst::Move(-3),
-            ])],
+            insts: vec![
+                HirInst::GetByte,
+                HirInst::Loop(vec![
+                    HirInst::Add(-3),
+                    HirInst::Move(1),
+                    HirInst::Add(1),
+                    HirInst::Move(2),
+                    HirInst::Add(-1),
+                    HirInst::Move(-3),
+                ]),
+            ],
         };
         let o = optimize_o1(p);
-        assert_eq!(o.insts, vec![HirInst::LinearMul(vec![(1, 171), (3, -171)])]);
+        assert_eq!(
+            o.insts,
+            vec![
+                HirInst::GetByte,
+                HirInst::LinearMul(vec![(1, 171), (3, -171)])
+            ]
+        );
     }
 
     // --- B6: small-loop unrolling when the head value is known ---
@@ -743,13 +787,13 @@ mod tests {
         assert!(o.insts.is_empty());
     }
 
+    // --- B2: cross-block zero-loop elimination driven by `TapeState` ---
+
     #[test]
-    fn b6_head_zero_keeps_linear_mul_for_now() {
-        // Non-empty body + v == 0: B6 returns `None`; `try_loop_specialize`
-        // still emits `LinearMul`.  Dropping this redundant LinearMul is
-        // B2 territory (handled in a follow-up commit) — this test pins
-        // the current behaviour so B2's change shows up as an intentional
-        // delta.
+    fn b2_drops_affine_loop_when_head_known_zero_at_entry() {
+        // Fresh program → env cell[0] = Const(0). A non-empty affine body
+        // that `try_loop_specialize` would otherwise lower to `LinearMul`
+        // is now dropped entirely because the body never executes.
         let p = HirProgram {
             insts: vec![HirInst::Loop(vec![
                 HirInst::Add(-1),
@@ -759,6 +803,90 @@ mod tests {
             ])],
         };
         let o = optimize_o1(p);
-        assert_eq!(o.insts, vec![HirInst::LinearMul(vec![(1, 1)])]);
+        assert!(o.insts.is_empty(), "expected empty, got {:?}", o.insts);
+    }
+
+    #[test]
+    fn b2_drops_scan_loop_when_head_known_zero() {
+        // `[>]` at head == 0 is a no-op; must drop, not survive as Scan.
+        let p = HirProgram {
+            insts: vec![HirInst::Loop(vec![HirInst::Move(1)])],
+        };
+        let o = optimize_o1(p);
+        assert!(o.insts.is_empty(), "expected empty, got {:?}", o.insts);
+    }
+
+    #[test]
+    fn b2_drops_loop_after_arith_cancel_to_zero() {
+        // Add(5); Add(-5) nets to 0 — env re-proves head == 0, so the
+        // trailing loop drops.  Exercises the env-thread-through-block
+        // path rather than the program-start case.
+        let p = HirProgram {
+            insts: vec![
+                HirInst::Add(5),
+                HirInst::Add(-5),
+                HirInst::Loop(vec![HirInst::Add(-1)]),
+            ],
+        };
+        let o = optimize_o1(p);
+        assert!(o.insts.is_empty(), "expected empty, got {:?}", o.insts);
+    }
+
+    #[test]
+    fn b2_drops_loop_after_explicit_zero_inst() {
+        // `Zero` inst makes head == 0 an A3 fact; subsequent loop drops.
+        let p = HirProgram {
+            insts: vec![
+                HirInst::GetByte,
+                HirInst::Zero,
+                HirInst::Loop(vec![
+                    HirInst::Add(-1),
+                    HirInst::Move(1),
+                    HirInst::Add(1),
+                    HirInst::Move(-1),
+                ]),
+            ],
+        };
+        let o = optimize_o1(p);
+        // B2 drops the Loop; the `Zero` survives (current DSE does not do
+        // read-reachability to end-of-program) but is cheap and sets up
+        // cell 0 for any future instruction.
+        assert_eq!(o.insts, vec![HirInst::GetByte, HirInst::Zero]);
+    }
+
+    #[test]
+    fn b2_does_not_drop_when_head_unknown() {
+        // `GetByte` leaves head at `Top` — loop must survive and
+        // specialise to `LinearMul`.
+        let p = HirProgram {
+            insts: vec![
+                HirInst::GetByte,
+                HirInst::Loop(vec![
+                    HirInst::Add(-1),
+                    HirInst::Move(1),
+                    HirInst::Add(1),
+                    HirInst::Move(-1),
+                ]),
+            ],
+        };
+        let o = optimize_o1(p);
+        assert_eq!(
+            o.insts,
+            vec![HirInst::GetByte, HirInst::LinearMul(vec![(1, 1)])]
+        );
+    }
+
+    #[test]
+    fn b2_drops_nested_outer_loop_when_outer_head_zero() {
+        // Outer loop head known zero at program start → outer drops, and
+        // with it any inner specialisation/clobber work.
+        let p = HirProgram {
+            insts: vec![HirInst::Loop(vec![
+                HirInst::Loop(vec![HirInst::Add(-1)]),
+                HirInst::Move(1),
+            ])],
+        };
+        let o = optimize_o1(p);
+        assert!(o.insts.is_empty(), "expected empty, got {:?}", o.insts);
     }
 }

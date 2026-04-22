@@ -17,7 +17,7 @@
 - **O1** `optimize_o1`（`optimize.rs:60-68`）：O0 融合 + `try_scan_loop` / `is_byte_clear_loop` / `try_linear_loop`（`optimize.rs:151-197`）+ 基于 A1 `TapeState` 的常量传播（`optimize.rs:219-307`）+ `push_o1` peephole（`optimize.rs:309-329`）+ **B1 DSE**（`src/ir/dse.rs`）串联在管线末端
 - **O2** `try_optimize_o2`（`optimize.rs:74-87`）：对 O1 不动点迭代（含 DSE），4096 上限
 - **O3**：不是独立 HIR pass，在 `src/driver/run.rs:138-176` 做整程序折叠（无 `PutByte` → `exit(0)`；无 `GetByte` → 离线跑完再 `write + exit`）
-- **分析基础设施**：`src/ir/analysis/` 下的 A1 `TapeState` / A2 `LoopEffect` / A3 `CellLattice` 四点格 / A4 `run_forward` forward dataflow 骨架全部落地（57 单元测试覆盖）。A1+A3 已接入 O1 的常量传播（A3 的 `add_wrapping` 驱动 `TapeState::apply` 的 `Add` 分支）；A2 / A4 仍是待接入的基础设施，等待后续 B2 / B3 / B5 等消费者
+- **分析基础设施**：`src/ir/analysis/` 下的 A1 `TapeState` / A2 `LoopEffect` / A3 `CellLattice` 四点格 / A4 `run_forward` forward dataflow 骨架全部落地（57 单元测试覆盖）。A1 + A3 已接入 O1 常量传播（A3 的 `add_wrapping` 驱动 `TapeState::apply` 的 `Add` 分支）；A3 `is_zero` 进一步驱动 B2 `Loop` 丢弃与 B6 小循环展开。A2 / A4 仍是待接入的基础设施——`run_forward` 的跨循环 fixpoint 精度留给 B5 LICM；`LoopEffect` 是 B7 K6 的前置
 
 ### 1.2 LIR 层（`src/ir/lir.rs`, `src/ir/lower.rs`）
 
@@ -57,7 +57,8 @@
 
 - **B1 Dead store elimination** · **[已实现]**：`src/ir/dse.rs` 的 `dead_store_elimination` 做前向句法重写——虚拟指针 + `BTreeMap<isize, usize>` pending 写集。某 offset 的写被后续同 offset 写覆盖且中间无读时丢弃前者。`Loop` / `Scan` / `LinearMul` 作为 barrier 清空 pending 并递归进入 `Loop` body；`PutByte` / `Add` 提交（读到）前写，`GetByte` / `Zero` 无条件覆盖前写，`GetByte` 本身不可丢（输入副作用）。覆盖 `push_o1` 错过的 Move 间隔、GetByte 覆盖两类场景。串联在 `optimize_o1` 末端，O2 不动点循环自动受益。最终实现纯句法，不消费 A4 `run_forward`（A3 `CellLattice` 留给后续 B2 / B5 的 cross-block 变体使用）。
   - 文件：`src/ir/dse.rs`；集成点 `src/ir/optimize.rs:optimize_o1`
-- **B2 已知零格循环消除的跨 block 扩展**：O1 只在 block 入口 `ConstEnv` 做；A3 允许在 `Loop` 边界识别 `value_at_ptr == Zero` 并整块丢弃。
+- **B2 已知零格循环消除的跨 block 扩展** · **[已实现]**：`src/ir/optimize.rs` 在 `Loop` 分支入口处，先于 `inner.is_empty()` 与 `try_loop_specialize` 判断 `env.value_at_ptr() == Some(0)`——`TapeState` 的前向 env 由整个父 block 贯穿携带，把 "Loop 进入时头格证明为零" 从原 `empty body + v==0` 单一路径扩到任意 body 形态（包括之前仍生成无效 `LinearMul` / `Scan` / `Loop` 的情形）。覆盖的场景：程序起始 `TapeState::new_program()` 令 `cell[0]=Const(0)`、`Add(5); Add(-5); [...]` 之类算术归零、显式 `Zero; [...]`、嵌套 `Loop` 外层零值等。实现未引入 `run_forward`——当前父 block 已是单线程前向走位，B2 只补丢弃决策；`run_forward` 的跨循环 fixpoint 精度留给后续 B5 LICM 作首个正式消费者。
+  - 文件：`src/ir/optimize.rs`（6 B2 单测 + 9 既有 Loop 路径测试改以 `GetByte` 前缀阻 B2 以继续覆盖 specialisation 分支）
 - **B3 LinearMul 泛化（头格 gcd 放宽）** · **[已实现]**：`src/ir/optimize.rs` 的 `try_linear_loop` 现接受任意奇数头格 `d0`——通过 `invmod_256(d0)`（扩展欧几里得）在编译期算出迭代次数的乘法逆元，将 body 中每个 factor 统一缩放到 `factor * invmod(-d0, 256)` mod 256 后沿用既有 `LinearMul` 数据结构，不新增变体。偶数头格仍被拒（`gcd(|d0| mod 256, 256) ≠ 1` 时循环要么非终止、要么非整数迭代）。`is_byte_clear_loop` 同步放宽，识别任何奇数步长的 `[-]` / `[--]` 等价形式。嵌套 `LinearMul` body 与 ±1-only fused copy 两种形态暂未纳入，作为 B6 / B7 的延伸。
   - 文件：`src/ir/optimize.rs`（9 单测：`invmod_256` 全表覆盖、奇负头格、多 offset、偶数拒绝）
 - **B4 Pointer postponement（指针延后 / 偏移化）** · **[已实现]**：业界标准命名（[Nayuki](https://www.nayuki.io/page/optimizing-brainfuck-compiler)、[matslina](https://github.com/matslina/bfoptimization) 称 “operation offsets”，bfc 称 “postponing movements”）。最终落实为 LIR-only 方案（不新增 HIR 变体，避免污染 HIR interpreter 与现有 pattern detector）：`src/ir/lir_postpone.rs` 的 `postpone_pointer_adds` 按 straight-line window 累积 `virt_ptr: isize` 与 `pending: BTreeMap<isize, PendingOp>`，遇到 barrier（`Label` / `JumpIfZero` / `JumpIfNonZero` / `Scan` / `LinearMul` / `PutByte` / `GetByte` 以及上一次 pass 残留的 `CellAddAt` / `CellSetAt`）或 `virt_ptr` 要越 disp8 边界时触发 flush；flush 前按 `(lo, hi)` 两极发探针 `PtrAdd`，由后端的 `ensure_tape_contains_r15` 对接 tape 倍增，利用 tape 映射的连续性保证窗口内所有偏移都已被 bounds check。disp 范围限定在 `[-127, 127]`（disp32 推迟到 C2 落地后放宽）。挂在 `-O1` 及以上的 `optimize_lir(lower_to_lir(hir))` 之前。
@@ -67,7 +68,7 @@
   - 文件：`src/ir/optimize.rs`（6 单测：单 offset、多 offset、i8 canonicalisation、未知头、empty body 回归、v==0 pin B2 前行为）
 - **B7 Deep balanced loop（K6 算法，选配）**：[Oizys](https://github.com/jjcmoon/Oizys) 提出的 K6 算法对嵌套 balanced loop 做统一分析，覆盖 `try_linear_loop` + `try_scan_loop` 无法触达的程序类。作为 B3 / B4 稳定后的研究性扩展。
 
-**依赖：B1 / B3 / B4 / B6 已落地；B2 直接依赖 A3 / A4；B5 依赖 A3；B7 依赖 B3 + B4 + A2。**
+**依赖：B1 / B2 / B3 / B4 / B6 已落地；B5 依赖 A3；B7 依赖 B3 + B4 + A2。**
 
 ### Phase C — LIR peephole 新层
 
@@ -132,7 +133,7 @@ E5 (bench)  ──────────────────────�
 A1 → A2 → A3 → A4                        （回归衡量）
   │    │    │    │
   │    │    │    └→ B1 (DSE) ✓
-  │    │    └→ B2 (zero-loop), B5 (LICM), B6 (unroll) ✓
+  │    │    └→ B2 (zero-loop) ✓, B5 (LICM), B6 (unroll) ✓
   │    └→ B3 (LinearMul 泛化) ✓, B4 (pointer postponement) ✓, B7 (K6)
   │         │
   │         └→ C3 (displacement) ✓ → D2 / D4
@@ -143,7 +144,7 @@ C1 (LIR peephole) ✓、D1 (指令选择) ✓、
 D3 (buffered I/O — 解释器侧 ✓ / 后端侧 pending)、
 E1 / E2 (superinstruction + threaded dispatch) ✓、
 E3 (SIMD tape)、E4 (tape 倍增) ✓ 均可并行启动。
-已落地：E5、C1、D1、E4、Phase A (A1–A4)、B1、B3、B4、B6、C2、C3、C4、E1、E2、D3 (解释器侧)。
+已落地：E5、C1、D1、E4、Phase A (A1–A4)、B1、B2、B3、B4、B6、C2、C3、C4、E1、E2、D3 (解释器侧)。
 
 Phase F 全部不在近期依赖图内。
 ```

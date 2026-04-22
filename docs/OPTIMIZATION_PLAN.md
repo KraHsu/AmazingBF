@@ -17,7 +17,7 @@ This document is the modernization roadmap for the AmazingBF toolchain's compila
 - **O1** `optimize_o1` (`optimize.rs:60-68`): O0 fusion + `try_scan_loop` / `is_byte_clear_loop` / `try_linear_loop` (`optimize.rs:151-197`) + A1-`TapeState`-driven constant propagation (`optimize.rs:219-307`) + `push_o1` peephole (`optimize.rs:309-329`) + **B1 DSE** (`src/ir/dse.rs`) chained at the end of the pipeline
 - **O2** `try_optimize_o2` (`optimize.rs:74-87`): fixed-point iteration of O1 (DSE included), capped at 4096 iterations
 - **O3**: not a standalone HIR pass; `src/driver/run.rs:138-176` performs whole-program folding (no `PutByte` → `exit(0)`; no `GetByte` → run offline then `write + exit`)
-- **Analysis infrastructure**: under `src/ir/analysis/`, all of A1 `TapeState` / A2 `LoopEffect` / A3 `CellLattice` four-point lattice / A4 `run_forward` forward dataflow skeleton are in place (57 unit tests). A1+A3 already drive O1's constant propagation (A3's `add_wrapping` powers the `Add` arm of `TapeState::apply`); A2 / A4 remain pending infrastructure, awaiting consumers like B2 / B3 / B5
+- **Analysis infrastructure**: under `src/ir/analysis/`, all of A1 `TapeState` / A2 `LoopEffect` / A3 `CellLattice` four-point lattice / A4 `run_forward` forward dataflow skeleton are in place (57 unit tests). A1 + A3 drive O1's constant propagation (A3's `add_wrapping` powers the `Add` arm of `TapeState::apply`); A3 `is_zero` further drives B2 `Loop` drops and B6 small-loop unrolling. A2 / A4 remain pending — `run_forward`'s per-loop fixed-point precision is reserved for B5 LICM; `LoopEffect` is the prerequisite for B7 K6
 
 ### 1.2 LIR layer (`src/ir/lir.rs`, `src/ir/lower.rs`)
 
@@ -57,7 +57,8 @@ Six phases in dependency order: A analysis infrastructure → B HIR passes → C
 
 - **B1 Dead store elimination** · **[landed]**: `src/ir/dse.rs`'s `dead_store_elimination` is a forward syntactic rewrite — virtual pointer + `BTreeMap<isize, usize>` pending-write set. A write at some offset is dropped when a later write at the same offset covers it with no intervening read. `Loop` / `Scan` / `LinearMul` act as barriers that clear pending and recurse into `Loop` body; `PutByte` / `Add` commit (read-back) prior writes; `GetByte` / `Zero` unconditionally overwrite prior writes; `GetByte` itself is never droppable (input side effect). Covers the two cases `push_o1` misses: Move intervals and GetByte overwrites. Chained at the end of `optimize_o1`, automatically amplified by the O2 fixed-point loop. Final implementation is purely syntactic and does not consume A4 `run_forward` (A3 `CellLattice` is reserved for later B2 / B5 cross-block variants).
   - Files: `src/ir/dse.rs`; integration point `src/ir/optimize.rs:optimize_o1`
-- **B2 Cross-block extension of known-zero-cell loop elimination**: O1 only does this at the block-entry `ConstEnv`; A3 enables recognizing `value_at_ptr == Zero` at `Loop` boundaries and dropping the entire block.
+- **B2 Cross-block extension of known-zero-cell loop elimination** · **[landed]**: `src/ir/optimize.rs` now consults `env.value_at_ptr() == Some(0)` at the very top of the `Loop` arm, before both the `inner.is_empty()` fast path and `try_loop_specialize`. Because the parent block threads its `TapeState` forward across every instruction, "head cell provably zero at loop entry" is available as a cross-instruction fact — not only for the literal program-start case where `TapeState::new_program()` seeds `cell[0] = Const(0)`, but also for arithmetic-cancel patterns (`Add(5); Add(-5); [...]`), explicit `Zero; [...]`, and nested outer loops whose outer head is zero. Previously these bodies still lowered to a (semantically no-op but emitted) `LinearMul` / `Scan` / preserved `Loop`; B2 drops them. The pass does not yet use `run_forward` — the existing in-order env walk already delivers straight-line forward facts, and the fix-point precision `run_forward` buys (re-converging facts across loops) is reserved as the motivating consumer for B5 LICM.
+  - Files: `src/ir/optimize.rs` (6 new B2 unit tests; 9 pre-existing Loop-specialisation tests were rewritten to prefix `GetByte` so they still exercise the `LinearMul` / `Scan` / `Zero` specialisation path now that B2 intercepts the known-zero case)
 - **B3 LinearMul generalization (head-cell gcd relaxation)** · **[landed]**: `src/ir/optimize.rs`'s `try_linear_loop` now accepts any odd head delta `d0`. `invmod_256(d0)` (extended Euclid) computes the multiplicative inverse for the iteration count at compile time; every body factor is uniformly rescaled to `factor * invmod(-d0, 256) mod 256`, reusing the existing `LinearMul` data shape (no new variants). Even head deltas are still rejected (`gcd(|d0| mod 256, 256) ≠ 1` means the loop is either non-terminating or has non-integer iteration count). `is_byte_clear_loop` was relaxed symmetrically to recognise any odd-step `[-]` / `[--]`-equivalent form. Nested `LinearMul` bodies and the ±1-only fused-copy form remain out of scope and are deferred to B6 / B7.
   - Files: `src/ir/optimize.rs` (9 unit tests: full-table `invmod_256` coverage, negative-odd head deltas, multi-offset bodies, even rejections)
 - **B4 Pointer postponement (operation offsets / offset-form)** · **[landed]**: standard industry naming ([Nayuki](https://www.nayuki.io/page/optimizing-brainfuck-compiler), [matslina](https://github.com/matslina/bfoptimization) call it "operation offsets", bfc calls it "postponing movements"). Ultimately realized as a LIR-only pass (no new HIR variants, avoiding pollution of the HIR interpreter and existing pattern detectors): `src/ir/lir_postpone.rs`'s `postpone_pointer_adds` accumulates `virt_ptr: isize` plus `pending: BTreeMap<isize, PendingOp>` over a straight-line window. On encountering a barrier (`Label` / `JumpIfZero` / `JumpIfNonZero` / `Scan` / `LinearMul` / `PutByte` / `GetByte`, or a `CellAddAt` / `CellSetAt` left over from a prior pass), or when `virt_ptr` would cross the disp8 boundary, a flush is triggered; the flush first emits probe `PtrAdd`s visiting the `(lo, hi)` extremes, delegating to the backend's `ensure_tape_contains_r15` for tape doubling and relying on the contiguity of the tape mapping to guarantee that every offset in the window is already bounds-checked. disp is capped at `[-127, 127]` (disp32 deferred until C2 lands). Runs before `optimize_lir(lower_to_lir(hir))` at `-O1` and above.
@@ -67,7 +68,7 @@ Six phases in dependency order: A analysis infrastructure → B HIR passes → C
   - Files: `src/ir/optimize.rs` (6 unit tests: single offset, multi-offset, i8 canonicalisation, unknown head, empty body regression, `v == 0` pin of pre-B2 behaviour)
 - **B7 Deep balanced loop (K6 algorithm, optional)**: the K6 algorithm from [Oizys](https://github.com/jjcmoon/Oizys) performs a unified analysis of nested balanced loops, covering program classes that `try_linear_loop` + `try_scan_loop` cannot reach. A research extension once B3 / B4 are stable.
 
-**Dependencies: B1 / B3 / B4 / B6 have landed; B2 directly depends on A3 / A4; B5 depends on A3; B7 depends on B3 + B4 + A2.**
+**Dependencies: B1 / B2 / B3 / B4 / B6 have landed; B5 depends on A3; B7 depends on B3 + B4 + A2.**
 
 ### Phase C — New LIR peephole layer
 
@@ -132,7 +133,7 @@ E5 (bench)  ──────────────────────�
 A1 → A2 → A3 → A4                        (regression baseline)
   │    │    │    │
   │    │    │    └→ B1 (DSE) ✓
-  │    │    └→ B2 (zero-loop), B5 (LICM), B6 (unroll) ✓
+  │    │    └→ B2 (zero-loop) ✓, B5 (LICM), B6 (unroll) ✓
   │    └→ B3 (LinearMul generalization) ✓, B4 (pointer postponement) ✓, B7 (K6)
   │         │
   │         └→ C3 (displacement) ✓ → D2 / D4
@@ -143,7 +144,7 @@ C1 (LIR peephole) ✓, D1 (instruction selection) ✓,
 D3 (buffered I/O — interpreter ✓ / backend pending),
 E1 / E2 (super-instructions + threaded dispatch) ✓,
 E3 (SIMD tape), E4 (tape doubling) ✓ can all start in parallel.
-Landed: E5, C1, D1, E4, Phase A (A1–A4), B1, B3, B4, B6, C2, C3, C4, E1, E2, D3 (interpreter side).
+Landed: E5, C1, D1, E4, Phase A (A1–A4), B1, B2, B3, B4, B6, C2, C3, C4, E1, E2, D3 (interpreter side).
 
 Phase F items are all outside the near-term dependency graph.
 ```
