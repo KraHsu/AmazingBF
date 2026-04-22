@@ -34,6 +34,20 @@ use crate::backend::x86_64::encode::encode_program_with_inst_map;
 /// Byte length of the short Jcc / JMP forms (opcode + rel8).
 const SHORT_JUMP_LEN: usize = 2;
 
+/// Byte length of short Jz / Jnz with the D5 branch-hint prefix (0x2E / 0x3E).
+/// The hint prefix adds one byte to the standard two-byte short form.
+const SHORT_JUMP_LEN_WITH_HINT: usize = 3;
+
+/// Length of the short form `inst` will encode to.  Short Jz / Jnz carry a
+/// branch-hint prefix (D5) so they measure three bytes; every other short
+/// Jcc / JMP is the two-byte `opcode + rel8` shape.
+fn short_form_len(inst: &AsmInst) -> usize {
+    match inst {
+        AsmInst::JzShort(_) | AsmInst::JnzShort(_) => SHORT_JUMP_LEN_WITH_HINT,
+        _ => SHORT_JUMP_LEN,
+    }
+}
+
 /// Relax every long Jcc / JMP whose target fits in rel8, iterating until a
 /// fixed point is reached.
 ///
@@ -54,7 +68,7 @@ pub(crate) fn relax_jumps(mut program: AsmProgram) -> AsmProgram {
             let target = *label_offsets
                 .get(&target_label)
                 .unwrap_or_else(|| panic!("relax: unbound label {:?}", target_label));
-            let next_ip = inst_offsets[idx] + SHORT_JUMP_LEN;
+            let next_ip = inst_offsets[idx] + short_form_len(&short_inst);
             let rel = target as i64 - next_ip as i64;
             if i8::try_from(rel).is_ok() {
                 *inst = short_inst;
@@ -195,7 +209,9 @@ mod tests {
     }
 
     #[test]
-    fn encoder_emits_two_bytes_for_short_jump() {
+    fn encoder_emits_three_bytes_for_hinted_short_jz() {
+        // D5: short Jz carries the 0x2E branch-not-taken hint prefix, so
+        // the total encoding is hint + opcode + rel8 = 3 bytes.
         let target = lbl(6);
         let program = AsmProgram {
             insts: vec![
@@ -205,10 +221,11 @@ mod tests {
             ],
         };
         let encoded = encode_program(&program);
-        // jz rel8 = 2 bytes; ret = 1 byte.
-        assert_eq!(encoded.text.len(), 3);
-        assert_eq!(encoded.text[0], 0x74); // opcode jz rel8
-        assert_eq!(encoded.text[1], 0x00); // displacement to the immediately-following instruction
+        // hinted jz rel8 = 3 bytes; ret = 1 byte.
+        assert_eq!(encoded.text.len(), 4);
+        assert_eq!(encoded.text[0], 0x2E); // not-taken hint prefix
+        assert_eq!(encoded.text[1], 0x74); // opcode jz rel8
+        assert_eq!(encoded.text[2], 0x00); // displacement to the immediately-following instruction
     }
 
     #[test]

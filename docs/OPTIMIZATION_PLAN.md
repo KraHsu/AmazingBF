@@ -98,7 +98,8 @@ Goal: add `src/ir/lir_opt.rs` after `src/ir/lower.rs` to provide a no-analysis p
   - **Windows backend side (pending)**: `src/backend/x86_64/windows.rs`'s `emit_put_byte` / `emit_get_byte` still emit per-byte `WriteFile` / `ReadFile` IAT calls. A follow-up commit will mirror the Linux buffering using the same register convention.
   - Files: `src/runtime/io.rs`, `src/driver/run.rs`, `src/interp/engine.rs`, `src/backend/asm.rs`, `src/backend/codegen.rs`, `src/backend/x86_64/encode.rs`, `src/backend/x86_64/debug.rs`; tests `tests/buffered_io.rs` (interpreter + Linux compile, both `>4 KiB` plus `,` EOF returns 255) and three new encoding tests in `src/backend/x86_64/encode.rs`
 - **D4 Minimal register allocator**: track the explicit use of `rbx / rax / rcx` for `LinearMul` / loop-head multiplicands and source values (currently `codegen.rs:143-159` hard-codes them). Not a general RA — just a local "redundant-mov elimination" allocator. Paves the way for more aggressive codegen in Phase F.
-- **D5 Jump alignment + branch hints**: align loop heads to 16B; attach `2e` / `3e` branch-hint prefixes to `JumpIfZero` (no-op on Intel, still parsed by AMD) — lowest priority.
+- **D5 Branch hints + loop-head alignment** · **[branch hints landed / 16B loop-head alignment deferred]**: `src/backend/x86_64/encode.rs` now prepends `0x2E` (not-taken hint, matching the not-taken semantics of BF `[` — we almost always enter the loop body) to every `Jz` / `JzShort`, and `0x3E` (taken hint, matching BF `]` which usually loops back) to every `Jnz` / `JnzShort`. The long form grows from 6 to 7 bytes and the short form from 2 to 3 bytes; `relax.rs` picks up a `short_form_len(inst)` helper so the rel8 offset calculation distinguishes hinted `JzShort` / `JnzShort` (3 bytes) from other short jumps (2 bytes). Intel has ignored these segment-override prefixes since Netburst, AMD still parses them as static branch hints, and both vendors treat the encoding as a legal no-op prefix so no microarchitecture regresses. 16B loop-head alignment is deferred — it would require introducing a variable-length `Align` pseudo-instruction and extending relaxation to iterate jump shortening and padding updates to a joint fixed point, disproportionate to the "ROI not expected to be significant" caveat the roadmap itself attaches to D5.
+  - Files: `src/backend/x86_64/encode.rs`, `src/backend/x86_64/relax.rs` (`encoder_emits_three_bytes_for_hinted_short_jz` unit test)
 
 **Dependencies: D1, D3 are independent; D2, D4 depend on C; D5 shares `encode.rs` with D1 and can parallelize.**
 
@@ -148,7 +149,7 @@ C1 (LIR peephole) ✓, D1 (instruction selection) ✓,
 D3 (buffered I/O — interpreter ✓ / Linux backend ✓ / Windows backend pending),
 E1 / E2 (super-instructions + threaded dispatch) ✓,
 E3 (interp LinearMul ±1 fast path) ✓, E4 (tape doubling) ✓ can all start in parallel.
-Landed: E5, C1, D1, E4, Phase A (A1–A4), B1, B2, B3, B4, B6, C2, C3, C4, E1, E2, E3, D3 (interpreter + Linux backend).
+Landed: E5, C1, D1, E4, Phase A (A1–A4), B1, B2, B3, B4, B6, C2, C3, C4, E1, E2, E3, D3 (interpreter + Linux backend), D5 (branch hints; alignment deferred).
 
 Phase F items are all outside the near-term dependency graph.
 ```

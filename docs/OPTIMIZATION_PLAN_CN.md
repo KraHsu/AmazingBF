@@ -98,7 +98,8 @@
   - **Windows 后端侧（待）**：`src/backend/x86_64/windows.rs` 的 `emit_put_byte` / `emit_get_byte` 仍走 `WriteFile` / `ReadFile` IAT 调用，每字节一次。后续 commit 以相同语义改造。
   - 文件：`src/runtime/io.rs`、`src/driver/run.rs`、`src/interp/engine.rs`、`src/backend/asm.rs`、`src/backend/codegen.rs`、`src/backend/x86_64/encode.rs`、`src/backend/x86_64/debug.rs`；测试 `tests/buffered_io.rs`（>4 KiB 解释器 + Linux 编译两条 + `,` EOF 回 255）、`src/backend/x86_64/encode.rs` 3 单测
 - **D4 最小寄存器分配器**：为 `LinearMul` / loop 头的乘数与 src 值引入 `rbx / rax / rcx` 的显式使用跟踪（当前 `codegen.rs:143-159` 手工硬编码）。不做通用 RA，仅做 “多余 mov 消除” 级别的局部 allocator。为 Phase F 更激进的 codegen 铺路。
-- **D5 跳转对齐 + 分支提示**：loop 头对齐 16B；给 `JumpIfZero` 加 `2e` / `3e` 分支提示前缀（Intel 上已无效，AMD 仍解析）——优先级最低。
+- **D5 分支提示前缀 + loop 头对齐** · **[分支提示已实现 / loop 头 16B 对齐暂缓]**：`src/backend/x86_64/encode.rs` 给 `Jz` / `JzShort` 前置 `0x2E`（not-taken hint，对应 BF `[` 通常进入 loop 体的 not-taken 语义），给 `Jnz` / `JnzShort` 前置 `0x3E`（taken hint，对应 BF `]` 常常回跳继续循环）。长形从 6 字节增至 7 字节，短形从 2 字节增至 3 字节；`relax.rs` 引入 `short_form_len(inst)` 让 rel8 偏移计算区分带 hint 的 `JzShort` / `JnzShort`（3 字节）和其它短跳（2 字节）。Intel 自 Netburst 起忽略这组前缀，AMD 仍按静态预测解析；都属合法无副作用前缀，所以不会破坏任何微架构。16B loop 头对齐需要引入可变长度 `Align` 伪指令 + 让 relaxation 在 jump 收缩与 align 填充之间迭代至不动点，改动面与 D5 自述的 "ROI 不显著" 不相称，按 CN/EN 路线图 "优先级最低" 的注释暂不落地。
+  - 文件：`src/backend/x86_64/encode.rs`、`src/backend/x86_64/relax.rs`（`encoder_emits_three_bytes_for_hinted_short_jz` 单测）
 
 **依赖：D1、D3 独立；D2、D4 依赖 C；D5 与 D1 共享 `encode.rs`，可并行。**
 
@@ -148,7 +149,7 @@ C1 (LIR peephole) ✓、D1 (指令选择) ✓、
 D3 (buffered I/O — 解释器 ✓ / Linux 后端 ✓ / Windows 后端 pending)、
 E1 / E2 (superinstruction + threaded dispatch) ✓、
 E3 (interp LinearMul ±1 快路径) ✓、E4 (tape 倍增) ✓ 均可并行启动。
-已落地：E5、C1、D1、E4、Phase A (A1–A4)、B1、B2、B3、B4、B6、C2、C3、C4、E1、E2、E3、D3 (解释器 + Linux 后端)。
+已落地：E5、C1、D1、E4、Phase A (A1–A4)、B1、B2、B3、B4、B6、C2、C3、C4、E1、E2、E3、D3 (解释器 + Linux 后端)、D5 (分支提示；对齐暂缓)。
 
 Phase F 全部不在近期依赖图内。
 ```

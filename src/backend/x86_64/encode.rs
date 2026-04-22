@@ -709,8 +709,20 @@ fn encode_inst(buf: &mut CodeBuffer, inst: &AsmInst) {
         }
 
         // Conditional near jumps: 0x0F + cc + rel32.
-        AsmInst::Jz(label) => emit_jcc_rel32(buf, 0x84, *label), // ZF=1
-        AsmInst::Jnz(label) => emit_jcc_rel32(buf, 0x85, *label), // ZF=0
+        // D5: segment-override prefixes 0x2E (not-taken) and 0x3E (taken)
+        // are parsed by AMD as static branch hints. Intel ignores them since
+        // Netburst, and both shapes are legal no-op prefixes on either
+        // vendor. BF `[` is an unlikely jump (we almost always enter the
+        // loop body) so `Jz` takes 0x2E; BF `]` is a likely jump (we keep
+        // looping) so `Jnz` takes 0x3E.
+        AsmInst::Jz(label) => {
+            buf.emit_u8(0x2E); // branch-not-taken hint
+            emit_jcc_rel32(buf, 0x84, *label); // ZF=1
+        }
+        AsmInst::Jnz(label) => {
+            buf.emit_u8(0x3E); // branch-taken hint
+            emit_jcc_rel32(buf, 0x85, *label); // ZF=0
+        }
         AsmInst::Jb(label) => emit_jcc_rel32(buf, 0x82, *label), // CF=1 (unsigned <)
         AsmInst::Jae(label) => emit_jcc_rel32(buf, 0x83, *label), // CF=0 (unsigned >=)
         AsmInst::Jl(label) => emit_jcc_rel32(buf, 0x8C, *label), // SF≠OF (signed <)
@@ -725,8 +737,14 @@ fn encode_inst(buf: &mut CodeBuffer, inst: &AsmInst) {
         // Short conditional / unconditional jumps: single-byte opcode + rel8.
         // Produced only by the relaxation pass in
         // `crate::backend::x86_64::relax`.
-        AsmInst::JzShort(label) => emit_short_jump(buf, 0x74, *label),
-        AsmInst::JnzShort(label) => emit_short_jump(buf, 0x75, *label),
+        AsmInst::JzShort(label) => {
+            buf.emit_u8(0x2E); // branch-not-taken hint (D5)
+            emit_short_jump(buf, 0x74, *label);
+        }
+        AsmInst::JnzShort(label) => {
+            buf.emit_u8(0x3E); // branch-taken hint (D5)
+            emit_short_jump(buf, 0x75, *label);
+        }
         AsmInst::JbShort(label) => emit_short_jump(buf, 0x72, *label),
         AsmInst::JaeShort(label) => emit_short_jump(buf, 0x73, *label),
         AsmInst::JlShort(label) => emit_short_jump(buf, 0x7C, *label),
@@ -1095,9 +1113,6 @@ mod tests {
             insts: vec![AsmInst::LeaRegMem(Reg64::Rsi, Reg64::Rbp, -4096)],
         };
         let encoded = encode_program(&program);
-        assert_eq!(
-            encoded.text,
-            vec![0x48, 0x8D, 0xB5, 0x00, 0xF0, 0xFF, 0xFF]
-        );
+        assert_eq!(encoded.text, vec![0x48, 0x8D, 0xB5, 0x00, 0xF0, 0xFF, 0xFF]);
     }
 }
