@@ -63,10 +63,11 @@
 - **B4 Pointer postponement（指针延后 / 偏移化）** · **[已实现]**：业界标准命名（[Nayuki](https://www.nayuki.io/page/optimizing-brainfuck-compiler)、[matslina](https://github.com/matslina/bfoptimization) 称 “operation offsets”，bfc 称 “postponing movements”）。最终落实为 LIR-only 方案（不新增 HIR 变体，避免污染 HIR interpreter 与现有 pattern detector）：`src/ir/lir_postpone.rs` 的 `postpone_pointer_adds` 按 straight-line window 累积 `virt_ptr: isize` 与 `pending: BTreeMap<isize, PendingOp>`，遇到 barrier（`Label` / `JumpIfZero` / `JumpIfNonZero` / `Scan` / `LinearMul` / `PutByte` / `GetByte` 以及上一次 pass 残留的 `CellAddAt` / `CellSetAt`）或 `virt_ptr` 要越 disp8 边界时触发 flush；flush 前按 `(lo, hi)` 两极发探针 `PtrAdd`，由后端的 `ensure_tape_contains_r15` 对接 tape 倍增，利用 tape 映射的连续性保证窗口内所有偏移都已被 bounds check。disp 范围限定在 `[-127, 127]`（disp32 推迟到 C2 落地后放宽）。挂在 `-O1` 及以上的 `optimize_lir(lower_to_lir(hir))` 之前。
   - 文件：`src/ir/lir_postpone.rs`（18 单测含安全证明）；集成点 `src/driver/run.rs:build_optimized_lir`
 - **B5 Loop-invariant code motion**：A3 识别被 loop 读但不被改写的 cell；将其 loop-pre 赋值保留在 loop 外，避免反复 reload。BF 上实用性偏弱，但 SSA-化后几乎免费。
-- **B6 小 loop 展开**：进入 loop 时头格值已知（A3）且 body 为 affine 时，编译期直接计算 `Add` / `Zero` 序列，不必生成 `LinearMul`。
+- **B6 小 loop 展开** · **[已实现]**：`src/ir/optimize.rs::try_unroll_known_head` 在 `Loop` 分支的 `try_loop_specialize` 之前检查 `env.value_at_ptr()`——值已知（`CellLattice::Const(v)`）且 `v != 0`、body 通过 `try_linear_loop` 时，按相对 `Move` 形式编译期展开：对每个 `(off, f)` 发 `Move(step); Add((v * f) as i8 as i32)`（零 delta 跳过、指针相对游走），末尾 `Move(-cur); Zero`。替代原先落入 `LinearMul` 的运行期 `*p * factor` 乘法。`v == 0` 继续走 `try_loop_specialize`（由 B2 commit 3 负责整块丢弃）；头格 `Top` / `NonZero` 的老程序依然走 `LinearMul` 无回归。`try_loop_specialize` 的 `Scan` / `is_byte_clear_loop` 路径不受影响——它们的 body 形态 `try_linear_loop` 会拒绝或返回空 factors，B6 自然退回。
+  - 文件：`src/ir/optimize.rs`（6 单测：单 offset、多 offset、i8 canonicalisation、未知头、empty body 回归、v==0 pin B2 前行为）
 - **B7 Deep balanced loop（K6 算法，选配）**：[Oizys](https://github.com/jjcmoon/Oizys) 提出的 K6 算法对嵌套 balanced loop 做统一分析，覆盖 `try_linear_loop` + `try_scan_loop` 无法触达的程序类。作为 B3 / B4 稳定后的研究性扩展。
 
-**依赖：B1 已落地（句法形式）；B2 / B3 直接依赖 A；B4 是 C3 的前置；B5 / B6 可并行；B7 依赖 B3 + B4 + A2。**
+**依赖：B1 / B3 / B4 / B6 已落地；B2 直接依赖 A3 / A4；B5 依赖 A3；B7 依赖 B3 + B4 + A2。**
 
 ### Phase C — LIR peephole 新层
 
@@ -131,17 +132,18 @@ E5 (bench)  ──────────────────────�
 A1 → A2 → A3 → A4                        （回归衡量）
   │    │    │    │
   │    │    │    └→ B1 (DSE) ✓
-  │    │    └→ B2 (zero-loop), B5 (LICM), B6 (unroll)
+  │    │    └→ B2 (zero-loop), B5 (LICM), B6 (unroll) ✓
   │    └→ B3 (LinearMul 泛化) ✓, B4 (pointer postponement) ✓, B7 (K6)
   │         │
   │         └→ C3 (displacement) ✓ → D2 / D4
   │
   └→ C2 (bounds batching) ✓ → C4 (scan hint) ✓、D2 (SIMD)
 
-C1 (LIR peephole) ✓、D1 (指令选择) ✓、D3 (buffered I/O)、
+C1 (LIR peephole) ✓、D1 (指令选择) ✓、
+D3 (buffered I/O — 解释器侧 ✓ / 后端侧 pending)、
 E1 / E2 (superinstruction + threaded dispatch) ✓、
 E3 (SIMD tape)、E4 (tape 倍增) ✓ 均可并行启动。
-已落地：E5、C1、D1、E4、Phase A (A1–A4)、B1、B3、B4、C2、C3、C4、E1、E2。
+已落地：E5、C1、D1、E4、Phase A (A1–A4)、B1、B3、B4、B6、C2、C3、C4、E1、E2、D3 (解释器侧)。
 
 Phase F 全部不在近期依赖图内。
 ```

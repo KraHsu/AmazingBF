@@ -225,6 +225,52 @@ fn is_byte_clear_loop(body: &[HirInst]) -> bool {
     }
 }
 
+/// When the loop head value is known at compile time and the body is an
+/// affine (`try_linear_loop`) form, replace the runtime multiply/add with
+/// a deterministic `Move/Add/Zero` sequence computed at compile time.
+///
+/// Returns `None` when:
+/// - the head value is unknown (`Top` / `NonZero`) — the existing
+///   `LinearMul` lowering still applies,
+/// - `v == 0` — the caller should drop the loop entirely (B2 territory;
+///   `try_loop_specialize` still emits a correct but redundant
+///   `LinearMul` in that case),
+/// - `try_linear_loop` rejects the body (not affine).
+///
+/// The returned sequence is emitted in "relative Move" form — the
+/// pointer walks factor offsets in sorted order, emits an `Add(delta)`
+/// at each, then returns to the origin before the final `Zero`. O2's
+/// fixed-point loop will further fuse adjacent `Move`s if any survive.
+fn try_unroll_known_head(env: &TapeState, inner: &[HirInst]) -> Option<Vec<HirInst>> {
+    let v = env.value_at_ptr()?;
+    if v == 0 {
+        return None;
+    }
+    let factors = try_linear_loop(inner)?;
+    let mut out: Vec<HirInst> = Vec::with_capacity(factors.len() * 2 + 2);
+    let mut cur: isize = 0;
+    for (off, f) in &factors {
+        // `LinearMul` semantics: *(p + off) += v * f (mod 256).  With `v`
+        // known, fold to a constant `Add`.  `as i8 as i32` canonicalises
+        // the wrapped byte delta into `-128..=127`.
+        let delta = (v as i32).wrapping_mul(*f) as i8 as i32;
+        if delta == 0 {
+            continue;
+        }
+        let step = off - cur;
+        if step != 0 {
+            out.push(HirInst::Move(step));
+        }
+        out.push(HirInst::Add(delta));
+        cur = *off;
+    }
+    if cur != 0 {
+        out.push(HirInst::Move(-cur));
+    }
+    out.push(HirInst::Zero);
+    Some(out)
+}
+
 fn try_loop_specialize(inner: &[HirInst]) -> Option<HirInst> {
     if let Some(dir) = try_scan_loop(inner) {
         return Some(HirInst::Scan(dir));
@@ -309,6 +355,21 @@ fn optimize_block_o1_with_parent_env(insts: Vec<HirInst>, nested: bool) -> Vec<H
                     }
                     push_o1(&mut out, HirInst::Loop(inner));
                     env.clobber_all();
+                    i += 1;
+                    continue;
+                }
+
+                // B6: with the head value known at compile time, unroll an
+                // affine loop body to a concrete `Move/Add/Zero` sequence —
+                // skipping the runtime multiply the `LinearMul` lowering
+                // would otherwise emit.  Tried before `try_loop_specialize`
+                // so the `LinearMul` path is only reached when the head is
+                // `Top`/`NonZero`.
+                if let Some(unrolled) = try_unroll_known_head(&env, &inner) {
+                    for inst in unrolled {
+                        xfer.transfer_inst(&mut env, &inst);
+                        push_o1(&mut out, inst);
+                    }
                     i += 1;
                     continue;
                 }
@@ -549,5 +610,155 @@ mod tests {
         };
         let o = optimize_o1(p);
         assert_eq!(o.insts, vec![HirInst::LinearMul(vec![(1, 171), (3, -171)])]);
+    }
+
+    // --- B6: small-loop unrolling when the head value is known ---
+
+    #[test]
+    fn b6_unrolls_known_head_copy_loop() {
+        // Add(5); [->+<]  — head known = 5 at loop entry, body is an affine
+        // copy with factor 1 at offset 1.  B6 emits a `Move/Add/Move/Zero`
+        // unroll; the leading `Add(5)` the test provides is later collapsed
+        // by DSE (the `Zero` at the tail clobbers cell 0 before any read),
+        // leaving exactly four instructions.
+        let p = HirProgram {
+            insts: vec![
+                HirInst::Add(5),
+                HirInst::Loop(vec![
+                    HirInst::Add(-1),
+                    HirInst::Move(1),
+                    HirInst::Add(1),
+                    HirInst::Move(-1),
+                ]),
+            ],
+        };
+        let o = optimize_o1(p);
+        assert_eq!(
+            o.insts,
+            vec![
+                HirInst::Move(1),
+                HirInst::Add(5),
+                HirInst::Move(-1),
+                HirInst::Zero,
+            ]
+        );
+    }
+
+    #[test]
+    fn b6_unrolls_multi_offset_loop() {
+        // Add(3); [->+>++<<]  — head 3, offsets 1 (+1) and 2 (+2).
+        // Unrolled deltas: 3·1 = 3 at off 1, 3·2 = 6 at off 2.  Relative
+        // move form walks 0→1→2→0, then clears the head.  DSE drops the
+        // dead `Add(3)` on cell 0.
+        let p = HirProgram {
+            insts: vec![
+                HirInst::Add(3),
+                HirInst::Loop(vec![
+                    HirInst::Add(-1),
+                    HirInst::Move(1),
+                    HirInst::Add(1),
+                    HirInst::Move(1),
+                    HirInst::Add(2),
+                    HirInst::Move(-2),
+                ]),
+            ],
+        };
+        let o = optimize_o1(p);
+        assert_eq!(
+            o.insts,
+            vec![
+                HirInst::Move(1),
+                HirInst::Add(3),
+                HirInst::Move(1),
+                HirInst::Add(6),
+                HirInst::Move(-2),
+                HirInst::Zero,
+            ]
+        );
+    }
+
+    #[test]
+    fn b6_wraps_delta_to_i8_canonical_form() {
+        // Add(200); [->+<].  Head lattice reports v = 200.
+        // delta = (200 * 1) as i8 as i32 = -56 — canonical signed byte.
+        let p = HirProgram {
+            insts: vec![
+                HirInst::Add(200),
+                HirInst::Loop(vec![
+                    HirInst::Add(-1),
+                    HirInst::Move(1),
+                    HirInst::Add(1),
+                    HirInst::Move(-1),
+                ]),
+            ],
+        };
+        let o = optimize_o1(p);
+        // The critical post-B6 assertion is the `Add(-56)` in the unroll —
+        // without B6 this would be a `LinearMul([(1, 1)])` that computes
+        // the 200*1 product at runtime.  DSE also drops the leading
+        // `Add(200)` because the tail `Zero` clobbers cell 0.
+        assert_eq!(
+            o.insts,
+            vec![
+                HirInst::Move(1),
+                HirInst::Add(-56),
+                HirInst::Move(-1),
+                HirInst::Zero,
+            ]
+        );
+    }
+
+    #[test]
+    fn b6_unknown_head_falls_back_to_linear_mul() {
+        // No prefix Add and body reads `,` first — head value is `Top`
+        // after GetByte clobbers the cell.  Must stay as `LinearMul`.
+        let p = HirProgram {
+            insts: vec![
+                HirInst::GetByte,
+                HirInst::Loop(vec![
+                    HirInst::Add(-1),
+                    HirInst::Move(1),
+                    HirInst::Add(1),
+                    HirInst::Move(-1),
+                ]),
+            ],
+        };
+        let o = optimize_o1(p);
+        assert_eq!(
+            o.insts,
+            vec![HirInst::GetByte, HirInst::LinearMul(vec![(1, 1)])]
+        );
+    }
+
+    #[test]
+    fn b6_head_zero_still_drops_empty_body_loop() {
+        // Regression: head == 0 at loop entry and body optimises to empty
+        // (a `[-]` folds to `Zero` *inside* the loop, but an already-empty
+        // body loop like `[]` stays empty and must be dropped).  B6 must
+        // not interfere with the existing `inner.is_empty()` drop path.
+        let p = HirProgram {
+            insts: vec![HirInst::Loop(vec![])],
+        };
+        let o = optimize_o1(p);
+        assert!(o.insts.is_empty());
+    }
+
+    #[test]
+    fn b6_head_zero_keeps_linear_mul_for_now() {
+        // Non-empty body + v == 0: B6 returns `None`; `try_loop_specialize`
+        // still emits `LinearMul`.  Dropping this redundant LinearMul is
+        // B2 territory (handled in a follow-up commit) — this test pins
+        // the current behaviour so B2's change shows up as an intentional
+        // delta.
+        let p = HirProgram {
+            insts: vec![HirInst::Loop(vec![
+                HirInst::Add(-1),
+                HirInst::Move(1),
+                HirInst::Add(1),
+                HirInst::Move(-1),
+            ])],
+        };
+        let o = optimize_o1(p);
+        assert_eq!(o.insts, vec![HirInst::LinearMul(vec![(1, 1)])]);
     }
 }

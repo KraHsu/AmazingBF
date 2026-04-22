@@ -63,10 +63,11 @@ Six phases in dependency order: A analysis infrastructure → B HIR passes → C
 - **B4 Pointer postponement (operation offsets / offset-form)** · **[landed]**: standard industry naming ([Nayuki](https://www.nayuki.io/page/optimizing-brainfuck-compiler), [matslina](https://github.com/matslina/bfoptimization) call it "operation offsets", bfc calls it "postponing movements"). Ultimately realized as a LIR-only pass (no new HIR variants, avoiding pollution of the HIR interpreter and existing pattern detectors): `src/ir/lir_postpone.rs`'s `postpone_pointer_adds` accumulates `virt_ptr: isize` plus `pending: BTreeMap<isize, PendingOp>` over a straight-line window. On encountering a barrier (`Label` / `JumpIfZero` / `JumpIfNonZero` / `Scan` / `LinearMul` / `PutByte` / `GetByte`, or a `CellAddAt` / `CellSetAt` left over from a prior pass), or when `virt_ptr` would cross the disp8 boundary, a flush is triggered; the flush first emits probe `PtrAdd`s visiting the `(lo, hi)` extremes, delegating to the backend's `ensure_tape_contains_r15` for tape doubling and relying on the contiguity of the tape mapping to guarantee that every offset in the window is already bounds-checked. disp is capped at `[-127, 127]` (disp32 deferred until C2 lands). Runs before `optimize_lir(lower_to_lir(hir))` at `-O1` and above.
   - Files: `src/ir/lir_postpone.rs` (18 unit tests including the safety proof); integration point `src/driver/run.rs:build_optimized_lir`
 - **B5 Loop-invariant code motion**: A3 can identify cells that are read but not written inside a loop; their pre-loop assignments can be hoisted outside the loop, avoiding repeated reloads. Utility is low on BF, but essentially free after SSA-isation.
-- **B6 Small loop unrolling**: when the head cell value is known on loop entry (A3) and the body is affine, compute the `Add` / `Zero` sequence at compile time instead of producing a `LinearMul`.
+- **B6 Small loop unrolling** · **[landed]**: `src/ir/optimize.rs::try_unroll_known_head` runs in the `Loop` arm before `try_loop_specialize`: when `env.value_at_ptr()` reports a known `CellLattice::Const(v)` with `v != 0` and `try_linear_loop` accepts the body, the loop is unrolled at compile time into a relative-move form — for each `(off, f)` factor emit `Move(step); Add((v * f) as i8 as i32)` (zero deltas skipped; pointer walked relatively), then `Move(-cur); Zero` at the tail. This replaces the `LinearMul` runtime `*p * factor` multiply with a pre-computed `Add`. When `v == 0` B6 returns `None` and `try_loop_specialize` still emits a (redundant) `LinearMul` — dropping that is B2 territory (Commit 3). Head values reported as `Top` / `NonZero` keep the `LinearMul` path (no regression). The `Scan` / `is_byte_clear_loop` branches of `try_loop_specialize` are unaffected because `try_linear_loop` rejects or returns empty factors for those body shapes, so B6 naturally falls through.
+  - Files: `src/ir/optimize.rs` (6 unit tests: single offset, multi-offset, i8 canonicalisation, unknown head, empty body regression, `v == 0` pin of pre-B2 behaviour)
 - **B7 Deep balanced loop (K6 algorithm, optional)**: the K6 algorithm from [Oizys](https://github.com/jjcmoon/Oizys) performs a unified analysis of nested balanced loops, covering program classes that `try_linear_loop` + `try_scan_loop` cannot reach. A research extension once B3 / B4 are stable.
 
-**Dependencies: B1 has landed (syntactic form); B2 / B3 directly depend on A; B4 is the prerequisite for C3; B5 / B6 can parallelize; B7 depends on B3 + B4 + A2.**
+**Dependencies: B1 / B3 / B4 / B6 have landed; B2 directly depends on A3 / A4; B5 depends on A3; B7 depends on B3 + B4 + A2.**
 
 ### Phase C — New LIR peephole layer
 
@@ -131,17 +132,18 @@ E5 (bench)  ──────────────────────�
 A1 → A2 → A3 → A4                        (regression baseline)
   │    │    │    │
   │    │    │    └→ B1 (DSE) ✓
-  │    │    └→ B2 (zero-loop), B5 (LICM), B6 (unroll)
+  │    │    └→ B2 (zero-loop), B5 (LICM), B6 (unroll) ✓
   │    └→ B3 (LinearMul generalization) ✓, B4 (pointer postponement) ✓, B7 (K6)
   │         │
   │         └→ C3 (displacement) ✓ → D2 / D4
   │
   └→ C2 (bounds batching) ✓ → C4 (scan hint) ✓, D2 (SIMD)
 
-C1 (LIR peephole) ✓, D1 (instruction selection) ✓, D3 (buffered I/O),
+C1 (LIR peephole) ✓, D1 (instruction selection) ✓,
+D3 (buffered I/O — interpreter ✓ / backend pending),
 E1 / E2 (super-instructions + threaded dispatch) ✓,
 E3 (SIMD tape), E4 (tape doubling) ✓ can all start in parallel.
-Landed: E5, C1, D1, E4, Phase A (A1–A4), B1, B3, B4, C2, C3, C4, E1, E2.
+Landed: E5, C1, D1, E4, Phase A (A1–A4), B1, B3, B4, B6, C2, C3, C4, E1, E2, D3 (interpreter side).
 
 Phase F items are all outside the near-term dependency graph.
 ```
