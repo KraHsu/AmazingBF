@@ -33,7 +33,7 @@ use crate::ir::lir_scan_hint::promote_scan_hints;
 use crate::ir::lower::lower_to_lir;
 use crate::logging::{log_debug, log_info};
 use crate::runtime::host::NullHost;
-use crate::runtime::io::{BufferOutputIo, StdIo};
+use crate::runtime::io::{BufferOutputIo, BufferedStdIo};
 
 /// Execute the configured pipeline after CLI / logging setup has completed.
 pub(crate) fn run(config: DriverConfig) -> Result<()> {
@@ -59,7 +59,11 @@ pub(crate) fn run(config: DriverConfig) -> Result<()> {
 }
 
 fn run_interpret(config: &DriverConfig, hir: &HirProgram) -> Result<()> {
-    let mut interp = Interpreter::new(DEFAULT_INTERPRETER_TAPE_LEN, StdIo::new(), NullHost::new());
+    let mut interp = Interpreter::new(
+        DEFAULT_INTERPRETER_TAPE_LEN,
+        BufferedStdIo::new(),
+        NullHost::new(),
+    );
     interp.run(hir)?;
     log_info(format!(
         "interpreter finished (hir_insts={})",

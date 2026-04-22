@@ -78,9 +78,18 @@ impl<I: RuntimeIo, H: HostRuntime> Interpreter<I, H> {
     }
 
     /// Execute a HIR program to completion, reporting the first I/O or host error encountered.
+    ///
+    /// After dispatch ends, `io.flush()` is called so buffered adaptors
+    /// (e.g. `BufferedStdIo`) can surface a late-flush `IoError` as a
+    /// `RuntimeError::Io` instead of silently dropping it. A successful
+    /// exec followed by a flush failure is reported as the flush error;
+    /// an exec error wins over a flush error.
     pub(crate) fn run(&mut self, program: &HirProgram) -> Result<(), RuntimeError> {
         let bytecode = lower_hir_to_bytecode(program);
-        self.exec_bytecode(&bytecode)
+        let exec_result = self.exec_bytecode(&bytecode);
+        let flush_result = self.io.flush();
+        exec_result?;
+        flush_result.map_err(RuntimeError::from)
     }
 
     fn exec_bytecode(&mut self, program: &InterpProgram) -> Result<(), RuntimeError> {

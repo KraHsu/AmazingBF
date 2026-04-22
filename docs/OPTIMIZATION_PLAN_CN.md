@@ -90,7 +90,8 @@
   - `Scan(±1)` → `rep scasb`（`al = 0`, `rdi = r13`, `rcx` 设足够大）配合一次 bounds 收紧。需确认 Windows ABI 对 `rep` 指令无特殊要求。
   - `Zero` 连续段（来自未来 pass 合并）→ `rep stosb`
   - `LinearMul` 因子为 ±1 的列 → `movzx + add`，配合 C3 的 displacement 形式下降
-- **D3 Buffered I/O**：引入 runtime 侧 I/O buffer（如 4KB），`PutByte` 写 buffer，满或退出前 flush；`GetByte` 从 buffer 读。降低 syscall 开销一个数量级。需在 `src/runtime/io.rs` 增加 `BufferedStdIo`，backend 在 `PutByte` / `GetByte` 调用新 runtime 入口。
+- **D3 Buffered I/O** · **[解释器侧已实现 / 后端侧待落地]**：`src/runtime/io.rs::BufferedStdIo` 以 4 KiB `BufWriter<Stdout>` + `BufReader<Stdin>` 包住进程 stdio；`RuntimeIo` trait 新增默认 `flush()` 方法（no-op），`BufferedStdIo::flush` 通过 `BufWriter::flush` 把延迟 flush 错误经 `IoError::WriteError → RuntimeError::Io` 上抛，避免 `Drop` 中吞错。`Interpreter::run()` 尾部显式调用 `io.flush()?`，按 "exec 错误优先，成功后才报告 flush 错误" 排序。CLI `run_interpret` 已切 `BufferedStdIo::new()`，原先的单字节 `write` syscall 降到 per-4 KiB 一次。后端（ELF `write` / PE `WriteFile`）仍是每字节一次 syscall，按 Commit 1b 独立落地。
+  - 文件：`src/runtime/io.rs`、`src/driver/run.rs`、`src/interp/engine.rs`；测试 `tests/buffered_io.rs`（>4 KiB 输出 + `,` EOF 回 255）
 - **D4 最小寄存器分配器**：为 `LinearMul` / loop 头的乘数与 src 值引入 `rbx / rax / rcx` 的显式使用跟踪（当前 `codegen.rs:143-159` 手工硬编码）。不做通用 RA，仅做 “多余 mov 消除” 级别的局部 allocator。为 Phase F 更激进的 codegen 铺路。
 - **D5 跳转对齐 + 分支提示**：loop 头对齐 16B；给 `JumpIfZero` 加 `2e` / `3e` 分支提示前缀（Intel 上已无效，AMD 仍解析）——优先级最低。
 
