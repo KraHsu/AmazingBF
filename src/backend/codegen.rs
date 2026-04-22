@@ -106,6 +106,78 @@ fn emit_ptr_add_out(
     out.push(AsmInst::Label(done));
 }
 
+/// Emit `PtrAddChecked`: verify `[r13 + lo_extent, r13 + hi_extent]` is mapped,
+/// then advance `r13` by `delta` with no further bounds check.
+///
+/// At most two probes fire (one per side; each side's probe is skipped when its
+/// extent is `0`). On slow-path growth, `ensure_tape` returns with `r13` shifted
+/// by the failing extent (because it repositions `r13` to `r15`, the probe
+/// target). The caller undoes that shift and jumps back to the retry label so
+/// the other side can be re-probed against the grown tape.
+fn emit_ptr_add_checked_out(
+    out: &mut Vec<AsmInst>,
+    next_internal_label: &mut u32,
+    delta: isize,
+    lo_extent: isize,
+    hi_extent: isize,
+    ensure_tape_label: AsmLabel,
+) {
+    debug_assert!(
+        lo_extent <= 0 && 0 <= hi_extent,
+        "PtrAddChecked window must contain the origin"
+    );
+    debug_assert!(
+        lo_extent <= delta && delta <= hi_extent,
+        "PtrAddChecked delta must lie inside the verified window"
+    );
+
+    if lo_extent == 0 && hi_extent == 0 {
+        debug_assert_eq!(delta, 0, "degenerate PtrAddChecked must have delta = 0");
+        return;
+    }
+
+    let retry = fresh_internal_label(next_internal_label);
+    let slow_lo = fresh_internal_label(next_internal_label);
+    let slow_hi = fresh_internal_label(next_internal_label);
+    let done = fresh_internal_label(next_internal_label);
+
+    out.push(AsmInst::Label(retry));
+
+    if lo_extent < 0 {
+        out.push(AsmInst::MovRegReg(Reg64::R15, Reg64::R13));
+        emit_add_reg_isize(out, Reg64::R15, lo_extent);
+        out.push(AsmInst::CmpRegReg(Reg64::R15, Reg64::R12));
+        out.push(AsmInst::Jb(slow_lo));
+    }
+
+    if hi_extent > 0 {
+        out.push(AsmInst::MovRegReg(Reg64::R15, Reg64::R13));
+        emit_add_reg_isize(out, Reg64::R15, hi_extent);
+        out.push(AsmInst::CmpRegReg(Reg64::R15, Reg64::R14));
+        out.push(AsmInst::Jae(slow_hi));
+    }
+
+    if delta != 0 {
+        emit_add_reg_isize(out, Reg64::R13, delta);
+    }
+    out.push(AsmInst::Jmp(done));
+
+    if lo_extent < 0 {
+        out.push(AsmInst::Label(slow_lo));
+        out.push(AsmInst::Call(ensure_tape_label));
+        emit_add_reg_isize(out, Reg64::R13, -lo_extent);
+        out.push(AsmInst::Jmp(retry));
+    }
+    if hi_extent > 0 {
+        out.push(AsmInst::Label(slow_hi));
+        out.push(AsmInst::Call(ensure_tape_label));
+        emit_add_reg_isize(out, Reg64::R13, -hi_extent);
+        out.push(AsmInst::Jmp(retry));
+    }
+
+    out.push(AsmInst::Label(done));
+}
+
 /// Compile a LIR program into an x86_64 assembly program.
 ///
 /// Produced layout:
@@ -125,6 +197,13 @@ pub fn compile_lir_to_asm(lir: &LirProgram) -> AsmProgram {
 
     let mut out = Vec::new();
 
+    // Window of offsets (relative to current `r13`) that have already been
+    // proven to lie in `[r12, r14)` by a preceding `PtrAddChecked`. Subsequent
+    // `PtrAdd` ops whose delta falls inside this window can skip the bounds
+    // check; likewise a `PtrAddChecked` whose extents are already covered can
+    // skip its probes. Barriers clear the window.
+    let mut verified_window: Option<(isize, isize)> = None;
+
     // 1. Initialise the tape (mmap).
     emit_init_tape(&mut out, exit_one_label);
 
@@ -136,7 +215,56 @@ pub fn compile_lir_to_asm(lir: &LirProgram) -> AsmProgram {
 
             // PtrAdd(n): move the data pointer.
             LirInst::PtrAdd(n) => {
-                emit_ptr_add_out(&mut out, &mut next_internal_label, *n, ensure_tape_label);
+                let n = *n;
+                if let Some((wlo, whi)) = verified_window
+                    && wlo <= n
+                    && n <= whi
+                {
+                    // Target address already verified — emit an unchecked add.
+                    emit_add_reg_isize(&mut out, Reg64::R13, n);
+                    verified_window = Some((wlo - n, whi - n));
+                } else {
+                    emit_ptr_add_out(&mut out, &mut next_internal_label, n, ensure_tape_label);
+                    verified_window = None;
+                }
+            }
+
+            // PtrAddChecked: batched bounds-check window + unchecked delta move.
+            // Produced by `lir_postpone`; subsumes what would otherwise be
+            // 2–3 individually-checked probe `PtrAdd`s.
+            LirInst::PtrAddChecked {
+                delta,
+                lo_extent,
+                hi_extent,
+            } => {
+                let delta = *delta;
+                let lo_extent = *lo_extent;
+                let hi_extent = *hi_extent;
+                let covered = matches!(
+                    verified_window,
+                    Some((wlo, whi)) if wlo <= lo_extent && hi_extent <= whi
+                );
+                if covered {
+                    if delta != 0 {
+                        emit_add_reg_isize(&mut out, Reg64::R13, delta);
+                    }
+                } else {
+                    emit_ptr_add_checked_out(
+                        &mut out,
+                        &mut next_internal_label,
+                        delta,
+                        lo_extent,
+                        hi_extent,
+                        ensure_tape_label,
+                    );
+                }
+                // Merge prior and new absolute ranges, then shift by -delta to
+                // express the window relative to the post-move r13.
+                let (nlo, nhi) = match verified_window {
+                    Some((wlo, whi)) => (wlo.min(lo_extent), whi.max(hi_extent)),
+                    None => (lo_extent, hi_extent),
+                };
+                verified_window = Some((nlo - delta, nhi - delta));
             }
 
             // LinearMul: `-O1` affine loops (e.g. `[->+<]`).
@@ -156,6 +284,7 @@ pub fn compile_lir_to_asm(lir: &LirProgram) -> AsmProgram {
                     emit_ptr_add_out(&mut out, &mut next_internal_label, -*off, ensure_tape_label);
                 }
                 out.push(AsmInst::Pop(Reg64::Rbx));
+                verified_window = None;
             }
 
             // Scan: `while *p { < or > }` (`[<]` / `[>]`).
@@ -170,6 +299,55 @@ pub fn compile_lir_to_asm(lir: &LirProgram) -> AsmProgram {
                 emit_ptr_add_out(&mut out, &mut next_internal_label, step, ensure_tape_label);
                 out.push(AsmInst::Jmp(loop_top));
                 out.push(AsmInst::Label(loop_done));
+                verified_window = None;
+            }
+
+            // ScanWithHint: fast unchecked body for `hint_bytes` iterations
+            // using a pre-computed boundary in R10, then fall through to the
+            // classic Scan loop (which handles bounds checks / tape growth).
+            LirInst::ScanWithHint { dir, hint_bytes } => {
+                let step = *dir;
+                debug_assert!(step == 1 || step == -1, "ScanWithHint step must be ±1");
+                let slow_top = fresh_internal_label(&mut next_internal_label);
+                let done = fresh_internal_label(&mut next_internal_label);
+
+                if *hint_bytes > 0 {
+                    let fast_top = fresh_internal_label(&mut next_internal_label);
+                    let limit_offset = i64::from(*hint_bytes) * (step as i64);
+                    let limit_offset = isize::try_from(limit_offset)
+                        .expect("ScanWithHint hint offset must fit in isize");
+
+                    // r10 = r13 + step * hint_bytes (boundary of the verified window).
+                    out.push(AsmInst::MovRegReg(Reg64::R10, Reg64::R13));
+                    emit_add_reg_isize(&mut out, Reg64::R10, limit_offset);
+
+                    out.push(AsmInst::Label(fast_top));
+                    out.push(AsmInst::CmpMem8Imm8(Reg64::R13, 0));
+                    out.push(AsmInst::Jz(done));
+                    // Direction picks operand order so Jae fires exactly when
+                    // the scan has reached the far end of the verified window.
+                    // dir = +1: bail when r13 >= r10 (Jae r13 vs r10).
+                    // dir = -1: bail when r13 <= r10 (Jae r10 vs r13).
+                    if step == 1 {
+                        out.push(AsmInst::CmpRegReg(Reg64::R13, Reg64::R10));
+                    } else {
+                        out.push(AsmInst::CmpRegReg(Reg64::R10, Reg64::R13));
+                    }
+                    out.push(AsmInst::Jae(slow_top));
+                    out.push(AsmInst::AddRegImm32(Reg64::R13, step as i32));
+                    out.push(AsmInst::Jmp(fast_top));
+                }
+
+                // Classic bounds-checked scan body — exited once a zero cell
+                // is reached (the slow path grows the tape on boundary cross).
+                out.push(AsmInst::Label(slow_top));
+                out.push(AsmInst::CmpMem8Imm8(Reg64::R13, 0));
+                out.push(AsmInst::Jz(done));
+                emit_ptr_add_out(&mut out, &mut next_internal_label, step, ensure_tape_label);
+                out.push(AsmInst::Jmp(slow_top));
+                out.push(AsmInst::Label(done));
+
+                verified_window = None;
             }
 
             // CellAdd(0): no-op.
@@ -208,34 +386,48 @@ pub fn compile_lir_to_asm(lir: &LirProgram) -> AsmProgram {
 
             // CellAddAt { off, delta }: add imm8 to the cell at [r13 + off].
             //
-            // Produced only by the `lir_postpone` pass, which guarantees
-            // `off ∈ [-127, 127]` and canonicalises `off == 0` into the
-            // plain `CellAdd` form above (so the inc/dec short form stays
-            // reachable).
+            // Produced only by the `lir_postpone` pass, which canonicalises
+            // `off == 0` into the plain `CellAdd` form above (so the inc/dec
+            // short form stays reachable). Codegen picks the shortest addressing
+            // mode that fits `off`: `disp8` when `-128..=127`, otherwise `disp32`.
             LirInst::CellAddAt { off, delta } => {
                 debug_assert!(
                     *off != 0,
                     "CellAddAt(off=0) should be canonicalised to CellAdd"
                 );
-                let disp = i8::try_from(*off)
-                    .expect("B4 invariant: CellAddAt offset must fit in i8 (disp8)");
                 let imm = ((*delta % 256) + 256) % 256;
                 if imm != 0 {
-                    out.push(AsmInst::AddMem8ImmDisp8(Reg64::R13, disp, imm as u8 as i8));
+                    out.push(mem8_add_at_r13(*off, imm as u8 as i8));
                 }
             }
 
             // CellSetAt { off, val }: store imm8 into the cell at [r13 + off].
             //
-            // Same off-range invariant as CellAddAt.
+            // Same disp8/disp32 selection as CellAddAt.
             LirInst::CellSetAt { off, val } => {
                 debug_assert!(
                     *off != 0,
                     "CellSetAt(off=0) should be canonicalised to CellSet"
                 );
-                let disp = i8::try_from(*off)
-                    .expect("B4 invariant: CellSetAt offset must fit in i8 (disp8)");
-                out.push(AsmInst::MovMem8ImmDisp8(Reg64::R13, disp, *val));
+                out.push(mem8_set_at_r13(*off, *val));
+            }
+
+            // ZeroRun { start, count }: zero `count` contiguous bytes at
+            // [r13 + start, r13 + start + count). For now we just peel the run
+            // into individual byte stores; D2 will swap this for `rep stosb`
+            // once the LEA / RCX setup is worth it. The verified window is not
+            // touched (r13 is unchanged).
+            LirInst::ZeroRun { start, count } => {
+                debug_assert!(*count >= 2, "ZeroRun should hold at least two bytes");
+                for i in 0..*count {
+                    let off = isize::try_from(i64::from(*start) + i64::from(i))
+                        .expect("ZeroRun offset must fit in isize");
+                    if off == 0 {
+                        out.push(AsmInst::MovMem8Imm8(Reg64::R13, 0));
+                    } else {
+                        out.push(mem8_set_at_r13(off, 0));
+                    }
+                }
             }
 
             // PutByte: emit the current cell (`.`).
@@ -247,6 +439,7 @@ pub fn compile_lir_to_asm(lir: &LirProgram) -> AsmProgram {
                 out.push(AsmInst::MovRegReg(Reg64::Rsi, Reg64::R13)); // buf = data_ptr
                 out.push(AsmInst::MovRegImm64(Reg64::Rdx, 1)); // count = 1
                 out.push(AsmInst::Syscall);
+                verified_window = None;
             }
 
             // GetByte: read a byte into the current cell (`,`).
@@ -268,6 +461,7 @@ pub fn compile_lir_to_asm(lir: &LirProgram) -> AsmProgram {
                 out.push(AsmInst::Jnz(done));
                 out.push(AsmInst::MovMem8Imm8(Reg64::R13, 255));
                 out.push(AsmInst::Label(done));
+                verified_window = None;
             }
 
             // Label: label definition.
@@ -275,18 +469,21 @@ pub fn compile_lir_to_asm(lir: &LirProgram) -> AsmProgram {
             // Directly maps the LIR `LabelId` onto an `AsmLabel`.
             LirInst::Label(id) => {
                 out.push(AsmInst::Label(map_label(*id)));
+                verified_window = None;
             }
 
             // JumpIfZero: jump if current cell is zero (BF `[`).
             LirInst::JumpIfZero(id) => {
                 out.push(AsmInst::CmpMem8Imm8(Reg64::R13, 0)); // compare *data_ptr with 0
                 out.push(AsmInst::Jz(map_label(*id))); // jump if zero
+                verified_window = None;
             }
 
             // JumpIfNonZero: jump if current cell is non-zero (BF `]`).
             LirInst::JumpIfNonZero(id) => {
                 out.push(AsmInst::CmpMem8Imm8(Reg64::R13, 0)); // compare *data_ptr with 0
                 out.push(AsmInst::Jnz(map_label(*id))); // jump if non-zero
+                verified_window = None;
             }
         }
     }
@@ -637,6 +834,31 @@ fn map_label(id: LabelId) -> AsmLabel {
     AsmLabel(id.0)
 }
 
+/// Pick between `AddMem8ImmDisp8` and `AddMem8ImmDisp32` based on `off`'s
+/// width. `off == 0` is handled by the caller (it canonicalises to `CellAdd`
+/// and never reaches this helper).
+fn mem8_add_at_r13(off: isize, imm: i8) -> AsmInst {
+    if let Ok(disp8) = i8::try_from(off) {
+        AsmInst::AddMem8ImmDisp8(Reg64::R13, disp8, imm)
+    } else {
+        let disp32 =
+            i32::try_from(off).expect("CellAddAt offset must fit in i32 (lir_postpone DISP32 cap)");
+        AsmInst::AddMem8ImmDisp32(Reg64::R13, disp32, imm)
+    }
+}
+
+/// Pick between `MovMem8ImmDisp8` and `MovMem8ImmDisp32` based on `off`'s
+/// width. `off == 0` is handled by the caller (canonicalised to `CellSet`).
+fn mem8_set_at_r13(off: isize, val: u8) -> AsmInst {
+    if let Ok(disp8) = i8::try_from(off) {
+        AsmInst::MovMem8ImmDisp8(Reg64::R13, disp8, val)
+    } else {
+        let disp32 =
+            i32::try_from(off).expect("CellSetAt offset must fit in i32 (lir_postpone DISP32 cap)");
+        AsmInst::MovMem8ImmDisp32(Reg64::R13, disp32, val)
+    }
+}
+
 fn emit_add_reg_isize(out: &mut Vec<AsmInst>, reg: Reg64, value: isize) {
     let mut remaining = i64::try_from(value).expect("pointer delta did not fit in i64");
 
@@ -812,6 +1034,427 @@ mod tests {
     }
 
     #[test]
+    fn ptr_add_checked_degenerate_window_emits_nothing() {
+        // `lo_extent == 0 && hi_extent == 0` and `delta == 0` is a valid
+        // degenerate form that codegen drops entirely.
+        let baseline = compile_lir_to_asm(&LirProgram { insts: vec![] });
+        let with_checked = compile_lir_to_asm(&LirProgram {
+            insts: vec![LirInst::PtrAddChecked {
+                delta: 0,
+                lo_extent: 0,
+                hi_extent: 0,
+            }],
+        });
+        assert_eq!(baseline.insts, with_checked.insts);
+    }
+
+    #[test]
+    fn ptr_add_checked_low_side_only_emits_single_base_compare() {
+        // `lo_extent < 0, hi_extent == 0`: only the low probe fires; there is
+        // exactly one `cmp r15, r12` (base) and no `cmp r15, r14` (end).
+        let asm = compile_lir_to_asm(&LirProgram {
+            insts: vec![LirInst::PtrAddChecked {
+                delta: 0,
+                lo_extent: -3,
+                hi_extent: 0,
+            }],
+        });
+        let base_cmps = asm
+            .insts
+            .iter()
+            .filter(|i| matches!(i, AsmInst::CmpRegReg(Reg64::R15, Reg64::R12)))
+            .count();
+        let end_cmps = asm
+            .insts
+            .iter()
+            .filter(|i| matches!(i, AsmInst::CmpRegReg(Reg64::R15, Reg64::R14)))
+            .count();
+        assert_eq!(base_cmps, 1);
+        assert_eq!(end_cmps, 0);
+    }
+
+    #[test]
+    fn ptr_add_checked_high_side_only_emits_single_end_compare() {
+        let asm = compile_lir_to_asm(&LirProgram {
+            insts: vec![LirInst::PtrAddChecked {
+                delta: 0,
+                lo_extent: 0,
+                hi_extent: 3,
+            }],
+        });
+        let base_cmps = asm
+            .insts
+            .iter()
+            .filter(|i| matches!(i, AsmInst::CmpRegReg(Reg64::R15, Reg64::R12)))
+            .count();
+        let end_cmps = asm
+            .insts
+            .iter()
+            .filter(|i| matches!(i, AsmInst::CmpRegReg(Reg64::R15, Reg64::R14)))
+            .count();
+        assert_eq!(base_cmps, 0);
+        assert_eq!(end_cmps, 1);
+    }
+
+    #[test]
+    fn ptr_add_checked_both_sides_emits_one_of_each_compare() {
+        // Both extents non-zero: exactly one compare per side — this is the
+        // core M2 win over the prior 2–3 probe `PtrAdd` sequence (which would
+        // have emitted two full `cmp-pair`s, i.e. four compares total).
+        let asm = compile_lir_to_asm(&LirProgram {
+            insts: vec![LirInst::PtrAddChecked {
+                delta: 0,
+                lo_extent: -2,
+                hi_extent: 3,
+            }],
+        });
+        let base_cmps = asm
+            .insts
+            .iter()
+            .filter(|i| matches!(i, AsmInst::CmpRegReg(Reg64::R15, Reg64::R12)))
+            .count();
+        let end_cmps = asm
+            .insts
+            .iter()
+            .filter(|i| matches!(i, AsmInst::CmpRegReg(Reg64::R15, Reg64::R14)))
+            .count();
+        assert_eq!(base_cmps, 1);
+        assert_eq!(end_cmps, 1);
+    }
+
+    #[test]
+    fn ptr_add_checked_advances_r13_unchecked() {
+        // `delta != 0` must translate to a plain `add r13, delta` — not a
+        // separate `MovRegReg R15, R13` + cmp + mov-back sequence. Checked
+        // delta is the whole point of the op.
+        let asm = compile_lir_to_asm(&LirProgram {
+            insts: vec![LirInst::PtrAddChecked {
+                delta: 2,
+                lo_extent: -2,
+                hi_extent: 3,
+            }],
+        });
+        let r13_adds: Vec<i32> = asm
+            .insts
+            .iter()
+            .filter_map(|i| match i {
+                AsmInst::AddRegImm32(Reg64::R13, imm) => Some(*imm),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            r13_adds.contains(&2),
+            "expected `add r13, 2` for fast-path delta; got {r13_adds:?}"
+        );
+    }
+
+    #[test]
+    fn postpone_plus_codegen_emits_single_checked_probe_for_zigzag() {
+        // `PtrAdd(3); +; PtrAdd(-5); +; PtrAdd(2)` zigzags over offsets in
+        // [-2, 3] with net virt_ptr = 0. After B4 the pass emits exactly one
+        // `PtrAddChecked`, which lowers to one `cmp r15, r12` + one
+        // `cmp r15, r14`. Regression against re-introducing the 3-probe path.
+        use crate::ir::lir_postpone::postpone_pointer_adds;
+
+        let input = LirProgram {
+            insts: vec![
+                LirInst::PtrAdd(3),
+                LirInst::CellAdd(1),
+                LirInst::PtrAdd(-5),
+                LirInst::CellAdd(1),
+                LirInst::PtrAdd(2),
+            ],
+        };
+        let lir = postpone_pointer_adds(input);
+        let asm = compile_lir_to_asm(&lir);
+
+        let base_cmps = asm
+            .insts
+            .iter()
+            .filter(|i| matches!(i, AsmInst::CmpRegReg(Reg64::R15, Reg64::R12)))
+            .count();
+        let end_cmps = asm
+            .insts
+            .iter()
+            .filter(|i| matches!(i, AsmInst::CmpRegReg(Reg64::R15, Reg64::R14)))
+            .count();
+        assert_eq!(
+            base_cmps, 1,
+            "zigzag run should emit exactly one base-side bounds compare"
+        );
+        assert_eq!(
+            end_cmps, 1,
+            "zigzag run should emit exactly one end-side bounds compare"
+        );
+    }
+
+    #[test]
+    fn ptr_add_inside_verified_window_skips_bounds_check() {
+        // After `PtrAddChecked { lo=-2, hi=3 }` the codegen remembers that the
+        // window `[-2, 3]` around `r13` is mapped. A follow-up `PtrAdd(2)` lies
+        // inside that window, so it must lower to a bare `add r13, 2` — no
+        // `cmp r15, r12` / `cmp r15, r14` pair, and no `mov r15, r13` probe.
+        let asm = compile_lir_to_asm(&LirProgram {
+            insts: vec![
+                LirInst::PtrAddChecked {
+                    delta: 0,
+                    lo_extent: -2,
+                    hi_extent: 3,
+                },
+                LirInst::PtrAdd(2),
+            ],
+        });
+
+        let base_cmps = asm
+            .insts
+            .iter()
+            .filter(|i| matches!(i, AsmInst::CmpRegReg(Reg64::R15, Reg64::R12)))
+            .count();
+        let end_cmps = asm
+            .insts
+            .iter()
+            .filter(|i| matches!(i, AsmInst::CmpRegReg(Reg64::R15, Reg64::R14)))
+            .count();
+        assert_eq!(
+            base_cmps, 1,
+            "only the PtrAddChecked probe should emit a base-side compare; got {base_cmps}"
+        );
+        assert_eq!(
+            end_cmps, 1,
+            "only the PtrAddChecked probe should emit an end-side compare; got {end_cmps}"
+        );
+    }
+
+    #[test]
+    fn ptr_add_outside_verified_window_still_probes() {
+        // `PtrAddChecked { lo=0, hi=2 }` verifies `[0, 2]`. A subsequent
+        // `PtrAdd(3)` lands outside that window, so it must emit its own probe.
+        let asm = compile_lir_to_asm(&LirProgram {
+            insts: vec![
+                LirInst::PtrAddChecked {
+                    delta: 0,
+                    lo_extent: 0,
+                    hi_extent: 2,
+                },
+                LirInst::PtrAdd(3),
+            ],
+        });
+
+        // PtrAddChecked(0, 2) emits only the end-side probe (1 cmp r15, r14).
+        // PtrAdd(3) emits both sides (1 cmp r15, r12 and 1 cmp r15, r14).
+        let base_cmps = asm
+            .insts
+            .iter()
+            .filter(|i| matches!(i, AsmInst::CmpRegReg(Reg64::R15, Reg64::R12)))
+            .count();
+        let end_cmps = asm
+            .insts
+            .iter()
+            .filter(|i| matches!(i, AsmInst::CmpRegReg(Reg64::R15, Reg64::R14)))
+            .count();
+        assert_eq!(base_cmps, 1, "PtrAdd(3) falls outside window → base probe");
+        assert_eq!(
+            end_cmps, 2,
+            "both PtrAddChecked end probe and PtrAdd(3) end probe should fire"
+        );
+    }
+
+    #[test]
+    fn verified_window_cleared_by_label_barrier() {
+        // A `Label` is a control-flow barrier: after it the verified window is
+        // unknown because execution may reach the label from elsewhere. The
+        // following `PtrAdd(2)`, despite being inside the original window,
+        // must re-emit its bounds check.
+        let asm = compile_lir_to_asm(&LirProgram {
+            insts: vec![
+                LirInst::PtrAddChecked {
+                    delta: 0,
+                    lo_extent: -2,
+                    hi_extent: 3,
+                },
+                LirInst::Label(crate::ir::lir::LabelId(0)),
+                LirInst::PtrAdd(2),
+            ],
+        });
+
+        let base_cmps = asm
+            .insts
+            .iter()
+            .filter(|i| matches!(i, AsmInst::CmpRegReg(Reg64::R15, Reg64::R12)))
+            .count();
+        let end_cmps = asm
+            .insts
+            .iter()
+            .filter(|i| matches!(i, AsmInst::CmpRegReg(Reg64::R15, Reg64::R14)))
+            .count();
+        // PtrAddChecked emits 1 base + 1 end; post-barrier PtrAdd emits 1 base
+        // + 1 end of its own.
+        assert_eq!(
+            base_cmps, 2,
+            "label barrier must force re-probe on following PtrAdd"
+        );
+        assert_eq!(
+            end_cmps, 2,
+            "label barrier must force re-probe on following PtrAdd"
+        );
+    }
+
+    #[test]
+    fn verified_window_cleared_by_putbyte_barrier() {
+        // PutByte is an I/O barrier; after it the window must be invalidated
+        // because the slow path's `ensure_tape` may have relocated `r13`
+        // (though PutByte itself doesn't, later codegen contracts treat any
+        // syscall site as a barrier — keep the contract tight).
+        let asm = compile_lir_to_asm(&LirProgram {
+            insts: vec![
+                LirInst::PtrAddChecked {
+                    delta: 0,
+                    lo_extent: -2,
+                    hi_extent: 3,
+                },
+                LirInst::PutByte,
+                LirInst::PtrAdd(2),
+            ],
+        });
+
+        let base_cmps = asm
+            .insts
+            .iter()
+            .filter(|i| matches!(i, AsmInst::CmpRegReg(Reg64::R15, Reg64::R12)))
+            .count();
+        let end_cmps = asm
+            .insts
+            .iter()
+            .filter(|i| matches!(i, AsmInst::CmpRegReg(Reg64::R15, Reg64::R14)))
+            .count();
+        assert_eq!(base_cmps, 2);
+        assert_eq!(end_cmps, 2);
+    }
+
+    #[test]
+    fn second_ptr_add_checked_covered_by_first_emits_no_probes() {
+        // First op verifies `[-3, 5]`; the second op's window `[-1, 2]` is a
+        // strict subset → its probes should be elided entirely. The second op
+        // still advances `r13` by `delta = 1` via a plain `add r13, 1`.
+        let asm = compile_lir_to_asm(&LirProgram {
+            insts: vec![
+                LirInst::PtrAddChecked {
+                    delta: 0,
+                    lo_extent: -3,
+                    hi_extent: 5,
+                },
+                LirInst::PtrAddChecked {
+                    delta: 1,
+                    lo_extent: -1,
+                    hi_extent: 2,
+                },
+            ],
+        });
+
+        let base_cmps = asm
+            .insts
+            .iter()
+            .filter(|i| matches!(i, AsmInst::CmpRegReg(Reg64::R15, Reg64::R12)))
+            .count();
+        let end_cmps = asm
+            .insts
+            .iter()
+            .filter(|i| matches!(i, AsmInst::CmpRegReg(Reg64::R15, Reg64::R14)))
+            .count();
+        assert_eq!(
+            base_cmps, 1,
+            "second PtrAddChecked's base probe should be elided"
+        );
+        assert_eq!(
+            end_cmps, 1,
+            "second PtrAddChecked's end probe should be elided"
+        );
+    }
+
+    #[test]
+    fn cell_writes_do_not_clear_verified_window() {
+        // CellAdd / CellAddAt / CellSet / CellSetAt do not touch `r13`, so the
+        // verified window must survive them. A following in-window `PtrAdd`
+        // should still elide its bounds check.
+        let asm = compile_lir_to_asm(&LirProgram {
+            insts: vec![
+                LirInst::PtrAddChecked {
+                    delta: 0,
+                    lo_extent: -2,
+                    hi_extent: 3,
+                },
+                LirInst::CellAdd(1),
+                LirInst::CellAddAt { off: 2, delta: 3 },
+                LirInst::CellSet(0),
+                LirInst::PtrAdd(2),
+            ],
+        });
+
+        let base_cmps = asm
+            .insts
+            .iter()
+            .filter(|i| matches!(i, AsmInst::CmpRegReg(Reg64::R15, Reg64::R12)))
+            .count();
+        let end_cmps = asm
+            .insts
+            .iter()
+            .filter(|i| matches!(i, AsmInst::CmpRegReg(Reg64::R15, Reg64::R14)))
+            .count();
+        assert_eq!(base_cmps, 1, "cell writes are transparent to the window");
+        assert_eq!(end_cmps, 1, "cell writes are transparent to the window");
+    }
+
+    #[test]
+    fn cell_add_at_wide_off_selects_disp32() {
+        let off: isize = 1_000;
+        let asm = compile_lir_to_asm(&LirProgram {
+            insts: vec![LirInst::CellAddAt { off, delta: 5 }],
+        });
+        assert!(
+            asm.insts
+                .contains(&AsmInst::AddMem8ImmDisp32(Reg64::R13, 1_000, 5)),
+            "off beyond i8 range must lower to AddMem8ImmDisp32"
+        );
+        assert!(
+            !asm.insts
+                .iter()
+                .any(|i| matches!(i, AsmInst::AddMem8ImmDisp8(_, _, _))),
+            "no disp8 variant should appear when off does not fit i8"
+        );
+    }
+
+    #[test]
+    fn cell_set_at_wide_off_selects_disp32() {
+        let off: isize = -10_000;
+        let asm = compile_lir_to_asm(&LirProgram {
+            insts: vec![LirInst::CellSetAt { off, val: 0x7F }],
+        });
+        assert!(
+            asm.insts
+                .contains(&AsmInst::MovMem8ImmDisp32(Reg64::R13, -10_000, 0x7F)),
+            "negative off beyond i8 range must lower to MovMem8ImmDisp32"
+        );
+    }
+
+    #[test]
+    fn cell_add_at_narrow_off_keeps_disp8() {
+        let asm = compile_lir_to_asm(&LirProgram {
+            insts: vec![LirInst::CellAddAt { off: 5, delta: 3 }],
+        });
+        assert!(
+            asm.insts
+                .contains(&AsmInst::AddMem8ImmDisp8(Reg64::R13, 5, 3)),
+            "off that fits i8 must stay on the disp8 path"
+        );
+        assert!(
+            !asm.insts
+                .iter()
+                .any(|i| matches!(i, AsmInst::AddMem8ImmDisp32(_, _, _))),
+            "no disp32 variant should appear for small offsets"
+        );
+    }
+
+    #[test]
     fn ensure_tape_does_not_use_r11_after_munmap_syscall() {
         let asm = compile_lir_to_asm(&LirProgram {
             insts: vec![LirInst::PtrAdd(4096)],
@@ -839,5 +1482,239 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn scan_with_hint_positive_dir_sets_r10_limit_and_uses_r13_vs_r10_compare() {
+        // ScanWithHint(dir=+1, hint=5) must:
+        // 1. seed r10 = r13 + 5 (MovRegReg R10, R13 then AddRegImm32 R10, 5)
+        // 2. fast body compares r13 against r10 in that operand order, so Jae
+        //    fires exactly when r13 has reached the upper edge of the window.
+        let asm = compile_lir_to_asm(&LirProgram {
+            insts: vec![LirInst::ScanWithHint {
+                dir: 1,
+                hint_bytes: 5,
+            }],
+        });
+
+        let seeds_limit = asm.insts.windows(2).any(|w| {
+            matches!(
+                w,
+                [
+                    AsmInst::MovRegReg(Reg64::R10, Reg64::R13),
+                    AsmInst::AddRegImm32(Reg64::R10, 5)
+                ]
+            )
+        });
+        assert!(
+            seeds_limit,
+            "ScanWithHint(+1, 5) must seed r10 = r13 + 5 in the fast path"
+        );
+
+        let uses_r13_r10 = asm
+            .insts
+            .iter()
+            .any(|i| matches!(i, AsmInst::CmpRegReg(Reg64::R13, Reg64::R10)));
+        let uses_r10_r13 = asm
+            .insts
+            .iter()
+            .any(|i| matches!(i, AsmInst::CmpRegReg(Reg64::R10, Reg64::R13)));
+        assert!(
+            uses_r13_r10,
+            "positive dir must use `cmp r13, r10` so Jae fires at the high edge"
+        );
+        assert!(
+            !uses_r10_r13,
+            "positive dir must not use the reversed `cmp r10, r13` operand order"
+        );
+    }
+
+    #[test]
+    fn scan_with_hint_negative_dir_swaps_compare_operands() {
+        // dir=-1 means "bail when r13 <= r10"; without a Jbe instruction we
+        // swap the operands and keep Jae, so the emitted compare must be
+        // `cmp r10, r13` (and the limit decrements r13).
+        let asm = compile_lir_to_asm(&LirProgram {
+            insts: vec![LirInst::ScanWithHint {
+                dir: -1,
+                hint_bytes: 4,
+            }],
+        });
+
+        let seeds_limit = asm.insts.windows(2).any(|w| {
+            matches!(
+                w,
+                [
+                    AsmInst::MovRegReg(Reg64::R10, Reg64::R13),
+                    AsmInst::AddRegImm32(Reg64::R10, -4)
+                ]
+            )
+        });
+        assert!(
+            seeds_limit,
+            "ScanWithHint(-1, 4) must seed r10 = r13 - 4 in the fast path"
+        );
+
+        let uses_r10_r13 = asm
+            .insts
+            .iter()
+            .any(|i| matches!(i, AsmInst::CmpRegReg(Reg64::R10, Reg64::R13)));
+        assert!(
+            uses_r10_r13,
+            "negative dir must swap operand order to `cmp r10, r13`"
+        );
+    }
+
+    #[test]
+    fn scan_with_hint_zero_hint_emits_only_slow_body() {
+        // hint_bytes == 0: no r10 seed, no fast loop; we only emit the slow
+        // body (`cmp [r13], 0; jz done; ptr_add; jmp slow_top`).
+        let asm = compile_lir_to_asm(&LirProgram {
+            insts: vec![LirInst::ScanWithHint {
+                dir: 1,
+                hint_bytes: 0,
+            }],
+        });
+        assert!(
+            !asm.insts
+                .iter()
+                .any(|i| matches!(i, AsmInst::MovRegReg(Reg64::R10, Reg64::R13))),
+            "hint=0 must not emit the r10 limit seed"
+        );
+        assert!(
+            !asm.insts.iter().any(|i| matches!(
+                i,
+                AsmInst::CmpRegReg(Reg64::R13, Reg64::R10)
+                    | AsmInst::CmpRegReg(Reg64::R10, Reg64::R13)
+            )),
+            "hint=0 must not emit the fast-path boundary compare"
+        );
+    }
+
+    #[test]
+    fn zero_run_at_origin_emits_base_store_plus_disp8_tail() {
+        // ZeroRun { start: 0, count: 3 } → bare [r13]=0, then disp8 stores at
+        // r13+1 and r13+2.
+        let asm = compile_lir_to_asm(&LirProgram {
+            insts: vec![LirInst::ZeroRun { start: 0, count: 3 }],
+        });
+        assert!(
+            asm.insts.contains(&AsmInst::MovMem8Imm8(Reg64::R13, 0)),
+            "ZeroRun covering offset 0 must emit a bare [r13]=0 store"
+        );
+        assert!(
+            asm.insts
+                .contains(&AsmInst::MovMem8ImmDisp8(Reg64::R13, 1, 0)),
+            "ZeroRun starting at 0 with count 3 must emit a disp8 store at +1"
+        );
+        assert!(
+            asm.insts
+                .contains(&AsmInst::MovMem8ImmDisp8(Reg64::R13, 2, 0)),
+            "ZeroRun starting at 0 with count 3 must emit a disp8 store at +2"
+        );
+    }
+
+    #[test]
+    fn zero_run_negative_start_emits_only_disp_stores() {
+        // start=-2, count=2 covers [-2, -1]; neither offset is 0 so both go
+        // through the disp8 path and no bare [r13]=0 store appears.
+        let asm = compile_lir_to_asm(&LirProgram {
+            insts: vec![LirInst::ZeroRun {
+                start: -2,
+                count: 2,
+            }],
+        });
+        assert!(
+            asm.insts
+                .contains(&AsmInst::MovMem8ImmDisp8(Reg64::R13, -2, 0)),
+            "expected disp8 store at r13 - 2"
+        );
+        assert!(
+            asm.insts
+                .contains(&AsmInst::MovMem8ImmDisp8(Reg64::R13, -1, 0)),
+            "expected disp8 store at r13 - 1"
+        );
+        // ZeroRun introduces no [r13]=0 when the origin isn't in the range.
+        // (The init-tape prologue uses MovRegImm64 / AddRegImm32, not MovMem8Imm8.)
+        assert!(
+            !asm.insts
+                .iter()
+                .any(|i| matches!(i, AsmInst::MovMem8Imm8(Reg64::R13, 0))),
+            "ZeroRun not covering offset 0 must not emit [r13]=0"
+        );
+    }
+
+    #[test]
+    fn zero_run_wide_span_selects_disp32() {
+        let asm = compile_lir_to_asm(&LirProgram {
+            insts: vec![LirInst::ZeroRun {
+                start: 200,
+                count: 2,
+            }],
+        });
+        assert!(
+            asm.insts
+                .contains(&AsmInst::MovMem8ImmDisp32(Reg64::R13, 200, 0)),
+            "offset beyond i8 range must lower to disp32 store"
+        );
+    }
+
+    #[test]
+    fn peephole_plus_codegen_collapses_adjacent_zero_writes_to_zero_run() {
+        // End-to-end: the postpone pass emits `CellSet(0); CellSetAt(1, 0);
+        // CellSetAt(2, 0)` for `[-]>[-]>[-]`-style source, and the peephole
+        // must coalesce them into ZeroRun { start: 0, count: 3 }.
+        use crate::ir::lir_opt::optimize_lir;
+        let optimized = optimize_lir(LirProgram {
+            insts: vec![
+                LirInst::CellSet(0),
+                LirInst::CellSetAt { off: 1, val: 0 },
+                LirInst::CellSetAt { off: 2, val: 0 },
+            ],
+        });
+        assert_eq!(
+            optimized.insts,
+            vec![LirInst::ZeroRun { start: 0, count: 3 }]
+        );
+        let asm = compile_lir_to_asm(&optimized);
+        assert!(
+            asm.insts
+                .contains(&AsmInst::MovMem8ImmDisp8(Reg64::R13, 2, 0)),
+            "ZeroRun must still produce a store at +2 after codegen"
+        );
+    }
+
+    #[test]
+    fn ptr_add_checked_then_scan_lowers_to_scan_with_hint_via_pipeline() {
+        // End-to-end: a PtrAddChecked that verifies [-2, 3] followed by Scan(+1)
+        // must go through `promote_scan_hints` and reach codegen as
+        // ScanWithHint(+1, 3), which we detect via the r10 seed sequence.
+        use crate::ir::lir_scan_hint::promote_scan_hints;
+
+        let lir = promote_scan_hints(LirProgram {
+            insts: vec![
+                LirInst::PtrAddChecked {
+                    delta: 0,
+                    lo_extent: -2,
+                    hi_extent: 3,
+                },
+                LirInst::Scan(1),
+            ],
+        });
+        let asm = compile_lir_to_asm(&lir);
+
+        let seeds_limit = asm.insts.windows(2).any(|w| {
+            matches!(
+                w,
+                [
+                    AsmInst::MovRegReg(Reg64::R10, Reg64::R13),
+                    AsmInst::AddRegImm32(Reg64::R10, 3)
+                ]
+            )
+        });
+        assert!(
+            seeds_limit,
+            "pipeline must promote Scan(+1) after PtrAddChecked([-2, 3]) to a ScanWithHint with hint=3"
+        );
     }
 }

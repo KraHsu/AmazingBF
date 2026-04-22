@@ -34,7 +34,7 @@
 
 ### 1.4 Interpreter + Runtime（`src/interp/engine.rs`, `src/runtime/`）
 
-- 单层 `match` 派发（`engine.rs:66-132`），无 threaded dispatch / 无超级指令
+- **E1 / E2 已落地**：HIR 先经 `src/interp/lower.rs::lower_hir_to_bytecode` 下降到 `src/interp/bytecode.rs::InterpOp` 超级指令流（含 `MoveAdd` / `ZeroMove` 融合，`LoopStart` / `LoopEnd` 携绝对 pc），再由 `engine.rs::exec_bytecode` 用 `src/interp/handlers.rs` 的 tag-indexed 函数指针表派发；原递归 `exec_block` + 单层 `match` 已整体替换
 - `Tape` 用 `Vec<u8>` 左右拼接（`tape.rs:34-209`），`Vec::resize` 同步增长；**与 `CLAUDE.md` 所述 “mmap + doubling” 不一致**
 - 基准基础设施（E5）已落地：`benches/standard_suite.rs`（Criterion，matslina 套件的解释/执行）与 `benches/compile_levels.rs`（自定义 harness，`tests/cases/*.bf` 的编译+运行耗时总表）。`tests/compile_artifacts.rs` 仅做产物正确性校验
 
@@ -58,10 +58,8 @@
 - **B1 Dead store elimination** · **[已实现]**：`src/ir/dse.rs` 的 `dead_store_elimination` 做前向句法重写——虚拟指针 + `BTreeMap<isize, usize>` pending 写集。某 offset 的写被后续同 offset 写覆盖且中间无读时丢弃前者。`Loop` / `Scan` / `LinearMul` 作为 barrier 清空 pending 并递归进入 `Loop` body；`PutByte` / `Add` 提交（读到）前写，`GetByte` / `Zero` 无条件覆盖前写，`GetByte` 本身不可丢（输入副作用）。覆盖 `push_o1` 错过的 Move 间隔、GetByte 覆盖两类场景。串联在 `optimize_o1` 末端，O2 不动点循环自动受益。最终实现纯句法，不消费 A4 `run_forward`（A3 `CellLattice` 留给后续 B2 / B5 的 cross-block 变体使用）。
   - 文件：`src/ir/dse.rs`；集成点 `src/ir/optimize.rs:optimize_o1`
 - **B2 已知零格循环消除的跨 block 扩展**：O1 只在 block 入口 `ConstEnv` 做；A3 允许在 `Loop` 边界识别 `value_at_ptr == Zero` 并整块丢弃。
-- **B3 LinearMul 泛化**：当前 `try_linear_loop`（`optimize.rs:136-168`）要求 net pointer delta 为 0 且头格 `-1`。借助 A2 放宽到：
-  - 头格 `-k` 且 `gcd(k, 256) == 1`（仍保证终止）
-  - 嵌套 `LinearMul` 体可在外层被识别（当前 body 含 `Loop` 立刻放弃）
-  - 提供 `LinearMul` 的 fused copy 形式（因子仅 ±1 的列）
+- **B3 LinearMul 泛化（头格 gcd 放宽）** · **[已实现]**：`src/ir/optimize.rs` 的 `try_linear_loop` 现接受任意奇数头格 `d0`——通过 `invmod_256(d0)`（扩展欧几里得）在编译期算出迭代次数的乘法逆元，将 body 中每个 factor 统一缩放到 `factor * invmod(-d0, 256)` mod 256 后沿用既有 `LinearMul` 数据结构，不新增变体。偶数头格仍被拒（`gcd(|d0| mod 256, 256) ≠ 1` 时循环要么非终止、要么非整数迭代）。`is_byte_clear_loop` 同步放宽，识别任何奇数步长的 `[-]` / `[--]` 等价形式。嵌套 `LinearMul` body 与 ±1-only fused copy 两种形态暂未纳入，作为 B6 / B7 的延伸。
+  - 文件：`src/ir/optimize.rs`（9 单测：`invmod_256` 全表覆盖、奇负头格、多 offset、偶数拒绝）
 - **B4 Pointer postponement（指针延后 / 偏移化）** · **[已实现]**：业界标准命名（[Nayuki](https://www.nayuki.io/page/optimizing-brainfuck-compiler)、[matslina](https://github.com/matslina/bfoptimization) 称 “operation offsets”，bfc 称 “postponing movements”）。最终落实为 LIR-only 方案（不新增 HIR 变体，避免污染 HIR interpreter 与现有 pattern detector）：`src/ir/lir_postpone.rs` 的 `postpone_pointer_adds` 按 straight-line window 累积 `virt_ptr: isize` 与 `pending: BTreeMap<isize, PendingOp>`，遇到 barrier（`Label` / `JumpIfZero` / `JumpIfNonZero` / `Scan` / `LinearMul` / `PutByte` / `GetByte` 以及上一次 pass 残留的 `CellAddAt` / `CellSetAt`）或 `virt_ptr` 要越 disp8 边界时触发 flush；flush 前按 `(lo, hi)` 两极发探针 `PtrAdd`，由后端的 `ensure_tape_contains_r15` 对接 tape 倍增，利用 tape 映射的连续性保证窗口内所有偏移都已被 bounds check。disp 范围限定在 `[-127, 127]`（disp32 推迟到 C2 落地后放宽）。挂在 `-O1` 及以上的 `optimize_lir(lower_to_lir(hir))` 之前。
   - 文件：`src/ir/lir_postpone.rs`（18 单测含安全证明）；集成点 `src/driver/run.rs:build_optimized_lir`
 - **B5 Loop-invariant code motion**：A3 识别被 loop 读但不被改写的 cell；将其 loop-pre 赋值保留在 loop 外，避免反复 reload。BF 上实用性偏弱，但 SSA-化后几乎免费。
@@ -75,10 +73,12 @@
 目标：`src/ir/lower.rs` 之后新增 `src/ir/lir_opt.rs`，提供一轮无分析 peephole。
 
 - **C1 LIR peephole 基础 pass** · **[已实现]**：合并相邻 `PtrAdd`、消除零 delta、折叠 `CellSet(0); CellAdd(k)` → `CellSet(k)`、`CellSet(a); CellSet(b)` → `CellSet(b)`。落地在 `src/ir/lir_opt.rs`，挂在 `lower_to_lir` 之后；`Label` / `JumpIfZero` / `JumpIfNonZero` / `Scan` / `LinearMul` / `PutByte` / `GetByte` 作为自然 barrier。
-- **C2 Bounds-check hoisting / batching**：连续 `PtrAdd` 只在总 delta 的极值上做一次 bounds check（当前每个 `PtrAdd` 独立检查，`codegen.rs:78-107`）。需要向后端传递 “已检查区间” 标记，考虑在 LIR 引入 `PtrAddChecked { delta, lo_extent, hi_extent }` 或新 op。
+- **C2 Bounds-check hoisting / batching** · **[已实现]**：LIR 新增 `LirInst::PtrAddChecked { delta, lo_extent, hi_extent }`（`src/ir/lir.rs`）承载 "已在 `[delta + lo_extent, delta + hi_extent]` 区间内完成 bounds check" 的语义；`lo_extent == hi_extent == 0` 退化为旧 `PtrAdd`。B4 的 `lir_postpone.rs` 原先发两条探针 `PtrAdd(lo) / PtrAdd(hi)` 现合为一条 `PtrAddChecked`；`CellAddAt.off` / `CellSetAt.off` 从 `i8` 放宽到 `isize`，emitter 按 off 范围自动选 disp8 / disp32 变体（`src/backend/asm.rs::{AddMem8ImmDisp32, MovMem8ImmDisp32}`、`src/backend/x86_64/encode.rs::emit_mem8_disp32`）。后端在 `src/backend/codegen.rs` 维护 "已验证窗口" 状态机：`CellAdd*` / `CellSet*` / `ZeroRun` 对 r13 透明，`PtrAdd` 在窗口内省略 bounds check，`Label` / `Jump*` / `Scan*` / `LinearMul` / `PutByte` / `GetByte` 清空窗口。C1 peephole 扩展 `PtrAddChecked` 合并 / 吸收规则（叠加 delta、区间取并）。
+  - 文件：`src/ir/lir.rs`、`src/ir/lir_postpone.rs`、`src/ir/lir_opt.rs`、`src/backend/codegen.rs`、`src/backend/asm.rs`、`src/backend/x86_64/encode.rs`
 - **C3 Displacement 形式下降** · **[已实现]**：`LirInst::CellAddAt { off, delta }` / `CellSetAt { off, val }` 两个新变体（`src/ir/lir.rs`）承载 B4 flush 产物；后端在 `src/backend/codegen.rs` 将其翻译为 `AsmInst::AddMem8ImmDisp8` / `MovMem8ImmDisp8`（`src/backend/asm.rs`），编码由 `src/backend/x86_64/encode.rs` 的 `emit_mem8_disp8` 发出 `add byte [r13 + disp8], imm8` / `mov byte [r13 + disp8], imm8`（ModRM mod=01，以 R13 为基址时 `(rm & 7) == 5` 避开 SIB 歧义，对应机器码 `49 80 45 <disp> <imm>` / `49 C6 45 <disp> <imm>`）。`off == 0` 在 codegen 中 `debug_assert!` 已被 B4 canonicalise 回 `CellAdd` / `CellSet`（保留 D1 的 inc/dec 短形）；disp 通过 `i8::try_from` 断言 ∈ `[-128, 127]`。disp32 推迟到 C2 落地——原因：超 disp8 的偏移必须配合区间 bounds-check，否则 `ensure_tape_contains_r15` 的单点语义被打破。LIR peephole (`src/ir/lir_opt.rs`) 扩展了 4 条同 offset 折叠规则（`CellAddAt;CellAddAt`、`CellSetAt;CellAddAt`、`CellSetAt;CellSetAt`、`CellAddAt;CellSetAt`），跨 offset 不合并。
   - 文件：`src/ir/lir.rs`、`src/backend/asm.rs`、`src/backend/x86_64/encode.rs`、`src/backend/codegen.rs`、`src/ir/lir_opt.rs`
-- **C4 Scan / Zero 传递 size 提示**：让后端知道某个 `Scan` 之前的 tape 区段是否已检查过 bound，决定是否内联边界检查。
+- **C4 Scan / Zero 传递 size 提示** · **[已实现]**：`src/ir/lir_scan_hint.rs` 的 `promote_scan_hints` 沿用与 C2 后端等价的 "已验证窗口" 状态机，识别每条 `Scan` 之前仍在有效的 bounds-check 覆盖——当窗口沿 `Scan` 方向有正向 extent 时，升格为 `LirInst::ScanWithHint { dir, hint_bytes }`；覆盖为 0 则保留原 `Scan` 走慢路径。后端在 `ScanWithHint` 的循环体内用 `inc r13` / `dec r13`（单字节，不做 cmp）迭代，循环退出时再发一次完整 `PtrAddChecked` 校准。`Zero` 连续段由 C1 peephole 合并为 `LirInst::ZeroRun { start: i32, count: u32 }`（disp32 形式），D2 未落地前后端仍逐字节 zero，但 LIR 形式已就位。
+  - 文件：`src/ir/lir.rs`、`src/ir/lir_scan_hint.rs`（新，12 单测）、`src/ir/lir_opt.rs`、`src/ir/lower.rs`、`src/backend/codegen.rs`
 
 **依赖：C1 独立；C2 依赖 A2 的 range；C3 依赖 B4；C4 依赖 C2。**
 
@@ -98,8 +98,10 @@
 
 ### Phase E — Interpreter + runtime（与 A–D 基本独立，可并行）
 
-- **E1 Superinstruction lowering**：HIR → interpreter 之间新增 bytecode 表示（如 `Vec<InterpOp>`，`InterpOp` 包含融合形式如 `MoveAdd(d, k)` / `ZeroMove(d)`），消除 `engine.rs:66-132` 的 hot-path 分派开销。
-- **E2 Threaded dispatch**：在 E1 之上用 `fn(&mut State)` 指针数组代替 `match`，获得 computed-goto 近似效果（稳定 Rust 无 computed-goto）。每个 `InterpOp` 对应一个 tail-call 风格 handler。
+- **E1 Superinstruction lowering** · **[已实现]**：新增 `src/interp/bytecode.rs` 定义 `InterpOp`（含融合形式 `MoveAdd { d, k }` / `ZeroMove(d)`）、`LinearMulPlan`（紧凑 `Box<[(i32, i16)]>` factors、`Arc` 共享避免 O2 fixed-point 复制后的反复 clone）与 `InterpProgram`；新增 `src/interp/lower.rs::lower_hir_to_bytecode` 做 HIR → InterpOp 下降，单 pass 完成 `Move; Add → MoveAdd` / `Zero; Move → ZeroMove` 融合以及 `Loop` → `LoopStart { end_pc } / LoopEnd { start_pc }` 绝对 pc 回填（back-patch 栈由 `Vec<u32>` 维护）。`engine.rs::exec_bytecode` 从递归 `exec_block` 改为平坦 pc-indexed 派发，`[` / `]` 成为单次比较 + 绝对跳转，不再走 Rust frame。
+  - 文件：`src/interp/bytecode.rs`（新）、`src/interp/lower.rs`（新，13 单测）、`src/interp/engine.rs`、`src/interp/mod.rs`
+- **E2 Threaded dispatch** · **[已实现]**：`InterpOp::tag()` 返回稠密 opcode 索引（安全 `match` 实现，因 `#![forbid(unsafe_code)]` 禁用 `mem::transmute`/repr 透视）；新增 `src/interp/handlers.rs`，11 个 `fn(&mut Interpreter<I, H>, &InterpOp, usize) -> Result<usize, RuntimeError>` handler 构成 `dispatch_table::<I, H>() -> [Handler<I, H>; INTERP_OP_TAG_COUNT]`。`engine.rs::exec_bytecode` 的 monolithic `match` 替换为 `pc = table[op.tag()](self, op, pc)?`——每条 op 变为一次表查 + 一次间接调用，目的是给 CPU 间接跳转预测器提供 per-opcode 的独立预测状态（原 match 只有单一 jump 点）。handler 通过 `if let` 解构对应变体、不匹配路径落入冷 `unreachable!()`。稳定 Rust 无 sibling-tail-call，若 LLVM 未展开则按计划可退回 `match + #[inline(always)]` 保底。
+  - 文件：`src/interp/bytecode.rs`、`src/interp/engine.rs`、`src/interp/handlers.rs`（新）
 - **E3 SIMD tape 操作**：`Zero` → `memset`；`LinearMul` 中因子 1 的列 → `copy_from_slice`。`Tape::move_ptr` 的 zero-fill 走 `Vec::resize` 已是 `memset`，但 `LinearMul` 内部仍是标量（`engine.rs:103-111`）。
 - **E4 Tape 后端重构** · **[已实现，方案调整]**：原方案要求 mmap + centered-copy，但与 `#![forbid(unsafe_code)]` 冲突。改为在现有 `Vec<u8>` 左右拼接布局上换上几何倍增（`new_len = max(needed, old_len * 2)`，左半因初始空载另设 8 字节下限）：均摊 O(1) 每访问格，避免单步走过边界触发 O(n) resize。`TapeStats::right_growth` 更名为 `right_grew_bytes` 以明确语义。后续若决定为共享 backend tape 再引入 mmap 版本，可在不破坏 forbid(unsafe) 的前提下通过 runtime feature flag 隔离。
 - **E5 Criterion 微基准套件** · **[已实现]**：新增 `benches/`，采用 [matslina 标准基准集](https://github.com/matslina/bfoptimization) 的子集——**factor.b**、**mandelbrot.b**、**hanoi.b**、**dbfi.b**、**long.b** 以及 **awib-0.4.b**。按 O0 / O1 / O2 / O3 × (interpret, compile+run) 交叉衡量。这套程序覆盖不同 contraction 比例（40%–75%）和不同 hot-loop 模式，是 BF 优化文献的既定 benchmark；参考文献给出的参考加速范围：hanoi.b ≈ 130×、mandelbrot.b 数十倍、awib-0.4 ≈ 2.4×（全部优化 vs 无优化）。作为 A–D 所有 pass 的回归衡量基线。
@@ -129,16 +131,16 @@ A1 → A2 → A3 → A4                        （回归衡量）
   │    │    │    │
   │    │    │    └→ B1 (DSE) ✓
   │    │    └→ B2 (zero-loop), B5 (LICM), B6 (unroll)
-  │    └→ B3 (LinearMul 泛化), B4 (pointer postponement) ✓, B7 (K6)
+  │    └→ B3 (LinearMul 泛化) ✓, B4 (pointer postponement) ✓, B7 (K6)
   │         │
   │         └→ C3 (displacement) ✓ → D2 / D4
   │
-  └→ C2 (bounds batching) → D2 (SIMD)
+  └→ C2 (bounds batching) ✓ → C4 (scan hint) ✓、D2 (SIMD)
 
-C1 (LIR peephole)、D1 (指令选择)、D3 (buffered I/O)、
-E1 / E2 (superinstruction + threaded dispatch)、
-E3 (SIMD tape)、E4 (tape 倍增) 均可并行启动。
-已落地：E5、C1、D1、E4、Phase A (A1–A4)、B1、B4、C3。
+C1 (LIR peephole) ✓、D1 (指令选择) ✓、D3 (buffered I/O)、
+E1 / E2 (superinstruction + threaded dispatch) ✓、
+E3 (SIMD tape)、E4 (tape 倍增) ✓ 均可并行启动。
+已落地：E5、C1、D1、E4、Phase A (A1–A4)、B1、B3、B4、C2、C3、C4、E1、E2。
 
 Phase F 全部不在近期依赖图内。
 ```

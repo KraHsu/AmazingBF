@@ -151,7 +151,25 @@ fn fuse_add_move(insts: Vec<HirInst>) -> Vec<HirInst> {
     optimize_block_o0(insts)
 }
 
-/// Affine simple loop: only `Move`/`Add`, net pointer delta 0, head cell `-1` per iteration (mod 256).
+/// Modular inverse of `a` mod 256. Returns `Some(x)` with `x ∈ 1..=255` and
+/// `(a * x) ≡ 1 (mod 256)` when `a mod 256` is coprime to 256 (i.e. odd).
+/// Returns `None` when `a mod 256` is even (no inverse exists).
+fn invmod_256(a: i32) -> Option<i32> {
+    let a = a.rem_euclid(256);
+    if a & 1 == 0 {
+        return None;
+    }
+    (1..256i32).find(|&x| (a * x).rem_euclid(256) == 1)
+}
+
+/// Affine simple loop: only `Move`/`Add`, net pointer delta 0, head cell delta
+/// `d0` with `gcd(|d0| mod 256, 256) == 1` (equivalently `d0` odd) so the loop
+/// terminates at an iteration count `n ≡ -v · invmod(d0, 256) (mod 256)`,
+/// where `v` is the entry head value. Each body delta at offset `off` is
+/// pre-scaled by `scale := (-invmod(d0, 256)) mod 256`, so the `v · f` the
+/// interpreter / backend already compute equals `n · original_delta[off]`
+/// without any downstream change. For `d0 ≡ -1 (mod 256)` this yields
+/// `scale = 1`, i.e. the pre-generalisation behaviour.
 fn try_linear_loop(body: &[HirInst]) -> Option<Vec<(isize, i32)>> {
     let mut ptr: isize = 0;
     let mut delta: BTreeMap<isize, i32> = BTreeMap::new();
@@ -176,11 +194,15 @@ fn try_linear_loop(body: &[HirInst]) -> Option<Vec<(isize, i32)>> {
     }
 
     let d0 = *delta.get(&0).unwrap_or(&0);
-    if d0.rem_euclid(256) != 255 {
-        return None;
-    }
+    let inv = invmod_256(d0)?;
+    let scale = (256 - inv).rem_euclid(256);
 
-    let mut factors: Vec<(isize, i32)> = delta.into_iter().filter(|(off, _)| *off != 0).collect();
+    let mut factors: Vec<(isize, i32)> = delta
+        .into_iter()
+        .filter(|(off, _)| *off != 0)
+        .map(|(off, f)| (off, f.wrapping_mul(scale)))
+        .filter(|(_, f)| f.rem_euclid(256) != 0)
+        .collect();
     factors.sort_by_key(|(o, _)| *o);
     Some(factors)
 }
@@ -192,10 +214,13 @@ fn try_scan_loop(body: &[HirInst]) -> Option<isize> {
     }
 }
 
-/// `[-]` on an 8-bit cell: body is a single wrapped decrement-by-one per iteration.
+/// Cell-clearing loop body on an 8-bit tape. The body is a single `Add(k)`
+/// whose `k` is invertible mod 256 (i.e. `k` odd): iteration count
+/// `n = -v · invmod(k, 256) mod 256` always terminates, and the net effect is
+/// `*p = 0` regardless of `v`. The classical `[-]` is the `k = -1` case.
 fn is_byte_clear_loop(body: &[HirInst]) -> bool {
     match body {
-        [HirInst::Add(k)] => k.rem_euclid(256) == 255,
+        [HirInst::Add(k)] => invmod_256(*k).is_some(),
         _ => false,
     }
 }
@@ -405,5 +430,124 @@ mod tests {
         let once = optimize_o1(p.clone());
         let twice = optimize_o2(p);
         assert_eq!(once, twice);
+    }
+
+    // --- B3 generalisation: head delta d0 with gcd(|d0| mod 256, 256) == 1 ---
+
+    #[test]
+    fn invmod_256_covers_all_odd_values() {
+        for a in (1..256).step_by(2) {
+            let inv = invmod_256(a).expect("odd a must have an inverse");
+            assert_eq!((a * inv).rem_euclid(256), 1, "a={a} inv={inv}");
+        }
+    }
+
+    #[test]
+    fn invmod_256_rejects_even_values() {
+        for a in (0..256).step_by(2) {
+            assert!(invmod_256(a).is_none(), "even a={a} must not invert");
+        }
+    }
+
+    #[test]
+    fn invmod_256_handles_negative_operands() {
+        // -3 ≡ 253 (mod 256); invmod(253) must satisfy 253·x ≡ 1.
+        let inv = invmod_256(-3).unwrap();
+        assert_eq!((253 * inv).rem_euclid(256), 1);
+    }
+
+    #[test]
+    fn o1_recognises_odd_head_delta_loop() {
+        // [--->+<] : head delta -3 (odd ⇒ terminates), body writes +1 at offset 1.
+        // Iteration count n = v · invmod(-(-3), 256) = v · 171 (mod 256).
+        // So cell[1] += v · 171 (mod 256), i.e. factor == 171.
+        let p = HirProgram {
+            insts: vec![HirInst::Loop(vec![
+                HirInst::Add(-3),
+                HirInst::Move(1),
+                HirInst::Add(1),
+                HirInst::Move(-1),
+            ])],
+        };
+        let o = optimize_o1(p);
+        assert_eq!(o.insts, vec![HirInst::LinearMul(vec![(1, 171)])]);
+    }
+
+    #[test]
+    fn o1_rejects_even_head_delta_loop() {
+        // [-->+<] : head delta -2 (even ⇒ can run forever for odd v). Must stay as Loop.
+        let p = HirProgram {
+            insts: vec![HirInst::Loop(vec![
+                HirInst::Add(-2),
+                HirInst::Move(1),
+                HirInst::Add(1),
+                HirInst::Move(-1),
+            ])],
+        };
+        let o = optimize_o1(p);
+        assert!(
+            matches!(o.insts.as_slice(), [HirInst::Loop(_)]),
+            "expected Loop, got {:?}",
+            o.insts
+        );
+    }
+
+    #[test]
+    fn o1_recognises_positive_odd_head_delta_loop() {
+        // [+++>+<] : head delta +3 is also odd, loop terminates.
+        // invmod(3, 256) = 171 ⇒ scale = -171 mod 256 = 85.
+        let p = HirProgram {
+            insts: vec![HirInst::Loop(vec![
+                HirInst::Add(3),
+                HirInst::Move(1),
+                HirInst::Add(1),
+                HirInst::Move(-1),
+            ])],
+        };
+        let o = optimize_o1(p);
+        assert_eq!(o.insts, vec![HirInst::LinearMul(vec![(1, 85)])]);
+    }
+
+    #[test]
+    fn o1_clears_odd_decrement_loop() {
+        // [---] : head decrements by 3 per iter (odd ⇒ terminates).
+        // Since only the head is touched, factors == [] → specialise to Zero.
+        let p = HirProgram {
+            insts: vec![HirInst::Loop(vec![HirInst::Add(-3)])],
+        };
+        let o = optimize_o1(p);
+        assert_eq!(o.insts, vec![HirInst::Zero]);
+    }
+
+    #[test]
+    fn o1_rejects_even_decrement_clear_loop() {
+        // [--] : head delta -2 does not clear the cell when v is odd.
+        let p = HirProgram {
+            insts: vec![HirInst::Loop(vec![HirInst::Add(-2)])],
+        };
+        let o = optimize_o1(p);
+        assert!(
+            matches!(o.insts.as_slice(), [HirInst::Loop(_)]),
+            "expected Loop, got {:?}",
+            o.insts
+        );
+    }
+
+    #[test]
+    fn o1_odd_head_delta_multi_offset() {
+        // [--->+>>-<<<] : head delta -3, writes +1 at off 1 and -1 at off 3.
+        // Scale = 171. factors = [(1, 171), (3, -171)]. Both ≠ 0 mod 256.
+        let p = HirProgram {
+            insts: vec![HirInst::Loop(vec![
+                HirInst::Add(-3),
+                HirInst::Move(1),
+                HirInst::Add(1),
+                HirInst::Move(2),
+                HirInst::Add(-1),
+                HirInst::Move(-3),
+            ])],
+        };
+        let o = optimize_o1(p);
+        assert_eq!(o.insts, vec![HirInst::LinearMul(vec![(1, 171), (3, -171)])]);
     }
 }

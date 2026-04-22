@@ -1,11 +1,22 @@
 //! HIR interpreter engine.
 //!
-//! Walks a `HirProgram` against a shared [`Tape`] and `RuntimeIo`, terminating
-//! when the instruction list is exhausted. Loop bodies recurse synchronously,
-//! so no explicit call stack exists beyond the host stack. This is the final
-//! stage of the pipeline in `RunMode::Interpret`.
+//! Runs a Brainfuck program against a shared [`Tape`] and `RuntimeIo`. The
+//! engine does *not* walk HIR directly: it first lowers to the
+//! superinstruction form in [`crate::interp::bytecode::InterpOp`] via
+//! [`crate::interp::lower::lower_hir_to_bytecode`], then dispatches a flat
+//! `pc`-indexed loop over that stream. `[` / `]` become direct jumps
+//! (`LoopStart` / `LoopEnd` carry absolute pc targets), so loop iteration
+//! costs one branch per cell test instead of a Rust recursive call per
+//! iteration.
+//!
+//! The lowering happens once per `run()` call; driver code that invokes the
+//! interpreter twice (e.g. -O3's precomputed-stdout path) pays the lowering
+//! cost twice, which is still negligible compared with the execution.
 
-use crate::ir::hir::{HirInst, HirProgram};
+use crate::interp::bytecode::InterpProgram;
+use crate::interp::handlers::dispatch_table;
+use crate::interp::lower::lower_hir_to_bytecode;
+use crate::ir::hir::HirProgram;
 use crate::runtime::host::HostRuntime;
 use crate::runtime::io::{IoError, RuntimeIo};
 use crate::runtime::tape::Tape;
@@ -56,13 +67,6 @@ pub(crate) struct Interpreter<I: RuntimeIo, H: HostRuntime> {
     pub(crate) host: H,
 }
 
-/// `(v * f)` reduced to a single `CellAdd`-style delta mod 256 (Brainfuck tape).
-fn mul_add_delta_u8(v: u8, f: i32) -> i32 {
-    let p = (v as i32).wrapping_mul(f);
-    let m = p.rem_euclid(256);
-    if m <= 127 { m } else { m - 256 }
-}
-
 impl<I: RuntimeIo, H: HostRuntime> Interpreter<I, H> {
     /// Create an interpreter with an `tape_len`-byte data tape and the supplied I/O and host runtime.
     pub(crate) fn new(tape_len: usize, io: I, host: H) -> Self {
@@ -75,58 +79,24 @@ impl<I: RuntimeIo, H: HostRuntime> Interpreter<I, H> {
 
     /// Execute a HIR program to completion, reporting the first I/O or host error encountered.
     pub(crate) fn run(&mut self, program: &HirProgram) -> Result<(), RuntimeError> {
-        self.exec_block(&program.insts)
+        let bytecode = lower_hir_to_bytecode(program);
+        self.exec_bytecode(&bytecode)
     }
 
-    fn exec_block(&mut self, insts: &[HirInst]) -> Result<(), RuntimeError> {
-        for inst in insts {
-            match inst {
-                HirInst::Move(delta) => {
-                    self.tape.move_ptr(*delta);
-                }
-                HirInst::Add(delta) => {
-                    self.tape.add_current(*delta);
-                }
-                HirInst::PutByte => {
-                    let ptr = self.tape.ptr();
-                    let byte = self.tape.current();
-                    self.io.put_byte(ptr, byte)?;
-                }
-                HirInst::GetByte => {
-                    let ptr = self.tape.ptr();
-                    let byte = self.io.get_byte(ptr)?;
-                    self.tape.set_current(byte);
-                }
-                HirInst::Zero => {
-                    self.tape.set_current(0);
-                }
-                HirInst::LinearMul(factors) => {
-                    let v = self.tape.current();
-                    self.tape.set_current(0);
-                    for (off, f) in factors {
-                        self.tape.move_ptr(*off);
-                        let delta = mul_add_delta_u8(v, *f);
-                        self.tape.add_current(delta);
-                        self.tape.move_ptr(-*off);
-                    }
-                }
-                HirInst::Scan(dir) => {
-                    let step = match *dir {
-                        1 | -1 => *dir,
-                        _ => dir.signum(),
-                    };
-                    while self.tape.current() != 0 {
-                        self.tape.move_ptr(step);
-                    }
-                }
-                HirInst::Loop(body) => {
-                    while self.tape.current() != 0 {
-                        self.exec_block(body)?;
-                    }
-                }
-            }
+    fn exec_bytecode(&mut self, program: &InterpProgram) -> Result<(), RuntimeError> {
+        // Table dispatch: index by `InterpOp::tag()`, then one indirect call
+        // per op. The table is a stack-local array of fn pointers — the hot
+        // loop pays one load + one indirect branch per op vs. LLVM's
+        // monolithic `match` jump table, giving the CPU's indirect-branch
+        // predictor more per-opcode state to learn from.
+        let table = dispatch_table::<I, H>();
+        let ops = program.ops.as_slice();
+        let mut pc: usize = 0;
+        while pc < ops.len() {
+            let op = &ops[pc];
+            let handler = table[op.tag()];
+            pc = handler(self, op, pc)?;
         }
-
         Ok(())
     }
 }

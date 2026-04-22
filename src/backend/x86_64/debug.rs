@@ -315,6 +315,32 @@ fn format_inst_asm(out: &mut String, inst: &AsmInst) {
             .unwrap();
         }
 
+        AsmInst::AddMem8ImmDisp32(reg, disp, imm) => {
+            // Disp32 counterpart of AddMem8ImmDisp8 for offsets beyond ±127.
+            writeln!(
+                out,
+                "    add     byte [{}{}{}], 0x{:02x}",
+                reg_name(*reg),
+                if *disp < 0 { " - " } else { " + " },
+                format_signed_hex_i32(disp.unsigned_abs() as i32),
+                *imm as u8
+            )
+            .unwrap();
+        }
+
+        AsmInst::MovMem8ImmDisp32(reg, disp, imm) => {
+            // Disp32 counterpart of MovMem8ImmDisp8 for offsets beyond ±127.
+            writeln!(
+                out,
+                "    mov     byte [{}{}{}], 0x{:02x}",
+                reg_name(*reg),
+                if *disp < 0 { " - " } else { " + " },
+                format_signed_hex_i32(disp.unsigned_abs() as i32),
+                imm
+            )
+            .unwrap();
+        }
+
         AsmInst::CmpMem8Imm8(reg, imm) => {
             // Zero check used by BF `[` / `]`.
             writeln!(out, "    cmp     byte [{}], 0x{:02x}", reg_name(*reg), imm).unwrap();

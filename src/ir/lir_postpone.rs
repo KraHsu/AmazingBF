@@ -51,11 +51,12 @@
 //!
 //! ## Invariants
 //!
-//! - `virt_ptr ∈ [-127, 127]` at every step; a would-be-out-of-range
+//! - `virt_ptr ∈ [i32::MIN, i32::MAX]` at every step; a would-be-out-of-range
 //!   `PtrAdd` triggers a flush and is then emitted unwrapped.
 //! - Every key of `pending` equals the `virt_ptr` value at the moment the
-//!   entry was created / last touched, so keys also live in `[-127, 127]`
-//!   and fit in the codegen's disp8 cap.
+//!   entry was created / last touched, so keys also live in that range and
+//!   fit the codegen's disp32 cap. The codegen picks `disp8` or `disp32`
+//!   per-write based on the offset's actual width.
 //! - Barriers (labels, jumps, `Scan`, `LinearMul`, I/O, and pre-existing
 //!   displacement variants) flush the current window before being emitted.
 //!
@@ -64,17 +65,20 @@
 //! - Not bit-exact idempotent: a second pass treats `CellAddAt` /
 //!   `CellSetAt` as barriers and may re-probe with tighter bounds.
 //!   Semantics are preserved either way.
-//! - disp32 (C2) is out of scope; the cap is disp8.
 
 use std::collections::BTreeMap;
 
 use crate::ir::lir::{LirInst, LirProgram};
 
-/// Inclusive upper bound on `virt_ptr` and on pending keys (x86 disp8 range).
-const DISP8_MAX: isize = 127;
+/// Inclusive upper bound on `virt_ptr` and on pending keys (x86 disp32 range).
+///
+/// The codegen picks disp8 or disp32 per-write based on the actual offset
+/// width, so the postpone pass can let windows grow to the full disp32 range
+/// and still emit the short (disp8) form wherever it fits.
+const DISP32_MAX: isize = i32::MAX as isize;
 
 /// Inclusive lower bound on `virt_ptr` and on pending keys.
-const DISP8_MIN: isize = -128;
+const DISP32_MIN: isize = i32::MIN as isize;
 
 /// Pending write at a single offset inside a straight-line block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,8 +104,8 @@ pub(crate) fn postpone_pointer_adds(program: LirProgram) -> LirProgram {
             LirInst::PtrAdd(0) => {}
             LirInst::PtrAdd(n) => {
                 let new_virt = state.virt_ptr.saturating_add(n);
-                if !(DISP8_MIN..=DISP8_MAX).contains(&new_virt) {
-                    // virt_ptr would escape disp8; flush the current window,
+                if !(DISP32_MIN..=DISP32_MAX).contains(&new_virt) {
+                    // virt_ptr would escape disp32; flush the current window,
                     // then emit the incoming PtrAdd unwrapped so it drives the
                     // real bounds check and grows the tape if needed.
                     state.flush_into(&mut out);
@@ -174,26 +178,24 @@ impl PostponeState {
         let lo = *self.pending.keys().next().expect("non-empty by check");
         let hi = *self.pending.keys().next_back().expect("non-empty by check");
 
-        // Probe extremes via real PtrAdds; they round-trip back to r13_0 so
-        // every following displacement write sees a base pointer identical
-        // to the one the offsets were collected against.
-        match (lo.cmp(&0), hi.cmp(&0)) {
-            (std::cmp::Ordering::Less, std::cmp::Ordering::Greater) => {
-                out.push(LirInst::PtrAdd(hi));
-                out.push(LirInst::PtrAdd(lo - hi));
-                out.push(LirInst::PtrAdd(-lo));
-            }
-            (std::cmp::Ordering::Less, _) => {
-                out.push(LirInst::PtrAdd(lo));
-                out.push(LirInst::PtrAdd(-lo));
-            }
-            (_, std::cmp::Ordering::Greater) => {
-                out.push(LirInst::PtrAdd(hi));
-                out.push(LirInst::PtrAdd(-hi));
-            }
-            _ => {
-                // Only the current cell is pending; r13_0 is trivially mapped.
-            }
+        // Probe both extremes in a single checked op that validates the whole
+        // window `[r13_0 + lo_extent, r13_0 + hi_extent]` and leaves r13 at
+        // r13_0 (delta = 0) so following displacement writes see the original
+        // base pointer.
+        //
+        // `PtrAddChecked`'s invariant is `lo_extent <= 0 <= hi_extent` (the
+        // origin must be inside the verified window). Pending keys may all sit
+        // on one side of 0 (e.g., only offset 3 written → lo = hi = 3), so
+        // clamp each side towards the origin: the side that needs no probe is
+        // reported as `0` and codegen skips its compare.
+        let lo_extent = lo.min(0);
+        let hi_extent = hi.max(0);
+        if lo_extent != 0 || hi_extent != 0 {
+            out.push(LirInst::PtrAddChecked {
+                delta: 0,
+                lo_extent,
+                hi_extent,
+            });
         }
 
         // Emit writes in ascending offset order.
@@ -266,8 +268,11 @@ mod tests {
         assert_eq!(
             out,
             vec![
-                LirInst::PtrAdd(2),
-                LirInst::PtrAdd(-2),
+                LirInst::PtrAddChecked {
+                    delta: 0,
+                    lo_extent: 0,
+                    hi_extent: 2,
+                },
                 LirInst::CellAdd(1),
                 LirInst::CellAddAt { off: 1, delta: 1 },
                 LirInst::CellAddAt { off: 2, delta: 1 },
@@ -289,8 +294,11 @@ mod tests {
         assert_eq!(
             out,
             vec![
-                LirInst::PtrAdd(-2),
-                LirInst::PtrAdd(2),
+                LirInst::PtrAddChecked {
+                    delta: 0,
+                    lo_extent: -2,
+                    hi_extent: 0,
+                },
                 LirInst::CellAddAt { off: -2, delta: 1 },
                 LirInst::CellAddAt { off: -1, delta: 1 },
                 LirInst::CellAdd(1),
@@ -311,9 +319,11 @@ mod tests {
         assert_eq!(
             out,
             vec![
-                LirInst::PtrAdd(3),
-                LirInst::PtrAdd(-5),
-                LirInst::PtrAdd(2),
+                LirInst::PtrAddChecked {
+                    delta: 0,
+                    lo_extent: -2,
+                    hi_extent: 3,
+                },
                 LirInst::CellAddAt { off: -2, delta: 1 },
                 LirInst::CellAddAt { off: 3, delta: 1 },
             ]
@@ -341,8 +351,11 @@ mod tests {
         assert_eq!(
             out,
             vec![
-                LirInst::PtrAdd(1),
-                LirInst::PtrAdd(-1),
+                LirInst::PtrAddChecked {
+                    delta: 0,
+                    lo_extent: 0,
+                    hi_extent: 1,
+                },
                 LirInst::CellSetAt { off: 1, val: 15 },
                 LirInst::PtrAdd(1),
             ]
@@ -361,8 +374,11 @@ mod tests {
         assert_eq!(
             out,
             vec![
-                LirInst::PtrAdd(3),
-                LirInst::PtrAdd(-3),
+                LirInst::PtrAddChecked {
+                    delta: 0,
+                    lo_extent: 0,
+                    hi_extent: 3,
+                },
                 LirInst::CellAddAt { off: 3, delta: 1 },
                 LirInst::PtrAdd(3),
                 LirInst::PutByte,
@@ -391,29 +407,66 @@ mod tests {
     }
 
     #[test]
-    fn disp8_overflow_forces_flush_and_unwrapped_ptr_add() {
-        // virt_ptr starts at 0, PtrAdd(100) brings it to 100; next PtrAdd(100)
-        // would go to 200, exceeding the disp8 cap, so flush happens first.
-        // After the raw PtrAdd is emitted, r13_0 advances: the following
-        // CellAdd lands at offset 0 of the fresh window.
+    fn disp32_overflow_forces_flush_and_unwrapped_ptr_add() {
+        // virt_ptr starts at 0, PtrAdd(2_000_000_000) lands inside the disp32
+        // range; the second PtrAdd(2_000_000_000) would take it to 4×10⁹ which
+        // overflows `i32`, so the postpone pass flushes first and re-emits the
+        // PtrAdd raw. After that, `r13_0` advances and the trailing CellAdd
+        // lands at offset 0 of the fresh window.
+        let big: isize = 2_000_000_000;
         let out = run(vec![
-            LirInst::PtrAdd(100),
+            LirInst::PtrAdd(big),
             LirInst::CellAdd(1),
-            LirInst::PtrAdd(100),
+            LirInst::PtrAdd(big),
             LirInst::CellAdd(1),
         ]);
         assert_eq!(
             out,
             vec![
-                // Flush of the first window (virt_ptr=100, pending={100: Add(1)}).
-                LirInst::PtrAdd(100),
-                LirInst::PtrAdd(-100),
-                LirInst::CellAddAt { off: 100, delta: 1 },
-                LirInst::PtrAdd(100),
-                // The overflowing PtrAdd(100) emitted as-is.
-                LirInst::PtrAdd(100),
+                // Flush of the first window (virt_ptr=big, pending={big: Add(1)}).
+                LirInst::PtrAddChecked {
+                    delta: 0,
+                    lo_extent: 0,
+                    hi_extent: big,
+                },
+                LirInst::CellAddAt { off: big, delta: 1 },
+                LirInst::PtrAdd(big),
+                // The overflowing PtrAdd(big) emitted as-is.
+                LirInst::PtrAdd(big),
                 // Trailing flush of the new window (virt_ptr=0, pending={0: Add(1)}).
                 LirInst::CellAdd(1),
+            ]
+        );
+    }
+
+    #[test]
+    fn wide_offsets_stay_in_one_window() {
+        // The pre-widening pass would have flushed at offset 128 because it
+        // was past the disp8 cap; now the window can grow to any disp32
+        // offset and produce a single `CellAddAt` / `CellSetAt` per write.
+        let out = run(vec![
+            LirInst::PtrAdd(1_000_000),
+            LirInst::CellAdd(1),
+            LirInst::PtrAdd(-2_000_000),
+            LirInst::CellSet(0x42),
+        ]);
+        assert_eq!(
+            out,
+            vec![
+                LirInst::PtrAddChecked {
+                    delta: 0,
+                    lo_extent: -1_000_000,
+                    hi_extent: 1_000_000,
+                },
+                LirInst::CellSetAt {
+                    off: -1_000_000,
+                    val: 0x42,
+                },
+                LirInst::CellAddAt {
+                    off: 1_000_000,
+                    delta: 1,
+                },
+                LirInst::PtrAdd(-1_000_000),
             ]
         );
     }
@@ -471,8 +524,11 @@ mod tests {
         assert_eq!(
             out,
             vec![
-                LirInst::PtrAdd(3),
-                LirInst::PtrAdd(-3),
+                LirInst::PtrAddChecked {
+                    delta: 0,
+                    lo_extent: 0,
+                    hi_extent: 3,
+                },
                 LirInst::CellAddAt { off: 3, delta: 1 },
                 LirInst::PtrAdd(3),
                 LirInst::Scan(1),

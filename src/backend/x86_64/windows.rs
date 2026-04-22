@@ -253,11 +253,58 @@ pub fn compile_lir_to_windows_program(lir: &LirProgram) -> WindowsProgram {
         exit_one_label,
     );
 
+    // See the Linux backend: tracks offsets relative to current `r13` that have
+    // been proven mapped by a preceding `PtrAddChecked`, so later moves and
+    // `PtrAddChecked`s within the window can skip their probes. Barriers clear.
+    let mut verified_window: Option<(isize, isize)> = None;
+
     for inst in &lir.insts {
         match inst {
             LirInst::PtrAdd(0) => {}
             LirInst::PtrAdd(n) => {
-                emit_ptr_add_out(&mut out, &mut labels, *n, ensure_tape_label);
+                let n = *n;
+                if let Some((wlo, whi)) = verified_window
+                    && wlo <= n
+                    && n <= whi
+                {
+                    emit_add_reg_isize(&mut out, Reg64::R13, n);
+                    verified_window = Some((wlo - n, whi - n));
+                } else {
+                    emit_ptr_add_out(&mut out, &mut labels, n, ensure_tape_label);
+                    verified_window = None;
+                }
+            }
+            LirInst::PtrAddChecked {
+                delta,
+                lo_extent,
+                hi_extent,
+            } => {
+                let delta = *delta;
+                let lo_extent = *lo_extent;
+                let hi_extent = *hi_extent;
+                let covered = matches!(
+                    verified_window,
+                    Some((wlo, whi)) if wlo <= lo_extent && hi_extent <= whi
+                );
+                if covered {
+                    if delta != 0 {
+                        emit_add_reg_isize(&mut out, Reg64::R13, delta);
+                    }
+                } else {
+                    emit_ptr_add_checked_out(
+                        &mut out,
+                        &mut labels,
+                        delta,
+                        lo_extent,
+                        hi_extent,
+                        ensure_tape_label,
+                    );
+                }
+                let (nlo, nhi) = match verified_window {
+                    Some((wlo, whi)) => (wlo.min(lo_extent), whi.max(hi_extent)),
+                    None => (lo_extent, hi_extent),
+                };
+                verified_window = Some((nlo - delta, nhi - delta));
             }
             LirInst::LinearMul(factors) => {
                 if factors.is_empty() {
@@ -273,6 +320,7 @@ pub fn compile_lir_to_windows_program(lir: &LirProgram) -> WindowsProgram {
                     out.push(AsmInst::AddMemR13Al);
                     emit_ptr_add_out(&mut out, &mut labels, -*off, ensure_tape_label);
                 }
+                verified_window = None;
             }
             LirInst::Scan(dir) => {
                 let loop_top = labels.fresh();
@@ -283,6 +331,44 @@ pub fn compile_lir_to_windows_program(lir: &LirProgram) -> WindowsProgram {
                 emit_ptr_add_out(&mut out, &mut labels, *dir, ensure_tape_label);
                 out.push(AsmInst::Jmp(loop_top));
                 out.push(AsmInst::Label(loop_done));
+                verified_window = None;
+            }
+            LirInst::ScanWithHint { dir, hint_bytes } => {
+                let step = *dir;
+                debug_assert!(step == 1 || step == -1, "ScanWithHint step must be ±1");
+                let slow_top = labels.fresh();
+                let done = labels.fresh();
+
+                if *hint_bytes > 0 {
+                    let fast_top = labels.fresh();
+                    let limit_offset = i64::from(*hint_bytes) * (step as i64);
+                    let limit_offset = isize::try_from(limit_offset)
+                        .expect("ScanWithHint hint offset must fit in isize");
+
+                    out.push(AsmInst::MovRegReg(Reg64::R10, Reg64::R13));
+                    emit_add_reg_isize(&mut out, Reg64::R10, limit_offset);
+
+                    out.push(AsmInst::Label(fast_top));
+                    out.push(AsmInst::CmpMem8Imm8(Reg64::R13, 0));
+                    out.push(AsmInst::Jz(done));
+                    if step == 1 {
+                        out.push(AsmInst::CmpRegReg(Reg64::R13, Reg64::R10));
+                    } else {
+                        out.push(AsmInst::CmpRegReg(Reg64::R10, Reg64::R13));
+                    }
+                    out.push(AsmInst::Jae(slow_top));
+                    out.push(AsmInst::AddRegImm32(Reg64::R13, step as i32));
+                    out.push(AsmInst::Jmp(fast_top));
+                }
+
+                out.push(AsmInst::Label(slow_top));
+                out.push(AsmInst::CmpMem8Imm8(Reg64::R13, 0));
+                out.push(AsmInst::Jz(done));
+                emit_ptr_add_out(&mut out, &mut labels, step, ensure_tape_label);
+                out.push(AsmInst::Jmp(slow_top));
+                out.push(AsmInst::Label(done));
+
+                verified_window = None;
             }
             LirInst::CellAdd(0) => {}
             LirInst::CellAdd(n) => {
@@ -297,11 +383,9 @@ pub fn compile_lir_to_windows_program(lir: &LirProgram) -> WindowsProgram {
                     *off != 0,
                     "CellAddAt(off=0) should be canonicalised to CellAdd"
                 );
-                let disp = i8::try_from(*off)
-                    .expect("B4 invariant: CellAddAt offset must fit in i8 (disp8)");
                 let imm = ((*delta % 256) + 256) % 256;
                 if imm != 0 {
-                    out.push(AsmInst::AddMem8ImmDisp8(Reg64::R13, disp, imm as u8 as i8));
+                    out.push(mem8_add_at_r13(*off, imm as u8 as i8));
                 }
             }
             LirInst::CellSetAt { off, val } => {
@@ -309,30 +393,51 @@ pub fn compile_lir_to_windows_program(lir: &LirProgram) -> WindowsProgram {
                     *off != 0,
                     "CellSetAt(off=0) should be canonicalised to CellSet"
                 );
-                let disp = i8::try_from(*off)
-                    .expect("B4 invariant: CellSetAt offset must fit in i8 (disp8)");
-                out.push(AsmInst::MovMem8ImmDisp8(Reg64::R13, disp, *val));
+                out.push(mem8_set_at_r13(*off, *val));
             }
-            LirInst::PutByte => emit_put_byte(
-                &mut out,
-                imports.iat_label(Kernel32Import::WriteFile),
-                exit_one_label,
-            ),
-            LirInst::GetByte => emit_get_byte(
-                &mut out,
-                &mut labels,
-                imports.iat_label(Kernel32Import::ReadFile),
-                imports.iat_label(Kernel32Import::GetLastError),
-                exit_one_label,
-            ),
-            LirInst::Label(id) => out.push(AsmInst::Label(map_label(*id))),
+            LirInst::ZeroRun { start, count } => {
+                debug_assert!(*count >= 2, "ZeroRun should hold at least two bytes");
+                for i in 0..*count {
+                    let off = isize::try_from(i64::from(*start) + i64::from(i))
+                        .expect("ZeroRun offset must fit in isize");
+                    if off == 0 {
+                        out.push(AsmInst::MovMem8Imm8(Reg64::R13, 0));
+                    } else {
+                        out.push(mem8_set_at_r13(off, 0));
+                    }
+                }
+            }
+            LirInst::PutByte => {
+                emit_put_byte(
+                    &mut out,
+                    imports.iat_label(Kernel32Import::WriteFile),
+                    exit_one_label,
+                );
+                verified_window = None;
+            }
+            LirInst::GetByte => {
+                emit_get_byte(
+                    &mut out,
+                    &mut labels,
+                    imports.iat_label(Kernel32Import::ReadFile),
+                    imports.iat_label(Kernel32Import::GetLastError),
+                    exit_one_label,
+                );
+                verified_window = None;
+            }
+            LirInst::Label(id) => {
+                out.push(AsmInst::Label(map_label(*id)));
+                verified_window = None;
+            }
             LirInst::JumpIfZero(id) => {
                 out.push(AsmInst::CmpMem8Imm8(Reg64::R13, 0));
                 out.push(AsmInst::Jz(map_label(*id)));
+                verified_window = None;
             }
             LirInst::JumpIfNonZero(id) => {
                 out.push(AsmInst::CmpMem8Imm8(Reg64::R13, 0));
                 out.push(AsmInst::Jnz(map_label(*id)));
+                verified_window = None;
             }
         }
     }
@@ -496,6 +601,64 @@ fn emit_ptr_add_out(
     out.push(AsmInst::Jmp(done));
     out.push(AsmInst::Label(slow_path));
     out.push(AsmInst::Call(ensure_tape_label));
+    out.push(AsmInst::Label(done));
+}
+
+/// Windows counterpart of [`crate::backend::codegen::emit_ptr_add_checked_out`].
+fn emit_ptr_add_checked_out(
+    out: &mut Vec<AsmInst>,
+    labels: &mut LabelAllocator,
+    delta: isize,
+    lo_extent: isize,
+    hi_extent: isize,
+    ensure_tape_label: AsmLabel,
+) {
+    debug_assert!(lo_extent <= 0 && 0 <= hi_extent);
+    debug_assert!(lo_extent <= delta && delta <= hi_extent);
+
+    if lo_extent == 0 && hi_extent == 0 {
+        debug_assert_eq!(delta, 0);
+        return;
+    }
+
+    let retry = labels.fresh();
+    let slow_lo = labels.fresh();
+    let slow_hi = labels.fresh();
+    let done = labels.fresh();
+
+    out.push(AsmInst::Label(retry));
+
+    if lo_extent < 0 {
+        out.push(AsmInst::MovRegReg(Reg64::R15, Reg64::R13));
+        emit_add_reg_isize(out, Reg64::R15, lo_extent);
+        out.push(AsmInst::CmpRegReg(Reg64::R15, Reg64::R12));
+        out.push(AsmInst::Jb(slow_lo));
+    }
+    if hi_extent > 0 {
+        out.push(AsmInst::MovRegReg(Reg64::R15, Reg64::R13));
+        emit_add_reg_isize(out, Reg64::R15, hi_extent);
+        out.push(AsmInst::CmpRegReg(Reg64::R15, Reg64::R14));
+        out.push(AsmInst::Jae(slow_hi));
+    }
+
+    if delta != 0 {
+        emit_add_reg_isize(out, Reg64::R13, delta);
+    }
+    out.push(AsmInst::Jmp(done));
+
+    if lo_extent < 0 {
+        out.push(AsmInst::Label(slow_lo));
+        out.push(AsmInst::Call(ensure_tape_label));
+        emit_add_reg_isize(out, Reg64::R13, -lo_extent);
+        out.push(AsmInst::Jmp(retry));
+    }
+    if hi_extent > 0 {
+        out.push(AsmInst::Label(slow_hi));
+        out.push(AsmInst::Call(ensure_tape_label));
+        emit_add_reg_isize(out, Reg64::R13, -hi_extent);
+        out.push(AsmInst::Jmp(retry));
+    }
+
     out.push(AsmInst::Label(done));
 }
 
@@ -730,6 +893,26 @@ fn emit_ensure_tape_contains_r15(
     out.push(AsmInst::Ret);
 }
 
+fn mem8_add_at_r13(off: isize, imm: i8) -> AsmInst {
+    if let Ok(disp8) = i8::try_from(off) {
+        AsmInst::AddMem8ImmDisp8(Reg64::R13, disp8, imm)
+    } else {
+        let disp32 =
+            i32::try_from(off).expect("CellAddAt offset must fit in i32 (lir_postpone DISP32 cap)");
+        AsmInst::AddMem8ImmDisp32(Reg64::R13, disp32, imm)
+    }
+}
+
+fn mem8_set_at_r13(off: isize, val: u8) -> AsmInst {
+    if let Ok(disp8) = i8::try_from(off) {
+        AsmInst::MovMem8ImmDisp8(Reg64::R13, disp8, val)
+    } else {
+        let disp32 =
+            i32::try_from(off).expect("CellSetAt offset must fit in i32 (lir_postpone DISP32 cap)");
+        AsmInst::MovMem8ImmDisp32(Reg64::R13, disp32, val)
+    }
+}
+
 fn emit_add_reg_isize(out: &mut Vec<AsmInst>, reg: Reg64, value: isize) {
     let mut remaining = i64::try_from(value).expect("pointer delta did not fit in i64");
     while remaining != 0 {
@@ -807,6 +990,112 @@ mod tests {
                 "VirtualAlloc",
                 "VirtualFree",
             ]
+        );
+    }
+
+    #[test]
+    fn windows_scan_with_hint_positive_dir_seeds_r10_and_uses_r13_vs_r10_compare() {
+        let program = compile_lir_to_windows_program(&LirProgram {
+            insts: vec![LirInst::ScanWithHint {
+                dir: 1,
+                hint_bytes: 5,
+            }],
+        });
+        let seeds_limit = program.asm.insts.windows(2).any(|w| {
+            matches!(
+                w,
+                [
+                    AsmInst::MovRegReg(Reg64::R10, Reg64::R13),
+                    AsmInst::AddRegImm32(Reg64::R10, 5)
+                ]
+            )
+        });
+        assert!(
+            seeds_limit,
+            "Windows ScanWithHint(+1, 5) must seed r10 = r13 + 5"
+        );
+        assert!(
+            program
+                .asm
+                .insts
+                .iter()
+                .any(|i| matches!(i, AsmInst::CmpRegReg(Reg64::R13, Reg64::R10))),
+            "positive dir must use `cmp r13, r10` on Windows too"
+        );
+    }
+
+    #[test]
+    fn windows_scan_with_hint_negative_dir_swaps_compare_operands() {
+        let program = compile_lir_to_windows_program(&LirProgram {
+            insts: vec![LirInst::ScanWithHint {
+                dir: -1,
+                hint_bytes: 4,
+            }],
+        });
+        assert!(
+            program
+                .asm
+                .insts
+                .iter()
+                .any(|i| matches!(i, AsmInst::CmpRegReg(Reg64::R10, Reg64::R13))),
+            "Windows negative dir must swap compare operands to `cmp r10, r13`"
+        );
+    }
+
+    #[test]
+    fn windows_zero_run_emits_byte_stores_across_span() {
+        let program = compile_lir_to_windows_program(&LirProgram {
+            insts: vec![LirInst::ZeroRun {
+                start: -1,
+                count: 3,
+            }],
+        });
+        assert!(
+            program
+                .asm
+                .insts
+                .contains(&AsmInst::MovMem8ImmDisp8(Reg64::R13, -1, 0)),
+            "Windows ZeroRun must emit disp8 store at r13 - 1"
+        );
+        assert!(
+            program
+                .asm
+                .insts
+                .contains(&AsmInst::MovMem8Imm8(Reg64::R13, 0)),
+            "Windows ZeroRun must emit bare [r13]=0 store when offset 0 is in range"
+        );
+        assert!(
+            program
+                .asm
+                .insts
+                .contains(&AsmInst::MovMem8ImmDisp8(Reg64::R13, 1, 0)),
+            "Windows ZeroRun must emit disp8 store at r13 + 1"
+        );
+    }
+
+    #[test]
+    fn windows_scan_with_hint_zero_hint_emits_only_slow_body() {
+        let program = compile_lir_to_windows_program(&LirProgram {
+            insts: vec![LirInst::ScanWithHint {
+                dir: 1,
+                hint_bytes: 0,
+            }],
+        });
+        assert!(
+            !program
+                .asm
+                .insts
+                .iter()
+                .any(|i| matches!(i, AsmInst::MovRegReg(Reg64::R10, Reg64::R13))),
+            "Windows hint=0 must not seed r10"
+        );
+        assert!(
+            !program.asm.insts.iter().any(|i| matches!(
+                i,
+                AsmInst::CmpRegReg(Reg64::R13, Reg64::R10)
+                    | AsmInst::CmpRegReg(Reg64::R10, Reg64::R13)
+            )),
+            "Windows hint=0 must not emit the fast-path boundary compare"
         );
     }
 }

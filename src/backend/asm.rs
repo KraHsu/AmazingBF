@@ -245,6 +245,21 @@ pub enum AsmInst {
     /// restriction as [`AsmInst::MovMem8Imm8`].
     MovMem8ImmDisp8(Reg64, i8, u8),
 
+    /// `add byte ptr [reg + disp32], imm8` — add an 8-bit immediate to the
+    /// byte at `reg + signed-disp32`.
+    ///
+    /// Disp32 counterpart of [`AsmInst::AddMem8ImmDisp8`], selected by
+    /// codegen when the offset does not fit in `i8`. Same SIB-free
+    /// restriction as [`AsmInst::AddMem8Imm8`].
+    AddMem8ImmDisp32(Reg64, i32, i8),
+
+    /// `mov byte ptr [reg + disp32], imm8` — store an 8-bit immediate at
+    /// `reg + signed-disp32`.
+    ///
+    /// Disp32 counterpart of [`AsmInst::MovMem8ImmDisp8`]. Same SIB-free
+    /// restriction as [`AsmInst::MovMem8Imm8`].
+    MovMem8ImmDisp32(Reg64, i32, u8),
+
     /// `cmp byte ptr [reg], imm8` — compare a memory byte with an immediate.
     ///
     /// Used by BF `[` / `]` to decide whether the current cell is zero. Same

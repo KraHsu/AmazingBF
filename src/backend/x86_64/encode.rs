@@ -470,6 +470,27 @@ fn emit_mem8_disp8(buf: &mut CodeBuffer, opcode: u8, subcode: u8, reg: Reg64, di
     buf.emit_u8(imm);
 }
 
+/// Emit `REX + opcode + ModRM(10, subcode, rm) + disp32 + imm8` — byte ALU /
+/// mov with a signed 32-bit displacement.
+///
+/// Disp32 counterpart of [`emit_mem8_disp8`], selected when the offset does
+/// not fit a signed byte. Same SIB-free restriction.
+fn emit_mem8_disp32(buf: &mut CodeBuffer, opcode: u8, subcode: u8, reg: Reg64, disp: i32, imm: u8) {
+    let rm = reg_num(reg);
+    assert!(
+        (rm & 7) != 4,
+        "mem8 disp32 encoding requires SIB for register {:?}",
+        reg
+    );
+    emit_rex_w(buf, 0, 0, rm >> 3);
+    buf.emit_u8(opcode);
+    buf.emit_u8(0b10_000_000 | ((subcode & 7) << 3) | (rm & 7));
+    for byte in disp.to_le_bytes() {
+        buf.emit_u8(byte);
+    }
+    buf.emit_u8(imm);
+}
+
 /// Emit `REX + opcode + ModRM(01, subcode, rm) + disp8(0)` without an
 /// immediate byte.
 ///
@@ -662,6 +683,20 @@ fn encode_inst(buf: &mut CodeBuffer, inst: &AsmInst) {
         // Encoding: REX.W + 0xC6 + ModRM(01, 0, rm) + disp8 + imm8.
         AsmInst::MovMem8ImmDisp8(reg, disp, imm) => {
             emit_mem8_disp8(buf, 0xC6, 0, *reg, *disp, *imm);
+        }
+
+        // add byte ptr [reg + disp32], imm8.
+        //
+        // Encoding: REX.W + 0x80 + ModRM(10, 0, rm) + disp32 + imm8.
+        AsmInst::AddMem8ImmDisp32(reg, disp, imm) => {
+            emit_mem8_disp32(buf, 0x80, 0, *reg, *disp, *imm as u8);
+        }
+
+        // mov byte ptr [reg + disp32], imm8.
+        //
+        // Encoding: REX.W + 0xC6 + ModRM(10, 0, rm) + disp32 + imm8.
+        AsmInst::MovMem8ImmDisp32(reg, disp, imm) => {
+            emit_mem8_disp32(buf, 0xC6, 0, *reg, *disp, *imm);
         }
 
         // cmp byte ptr [reg+0], imm8.
@@ -956,6 +991,35 @@ mod tests {
             insts: vec![AsmInst::AddMem8ImmDisp8(Reg64::R12, 1, 1)],
         };
         let _ = encode_program(&program);
+    }
+
+    #[test]
+    fn add_mem8_imm_disp32_on_r13_encodes_little_endian_disp() {
+        // add byte [r13 + 1000], 3
+        // REX.W|B=0x49, opcode=0x80, ModRM(mod=10 reg=0 rm=5)=0x85,
+        // disp32=0xE8 0x03 0x00 0x00 (1000 LE), imm8=0x03.
+        let program = AsmProgram {
+            insts: vec![AsmInst::AddMem8ImmDisp32(Reg64::R13, 1000, 3)],
+        };
+        let encoded = encode_program(&program);
+        assert_eq!(
+            encoded.text,
+            vec![0x49, 0x80, 0x85, 0xE8, 0x03, 0x00, 0x00, 0x03]
+        );
+    }
+
+    #[test]
+    fn mov_mem8_imm_disp32_on_r13_encodes_negative_disp_two_complement() {
+        // mov byte [r13 - 1000], 0x41
+        // disp32 = 0xFFFFFC18 (−1000 as i32 LE = 0x18 0xFC 0xFF 0xFF).
+        let program = AsmProgram {
+            insts: vec![AsmInst::MovMem8ImmDisp32(Reg64::R13, -1000, 0x41)],
+        };
+        let encoded = encode_program(&program);
+        assert_eq!(
+            encoded.text,
+            vec![0x49, 0xC6, 0x85, 0x18, 0xFC, 0xFF, 0xFF, 0x41]
+        );
     }
 
     #[test]

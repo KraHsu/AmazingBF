@@ -29,6 +29,7 @@ use crate::ir::hir::HirProgram;
 use crate::ir::lir::LirProgram;
 use crate::ir::lir_opt::optimize_lir;
 use crate::ir::lir_postpone::postpone_pointer_adds;
+use crate::ir::lir_scan_hint::promote_scan_hints;
 use crate::ir::lower::lower_to_lir;
 use crate::logging::{log_debug, log_info};
 use crate::runtime::host::NullHost;
@@ -185,12 +186,14 @@ fn compile_windows_program(hir: &HirProgram, opt_level: OptLevel) -> Result<Wind
 /// At `-O0` the pipeline stays a mechanical 1:1 lowering plus the basic
 /// peephole fold (`PtrAdd` / `CellAdd` adjacency). From `-O1` onwards
 /// [`postpone_pointer_adds`] runs before the peephole to expose
-/// displacement-form writes for x86_64 codegen.
+/// displacement-form writes for x86_64 codegen, and
+/// [`promote_scan_hints`] lifts `Scan` to `ScanWithHint` wherever the
+/// preceding bounds-check window already covers the scan traversal.
 fn build_optimized_lir(hir: &HirProgram, opt_level: OptLevel) -> LirProgram {
     let lowered = lower_to_lir(hir);
     if opt_level == OptLevel::O0 {
         optimize_lir(lowered)
     } else {
-        optimize_lir(postpone_pointer_adds(lowered))
+        promote_scan_hints(optimize_lir(postpone_pointer_adds(lowered)))
     }
 }
