@@ -9,6 +9,9 @@ use crate::backend::asm::{AsmInst, AsmLabel, AsmProgram, Reg64};
 use crate::ir::lir::{LabelId, LirInst, LirProgram};
 
 const INITIAL_TAPE_SIZE: usize = 4096;
+/// Size of the buffered-output ring, in bytes. Mirrors the Linux backend so
+/// the two `flush_output` helpers behave identically modulo ABI differences.
+const OUTPUT_BUFFER_SIZE: usize = 4096;
 const MEM_COMMIT_RESERVE: i64 = 0x3000;
 const MEM_RELEASE: i64 = 0x8000;
 const PAGE_READWRITE: i64 = 0x04;
@@ -217,6 +220,7 @@ pub fn compile_lir_to_windows_program(lir: &LirProgram) -> WindowsProgram {
     let ensure_tape_label = labels.fresh();
     let exit_one_label = labels.fresh();
     let grow_loop = labels.fresh();
+    let flush_output_label = labels.fresh();
     let imports = Kernel32Imports::new(
         &mut labels,
         &[
@@ -248,6 +252,11 @@ pub fn compile_lir_to_windows_program(lir: &LirProgram) -> WindowsProgram {
         exit_one_label,
     );
     emit_init_tape(
+        &mut out,
+        imports.iat_label(Kernel32Import::VirtualAlloc),
+        exit_one_label,
+    );
+    emit_init_output_buffer(
         &mut out,
         imports.iat_label(Kernel32Import::VirtualAlloc),
         exit_one_label,
@@ -454,6 +463,11 @@ pub fn compile_lir_to_windows_program(lir: &LirProgram) -> WindowsProgram {
     }
 
     emit_exit_process(&mut out, imports.iat_label(Kernel32Import::ExitProcess), 0);
+    emit_flush_output(
+        &mut out,
+        flush_output_label,
+        imports.iat_label(Kernel32Import::WriteFile),
+    );
     emit_ensure_tape_contains_r15(
         &mut out,
         ensure_tape_label,
@@ -708,6 +722,105 @@ fn emit_init_tape(out: &mut Vec<AsmInst>, virtual_alloc_iat: AsmLabel, exit_one_
     ));
     out.push(AsmInst::MovRegReg(Reg64::R14, Reg64::Rax));
     out.push(AsmInst::AddRegImm32(Reg64::R14, INITIAL_TAPE_SIZE as i32));
+}
+
+/// Allocate the 4 KiB output buffer via `VirtualAlloc` and pin its bookkeeping
+/// registers. Mirrors `crate::backend::codegen::emit_init_output_buffer` (Linux);
+/// the only differences are the allocation API (VirtualAlloc vs. mmap) and the
+/// failure semantics (NULL vs. negative). After this helper:
+///
+/// - `Rbx` = current write pointer, advanced by each `PutByte`; reset to the
+///   buffer base by [`emit_flush_output`].
+/// - `Rbp` = buffer end (= base + OUTPUT_BUFFER_SIZE); `PutByte`'s
+///   `cmp rbx, rbp` detects a full buffer and triggers a flush.
+///
+/// On allocation failure (`rax == NULL`) the generated code jumps to
+/// `exit_one_label`, matching the tape-allocation error path.
+fn emit_init_output_buffer(
+    out: &mut Vec<AsmInst>,
+    virtual_alloc_iat: AsmLabel,
+    exit_one_label: AsmLabel,
+) {
+    // VirtualAlloc(NULL, OUTPUT_BUFFER_SIZE, MEM_COMMIT|MEM_RESERVE, PAGE_READWRITE).
+    out.push(AsmInst::MovRegImm64(Reg64::Rcx, 0));
+    out.push(AsmInst::MovRegImm64(Reg64::Rdx, OUTPUT_BUFFER_SIZE as i64));
+    out.push(AsmInst::MovRegImm64(Reg64::R8, MEM_COMMIT_RESERVE));
+    out.push(AsmInst::MovRegImm64(Reg64::R9, PAGE_READWRITE));
+    out.push(AsmInst::CallMemLabel(virtual_alloc_iat));
+
+    // VirtualAlloc returns NULL on failure -> exit(1).
+    out.push(AsmInst::CmpRegImm32(Reg64::Rax, 0));
+    out.push(AsmInst::Jz(exit_one_label));
+
+    // Rbx = buffer_base (write pointer starts at the beginning).
+    out.push(AsmInst::MovRegReg(Reg64::Rbx, Reg64::Rax));
+
+    // Rbp = buffer_base + OUTPUT_BUFFER_SIZE (buffer end sentinel).
+    out.push(AsmInst::MovRegReg(Reg64::Rbp, Reg64::Rax));
+    out.push(AsmInst::AddRegImm32(Reg64::Rbp, OUTPUT_BUFFER_SIZE as i32));
+}
+
+/// Emit the `flush_output` helper subroutine for the Windows backend.
+///
+/// Will be called by `PutByte` on buffer-full, by every `GetByte` (so prior
+/// output reaches stdout before stdin blocks), and once on `exit(0)`.
+/// Writes `rbx - buffer_base` bytes to stdout via `WriteFile` and resets
+/// `rbx` to `buffer_base`. When no bytes are pending (`rbx == buffer_base`),
+/// `WriteFile(handle, buf, 0, ...)` is a harmless no-op.
+///
+/// Win64 calling convention notes:
+///
+/// - The helper reserves a fresh 88-byte frame (same constant the
+///   tape-grow helper uses) so the inner `call WriteFile` lands on a
+///   16-byte-aligned RSP. Layout inside the frame: `[rsp+0..32]` shadow
+///   space (untouched here), `[rsp+OVERLAPPED_SLOT_DISP]` 5th-arg
+///   `lpOverlapped = NULL`, `[rsp+IO_COUNT_SLOT_DISP]` `&BytesWritten`
+///   output slot.
+/// - `Rbx` and `Rbp` are non-volatile in Win64, so they survive the call
+///   to `WriteFile`. We still recompute the buffer base from `Rbp` after
+///   the call rather than caching it in `rdx`, because all volatile
+///   registers (rcx/rdx/r8/r9/r10/r11/rax) are clobbered.
+/// - We deliberately ignore short-write returns: BF programs only write
+///   to stdout, so `WriteFile` realistically either succeeds with the
+///   full count or the process is already terminating.
+fn emit_flush_output(out: &mut Vec<AsmInst>, label: AsmLabel, write_file_iat: AsmLabel) {
+    out.push(AsmInst::Label(label));
+    out.push(AsmInst::AddRegImm32(Reg64::Rsp, -CALLEE_STACK_FRAME_BYTES));
+
+    // 5th arg lpOverlapped = NULL (Win64 places it at [rsp+32]).
+    emit_zero_stack_qword(out, OVERLAPPED_SLOT_DISP);
+    // BytesWritten output slot (filled by WriteFile; we don't read it).
+    emit_zero_stack_qword(out, IO_COUNT_SLOT_DISP);
+
+    // rcx = stdout handle (cached in rdi during entry prologue).
+    out.push(AsmInst::MovRegReg(Reg64::Rcx, Reg64::Rdi));
+    // rdx = buffer_base = rbp - OUTPUT_BUFFER_SIZE.
+    out.push(AsmInst::LeaRegMem(
+        Reg64::Rdx,
+        Reg64::Rbp,
+        -(OUTPUT_BUFFER_SIZE as i32),
+    ));
+    // r8 = count = rbx - buffer_base.
+    out.push(AsmInst::MovRegReg(Reg64::R8, Reg64::Rbx));
+    out.push(AsmInst::SubRegReg(Reg64::R8, Reg64::Rdx));
+    // r9 = lpNumberOfBytesWritten = &slot.
+    out.push(AsmInst::LeaRegMem(
+        Reg64::R9,
+        Reg64::Rsp,
+        IO_COUNT_SLOT_DISP,
+    ));
+
+    out.push(AsmInst::CallMemLabel(write_file_iat));
+
+    // Reset write pointer to buffer_base (rdx is volatile post-call).
+    out.push(AsmInst::LeaRegMem(
+        Reg64::Rbx,
+        Reg64::Rbp,
+        -(OUTPUT_BUFFER_SIZE as i32),
+    ));
+
+    out.push(AsmInst::AddRegImm32(Reg64::Rsp, CALLEE_STACK_FRAME_BYTES));
+    out.push(AsmInst::Ret);
 }
 
 fn emit_put_byte(out: &mut Vec<AsmInst>, write_file_iat: AsmLabel, exit_one_label: AsmLabel) {
@@ -1137,6 +1250,83 @@ mod tests {
         assert!(
             program.asm.insts.contains(&AsmInst::DecMem8(Reg64::R13)),
             "CellAdd(-1) on Windows must emit DecMem8 (matches Linux short form)"
+        );
+    }
+
+    #[test]
+    fn windows_program_initialises_output_buffer_via_virtualalloc() {
+        let program = compile_lir_to_windows_program(&LirProgram { insts: vec![] });
+        // VirtualAlloc is invoked twice: first for the tape, then for the
+        // output buffer. The output-buffer call must set rdx = 4096, r8 =
+        // MEM_COMMIT|MEM_RESERVE, r9 = PAGE_READWRITE.
+        let virtual_alloc_calls = program
+            .asm
+            .insts
+            .iter()
+            .filter(|i| matches!(i, AsmInst::CallMemLabel(_)))
+            .count();
+        assert!(
+            virtual_alloc_calls >= 2,
+            "expected at least 2 VirtualAlloc/IAT calls (tape + output buffer)"
+        );
+        // After the second VirtualAlloc, rbx must be set from rax and rbp
+        // must be rax + OUTPUT_BUFFER_SIZE.
+        let pins_rbx = program.asm.insts.windows(3).any(|w| {
+            matches!(
+                w,
+                [
+                    AsmInst::MovRegReg(Reg64::Rbx, Reg64::Rax),
+                    AsmInst::MovRegReg(Reg64::Rbp, Reg64::Rax),
+                    AsmInst::AddRegImm32(Reg64::Rbp, 4096),
+                ]
+            )
+        });
+        assert!(
+            pins_rbx,
+            "Windows prologue must pin Rbx = base and Rbp = base + 4096"
+        );
+    }
+
+    #[test]
+    fn windows_flush_output_helper_uses_writefile_iat_with_aligned_frame() {
+        let program = compile_lir_to_windows_program(&LirProgram { insts: vec![] });
+        // The flush_output helper subroutine must reserve a 88-byte frame
+        // (matches CALLEE_STACK_FRAME_BYTES used for ensure_tape) so the
+        // inner WriteFile call lands on a 16-byte-aligned RSP.
+        let reserves_frame = program
+            .asm
+            .insts
+            .iter()
+            .any(|i| matches!(i, AsmInst::AddRegImm32(Reg64::Rsp, -88)));
+        let restores_frame = program
+            .asm
+            .insts
+            .iter()
+            .any(|i| matches!(i, AsmInst::AddRegImm32(Reg64::Rsp, 88)));
+        assert!(
+            reserves_frame && restores_frame,
+            "flush_output helper must reserve and restore an 88-byte frame"
+        );
+        // The helper terminates with `Ret` (it's a subroutine, not inlined).
+        assert!(
+            program.asm.insts.iter().any(|i| matches!(i, AsmInst::Ret)),
+            "flush_output helper must end with Ret"
+        );
+        // It computes count = rbx - (rbp - 4096) by lea rdx,[rbp-4096] then
+        // mov r8, rbx; sub r8, rdx.
+        let computes_count = program.asm.insts.windows(3).any(|w| {
+            matches!(
+                w,
+                [
+                    AsmInst::LeaRegMem(Reg64::Rdx, Reg64::Rbp, -4096),
+                    AsmInst::MovRegReg(Reg64::R8, Reg64::Rbx),
+                    AsmInst::SubRegReg(Reg64::R8, Reg64::Rdx),
+                ]
+            )
+        });
+        assert!(
+            computes_count,
+            "flush_output must compute count = rbx - (rbp - 4096) for WriteFile"
         );
     }
 
