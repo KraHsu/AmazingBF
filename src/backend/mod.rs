@@ -11,3 +11,6 @@
 pub(crate) mod asm;
 pub(crate) mod codegen;
 pub(crate) mod x86_64;
+
+#[cfg(test)]
+mod parity_tests;

@@ -371,10 +371,21 @@ pub fn compile_lir_to_windows_program(lir: &LirProgram) -> WindowsProgram {
                 verified_window = None;
             }
             LirInst::CellAdd(0) => {}
+            // CellAdd(n): mirror the Linux backend's inc/dec selection.
+            //
+            // ±1 → 4-byte `inc`/`dec byte [r13]`; everything else falls back to
+            // the 5-byte `add byte [r13], imm8` (or no-op when `n % 256 == 0`).
+            // Keeps the two backends byte-for-byte equivalent on this opcode
+            // (see `tests/backend_parity.rs`).
             LirInst::CellAdd(n) => {
                 let imm = ((*n % 256) + 256) % 256;
-                if imm != 0 {
-                    out.push(AsmInst::AddMem8Imm8(Reg64::R13, imm as u8 as i8));
+                match imm {
+                    0 => {}
+                    1 => out.push(AsmInst::IncMem8(Reg64::R13)),
+                    255 => out.push(AsmInst::DecMem8(Reg64::R13)),
+                    other => {
+                        out.push(AsmInst::AddMem8Imm8(Reg64::R13, other as u8 as i8));
+                    }
                 }
             }
             LirInst::CellSet(v) => out.push(AsmInst::MovMem8Imm8(Reg64::R13, *v)),
@@ -1096,6 +1107,60 @@ mod tests {
                     | AsmInst::CmpRegReg(Reg64::R10, Reg64::R13)
             )),
             "Windows hint=0 must not emit the fast-path boundary compare"
+        );
+    }
+
+    #[test]
+    fn windows_cell_add_plus_one_uses_inc_short_form() {
+        let program = compile_lir_to_windows_program(&LirProgram {
+            insts: vec![LirInst::CellAdd(1)],
+        });
+        assert!(
+            program.asm.insts.contains(&AsmInst::IncMem8(Reg64::R13)),
+            "CellAdd(1) on Windows must emit IncMem8 (matches Linux short form)"
+        );
+        assert!(
+            !program
+                .asm
+                .insts
+                .iter()
+                .any(|i| matches!(i, AsmInst::AddMem8Imm8(Reg64::R13, 1))),
+            "CellAdd(1) must not fall back to AddMem8Imm8"
+        );
+    }
+
+    #[test]
+    fn windows_cell_add_minus_one_uses_dec_short_form() {
+        let program = compile_lir_to_windows_program(&LirProgram {
+            insts: vec![LirInst::CellAdd(-1)],
+        });
+        assert!(
+            program.asm.insts.contains(&AsmInst::DecMem8(Reg64::R13)),
+            "CellAdd(-1) on Windows must emit DecMem8 (matches Linux short form)"
+        );
+    }
+
+    #[test]
+    fn windows_cell_add_other_values_keep_add_form() {
+        let program = compile_lir_to_windows_program(&LirProgram {
+            insts: vec![LirInst::CellAdd(2), LirInst::CellAdd(-3)],
+        });
+        // -3 normalises to 253 which fits in i8 as -3.
+        assert!(
+            program
+                .asm
+                .insts
+                .iter()
+                .any(|i| matches!(i, AsmInst::AddMem8Imm8(Reg64::R13, 2))),
+            "CellAdd(2) must still use AddMem8Imm8"
+        );
+        assert!(
+            program
+                .asm
+                .insts
+                .iter()
+                .any(|i| matches!(i, AsmInst::AddMem8Imm8(Reg64::R13, -3))),
+            "CellAdd(-3) must use AddMem8Imm8 with sign-extended -3"
         );
     }
 }

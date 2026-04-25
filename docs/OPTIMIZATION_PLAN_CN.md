@@ -86,8 +86,8 @@
 
 ### Phase D — Backend / codegen（依赖 Phase C 的语义保证）
 
-- **D1 指令选择** · **[共享编码层 + Linux codegen 已实现 / Windows codegen `inc`/`dec` 选择待对齐]**：`add/and/cmp r, imm` 立即数自动选 `0x83 + imm8`（4 字节）还是 `0x81 + imm32`（7 字节），长 Jcc / JMP 由独立的 relaxation pass（`src/backend/x86_64/relax.rs`）迭代收缩到 rel8 短跳——这两项都在 encode/relax 层，两平台共享。而 `CellAdd(±1) → inc / dec`（opcode `0xFE`）的选择只在 Linux `compile_lir_to_asm`（`src/backend/codegen.rs:382-395`）中做；`src/backend/x86_64/windows.rs::compile_lir_to_windows_program`（`windows.rs:373-379`）对 `±1` 仍一律发射 `AddMem8Imm8(R13, ±1)`，每条 `+` / `-` 比 Linux 多 1 字节。`AsmInst::{IncMem8, DecMem8}` 及其编码已就绪，Windows 侧 `CellAdd` 分支只需补同样的 `match imm { 1 => Inc, 255 => Dec, _ => Add }`，建议随 D3 Windows 后续（或更早）一起对齐。
-  - 文件：`src/backend/asm.rs`、`src/backend/x86_64/encode.rs`、`src/backend/x86_64/relax.rs`、`src/backend/codegen.rs`（Linux `inc`/`dec` 分支）、`src/backend/x86_64/windows.rs`（待对齐）
+- **D1 指令选择** · **[已实现]**：`add/and/cmp r, imm` 立即数自动选 `0x83 + imm8`（4 字节）还是 `0x81 + imm32`（7 字节），长 Jcc / JMP 由独立的 relaxation pass（`src/backend/x86_64/relax.rs`）迭代收缩到 rel8 短跳——这两项都在 encode/relax 层，两平台共享。`CellAdd(±1) → inc / dec`（opcode `0xFE`）的选择已在两个后端对齐：Linux `compile_lir_to_asm`（`src/backend/codegen.rs:382-395`）与 Windows `compile_lir_to_windows_program`（`src/backend/x86_64/windows.rs:373-396`）均使用相同的 `match imm { 0 => {}, 1 => IncMem8, 255 => DecMem8, _ => AddMem8Imm8 }` 模式，每条 `+` / `-` 都是 4 字节短形。新增的跨后端 parity 测试（`src/backend/parity_tests.rs`）锁定该不变量，并兜底其它 ABI 无关 LIR 指令（`CellSet` / `CellAddAt` / `CellSetAt` / 模 256 边界）的双端等价性，作为后续阶段不断扩充的基础。
+  - 文件：`src/backend/asm.rs`、`src/backend/x86_64/encode.rs`、`src/backend/x86_64/relax.rs`、`src/backend/codegen.rs`、`src/backend/x86_64/windows.rs`、`src/backend/parity_tests.rs`（新，7 单测）
 - **D2 SIMD 专用形式**：
   - `Scan(±1)` → `rep scasb`（`al = 0`, `rdi = r13`, `rcx` 设足够大）配合一次 bounds 收紧。需确认 Windows ABI 对 `rep` 指令无特殊要求。
   - `Zero` 连续段（来自未来 pass 合并）→ `rep stosb`
