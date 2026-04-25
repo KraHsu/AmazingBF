@@ -7,5 +7,7 @@ pub(crate) mod lir;
 pub(crate) mod lir_opt;
 pub(crate) mod lir_postpone;
 pub(crate) mod lir_scan_hint;
+pub(crate) mod loop_profile;
+pub(crate) mod loop_stats;
 pub(crate) mod lower;
 pub(crate) mod optimize;

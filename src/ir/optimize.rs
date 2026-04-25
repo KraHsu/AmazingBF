@@ -154,7 +154,7 @@ fn fuse_add_move(insts: Vec<HirInst>) -> Vec<HirInst> {
 /// Modular inverse of `a` mod 256. Returns `Some(x)` with `x ∈ 1..=255` and
 /// `(a * x) ≡ 1 (mod 256)` when `a mod 256` is coprime to 256 (i.e. odd).
 /// Returns `None` when `a mod 256` is even (no inverse exists).
-fn invmod_256(a: i32) -> Option<i32> {
+pub(crate) fn invmod_256(a: i32) -> Option<i32> {
     let a = a.rem_euclid(256);
     if a & 1 == 0 {
         return None;
