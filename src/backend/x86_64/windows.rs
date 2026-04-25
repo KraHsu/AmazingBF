@@ -428,11 +428,7 @@ pub fn compile_lir_to_windows_program(lir: &LirProgram) -> WindowsProgram {
                 }
             }
             LirInst::PutByte => {
-                emit_put_byte(
-                    &mut out,
-                    imports.iat_label(Kernel32Import::WriteFile),
-                    exit_one_label,
-                );
+                emit_put_byte(&mut out, &mut labels, flush_output_label);
                 verified_window = None;
             }
             LirInst::GetByte => {
@@ -823,19 +819,25 @@ fn emit_flush_output(out: &mut Vec<AsmInst>, label: AsmLabel, write_file_iat: As
     out.push(AsmInst::Ret);
 }
 
-fn emit_put_byte(out: &mut Vec<AsmInst>, write_file_iat: AsmLabel, exit_one_label: AsmLabel) {
-    emit_zero_stack_qword(out, IO_COUNT_SLOT_DISP);
-    out.push(AsmInst::MovRegReg(Reg64::Rcx, Reg64::Rdi));
-    out.push(AsmInst::MovRegReg(Reg64::Rdx, Reg64::R13));
-    out.push(AsmInst::MovRegImm64(Reg64::R8, 1));
-    out.push(AsmInst::LeaRegMem(
-        Reg64::R9,
-        Reg64::Rsp,
-        IO_COUNT_SLOT_DISP,
-    ));
-    out.push(AsmInst::CallMemLabel(write_file_iat));
-    out.push(AsmInst::CmpRegImm32(Reg64::Rax, 0));
-    out.push(AsmInst::Jz(exit_one_label));
+/// Emit a buffered `.` (PutByte) for the Windows backend.
+///
+/// Mirrors the Linux backend's per-byte hot path (`codegen.rs:461-471`):
+/// store the current cell into `[rbx]`, advance `rbx`, and `call
+/// flush_output` only when `rbx == rbp` (every 4096 bytes). The actual
+/// `WriteFile` IAT call lives entirely inside `emit_flush_output`.
+fn emit_put_byte(
+    out: &mut Vec<AsmInst>,
+    labels: &mut LabelAllocator,
+    flush_output_label: AsmLabel,
+) {
+    let skip = labels.fresh();
+    out.push(AsmInst::MovAlMemR13);
+    out.push(AsmInst::MovMemRbxAl);
+    out.push(AsmInst::AddRegImm32(Reg64::Rbx, 1));
+    out.push(AsmInst::CmpRegReg(Reg64::Rbx, Reg64::Rbp));
+    out.push(AsmInst::Jnz(skip));
+    out.push(AsmInst::Call(flush_output_label));
+    out.push(AsmInst::Label(skip));
 }
 
 fn emit_get_byte(
@@ -1284,6 +1286,39 @@ mod tests {
         assert!(
             pins_rbx,
             "Windows prologue must pin Rbx = base and Rbp = base + 4096"
+        );
+    }
+
+    #[test]
+    fn windows_put_byte_uses_buffered_path_not_writefile_per_byte() {
+        let program = compile_lir_to_windows_program(&LirProgram {
+            insts: vec![LirInst::PutByte],
+        });
+        // PutByte should appear as the 5-instruction buffered hot path.
+        let buffered = program.asm.insts.windows(5).any(|w| {
+            matches!(
+                w,
+                [
+                    AsmInst::MovAlMemR13,
+                    AsmInst::MovMemRbxAl,
+                    AsmInst::AddRegImm32(Reg64::Rbx, 1),
+                    AsmInst::CmpRegReg(Reg64::Rbx, Reg64::Rbp),
+                    AsmInst::Jnz(_),
+                ]
+            )
+        });
+        assert!(
+            buffered,
+            "Windows PutByte must emit the 5-instruction buffered hot path"
+        );
+        // It must Call the flush helper, not WriteFile directly.
+        assert!(
+            program
+                .asm
+                .insts
+                .iter()
+                .any(|i| matches!(i, AsmInst::Call(_))),
+            "Windows PutByte must contain a `Call` to the flush helper"
         );
     }
 
