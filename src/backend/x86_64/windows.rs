@@ -320,6 +320,17 @@ pub fn compile_lir_to_windows_program(lir: &LirProgram) -> WindowsProgram {
                     out.push(AsmInst::MovMem8Imm8(Reg64::R13, 0));
                     continue;
                 }
+                // D3 pinned Rbx as the output-buffer write pointer, so the
+                // body must save/restore it across MovzxEbxFromMemR13. Bare
+                // push/pop would shift Rsp by 8, leaving it 8-byte (not
+                // 16-byte) aligned at the inner `call ensure_tape` site
+                // inside emit_ptr_add_out — which violates Win64 ABI. The
+                // paired (push, sub rsp, 8) / (add rsp, 8, pop) keeps Rsp
+                // 16-aligned at every internal `call`. (The Linux backend
+                // uses bare push/pop because syscall has no alignment
+                // requirement.)
+                out.push(AsmInst::Push(Reg64::Rbx));
+                out.push(AsmInst::AddRegImm32(Reg64::Rsp, -8));
                 out.push(AsmInst::MovzxEbxFromMemR13);
                 out.push(AsmInst::MovMem8Imm8(Reg64::R13, 0));
                 for (off, factor) in factors {
@@ -329,6 +340,8 @@ pub fn compile_lir_to_windows_program(lir: &LirProgram) -> WindowsProgram {
                     out.push(AsmInst::AddMemR13Al);
                     emit_ptr_add_out(&mut out, &mut labels, -*off, ensure_tape_label);
                 }
+                out.push(AsmInst::AddRegImm32(Reg64::Rsp, 8));
+                out.push(AsmInst::Pop(Reg64::Rbx));
                 verified_window = None;
             }
             LirInst::Scan(dir) => {
@@ -1299,6 +1312,42 @@ mod tests {
         assert!(
             pins_rbx,
             "Windows prologue must pin Rbx = base and Rbp = base + 4096"
+        );
+    }
+
+    #[test]
+    fn windows_linear_mul_protects_rbx_with_aligned_pair() {
+        let program = compile_lir_to_windows_program(&LirProgram {
+            insts: vec![LirInst::LinearMul(vec![(1, 1)])],
+        });
+        // Body must open with `push rbx; sub rsp, 8` and close with
+        // `add rsp, 8; pop rbx` to keep Rsp 16-byte aligned at internal
+        // `call ensure_tape` sites (Win64 ABI).
+        let opens = program.asm.insts.windows(2).any(|w| {
+            matches!(
+                w,
+                [
+                    AsmInst::Push(Reg64::Rbx),
+                    AsmInst::AddRegImm32(Reg64::Rsp, -8),
+                ]
+            )
+        });
+        let closes = program.asm.insts.windows(2).any(|w| {
+            matches!(
+                w,
+                [
+                    AsmInst::AddRegImm32(Reg64::Rsp, 8),
+                    AsmInst::Pop(Reg64::Rbx),
+                ]
+            )
+        });
+        assert!(
+            opens,
+            "Windows LinearMul must save Rbx with aligned `push rbx; sub rsp, 8`"
+        );
+        assert!(
+            closes,
+            "Windows LinearMul must restore Rbx with `add rsp, 8; pop rbx`"
         );
     }
 
