@@ -470,6 +470,18 @@ fn format_inst_asm(out: &mut String, inst: &AsmInst) {
             .unwrap();
         }
 
+        AsmInst::Std => {
+            writeln!(out, "    std                         ; set direction flag").unwrap();
+        }
+
+        AsmInst::RepneScasb => {
+            writeln!(
+                out,
+                "    repne scasb                 ; while rcx>0: scan [rdi] vs al, stop on match"
+            )
+            .unwrap();
+        }
+
         // System call.
         AsmInst::Syscall => {
             writeln!(out, "    syscall").unwrap();

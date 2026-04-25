@@ -774,6 +774,17 @@ fn encode_inst(buf: &mut CodeBuffer, inst: &AsmInst) {
             buf.emit_u8(0xA4);
         }
 
+        // Set direction flag: 0xFD.
+        AsmInst::Std => buf.emit_u8(0xFD),
+
+        // repne scasb: 0xF2 (REPNE prefix) + 0xAE (SCASB).
+        // Compares al with [rdi], post-{inc,dec}rements rdi (sign by DF),
+        // decrements rcx; stops when ZF=1 (match) or rcx==0.
+        AsmInst::RepneScasb => {
+            buf.emit_u8(0xF2);
+            buf.emit_u8(0xAE);
+        }
+
         // syscall: 0x0F 0x05.
         AsmInst::Syscall => {
             buf.emit_u8(0x0F);
@@ -1101,6 +1112,26 @@ mod tests {
         };
         let encoded = encode_program(&program);
         assert_eq!(encoded.text, vec![0x88, 0x03]);
+    }
+
+    #[test]
+    fn std_encodes_to_single_byte_fd() {
+        // std — set direction flag, opcode 0xFD, no operands.
+        let program = AsmProgram {
+            insts: vec![AsmInst::Std],
+        };
+        let encoded = encode_program(&program);
+        assert_eq!(encoded.text, vec![0xFD]);
+    }
+
+    #[test]
+    fn repne_scasb_encodes_to_f2_ae() {
+        // repne scasb — REPNE prefix 0xF2, then SCASB opcode 0xAE.
+        let program = AsmProgram {
+            insts: vec![AsmInst::RepneScasb],
+        };
+        let encoded = encode_program(&program);
+        assert_eq!(encoded.text, vec![0xF2, 0xAE]);
     }
 
     #[test]

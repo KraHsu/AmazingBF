@@ -20,6 +20,8 @@
 
 #![cfg(test)]
 
+use std::collections::HashMap;
+
 use crate::backend::asm::{AsmInst, AsmLabel};
 use crate::backend::codegen::compile_lir_to_asm;
 use crate::backend::x86_64::windows::compile_lir_to_windows_program;
@@ -39,8 +41,8 @@ fn parity_for_lir(insts: Vec<LirInst>) -> (Vec<AsmInst>, Vec<AsmInst>) {
     let pe = compile_lir_to_windows_program(&lir).asm.insts;
 
     (
-        slice_between_markers(&elf).to_vec(),
-        slice_between_markers(&pe).to_vec(),
+        normalize_labels(slice_between_markers(&elf)),
+        normalize_labels(slice_between_markers(&pe)),
     )
 }
 
@@ -57,6 +59,44 @@ fn slice_between_markers(insts: &[AsmInst]) -> &[AsmInst] {
         .expect("backend dropped the end parity marker");
     assert!(begin_idx < end_idx, "begin marker must precede end marker");
     &insts[begin_idx + 1..end_idx]
+}
+
+/// Rewrite every `AsmLabel(_)` so the two backends' independently-allocated
+/// label spaces collapse to a canonical [0, N) indexing in encounter order.
+/// The structural sequence is preserved — only the underlying integers change.
+/// This isolates the parity comparison from each backend's internal label
+/// allocator (Linux decrements from `u32::MAX - 4`, Windows from `0xFFFE_FFFF`).
+fn normalize_labels(insts: &[AsmInst]) -> Vec<AsmInst> {
+    let mut remap: HashMap<u32, u32> = HashMap::new();
+    let mut next: u32 = 0;
+    let mut canon = |label: AsmLabel| -> AsmLabel {
+        let id = *remap.entry(label.0).or_insert_with(|| {
+            let id = next;
+            next += 1;
+            id
+        });
+        AsmLabel(id)
+    };
+
+    insts
+        .iter()
+        .map(|inst| match inst {
+            AsmInst::Label(l) => AsmInst::Label(canon(*l)),
+            AsmInst::Jmp(l) => AsmInst::Jmp(canon(*l)),
+            AsmInst::JmpShort(l) => AsmInst::JmpShort(canon(*l)),
+            AsmInst::Jz(l) => AsmInst::Jz(canon(*l)),
+            AsmInst::JzShort(l) => AsmInst::JzShort(canon(*l)),
+            AsmInst::Jnz(l) => AsmInst::Jnz(canon(*l)),
+            AsmInst::JnzShort(l) => AsmInst::JnzShort(canon(*l)),
+            AsmInst::Jb(l) => AsmInst::Jb(canon(*l)),
+            AsmInst::Jae(l) => AsmInst::Jae(canon(*l)),
+            AsmInst::Jl(l) => AsmInst::Jl(canon(*l)),
+            AsmInst::Call(l) => AsmInst::Call(canon(*l)),
+            AsmInst::CallMemLabel(l) => AsmInst::CallMemLabel(canon(*l)),
+            AsmInst::LeaRegLabel(reg, l) => AsmInst::LeaRegLabel(*reg, canon(*l)),
+            other => other.clone(),
+        })
+        .collect()
 }
 
 #[track_caller]
@@ -128,5 +168,43 @@ fn cell_set_at_disp8_parity() {
             LirInst::CellSetAt { off: 4, val: 42 },
             LirInst::CellSetAt { off: -3, val: 0 },
         ],
+    );
+}
+
+// ---- D2 SIMD: ScanWithHint must lower identically on both backends ----
+
+#[test]
+fn scan_with_hint_positive_parity() {
+    assert_parity(
+        "ScanWithHint(+1, 16)",
+        vec![LirInst::ScanWithHint {
+            dir: 1,
+            hint_bytes: 16,
+        }],
+    );
+}
+
+#[test]
+fn scan_with_hint_negative_parity() {
+    assert_parity(
+        "ScanWithHint(-1, 8)",
+        vec![LirInst::ScanWithHint {
+            dir: -1,
+            hint_bytes: 8,
+        }],
+    );
+}
+
+#[test]
+fn scan_with_hint_zero_hint_parity() {
+    // hint=0 must collapse to the slow_top body alone — both backends
+    // must agree on that minimal shape (including the same set of
+    // emit_ptr_add_out internals).
+    assert_parity(
+        "ScanWithHint(+1, 0)",
+        vec![LirInst::ScanWithHint {
+            dir: 1,
+            hint_bytes: 0,
+        }],
     );
 }

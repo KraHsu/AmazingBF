@@ -355,6 +355,12 @@ pub fn compile_lir_to_windows_program(lir: &LirProgram) -> WindowsProgram {
                 out.push(AsmInst::Label(loop_done));
                 verified_window = None;
             }
+            // ScanWithHint: D2 SIMD fast path uses `repne scasb` over the
+            // hint_bytes-sized verified window. Mirrors the Linux backend
+            // (`codegen.rs`) — see the comment there for the recovery
+            // story. Win64-specific note: the `Std` / `Cld` pair around
+            // `RepneScasb` exists precisely so DF=0 holds at the inner
+            // `call ensure_tape` site inside the slow_top fallthrough.
             LirInst::ScanWithHint { dir, hint_bytes } => {
                 let step = *dir;
                 debug_assert!(step == 1 || step == -1, "ScanWithHint step must be ±1");
@@ -362,25 +368,20 @@ pub fn compile_lir_to_windows_program(lir: &LirProgram) -> WindowsProgram {
                 let done = labels.fresh();
 
                 if *hint_bytes > 0 {
-                    let fast_top = labels.fresh();
-                    let limit_offset = i64::from(*hint_bytes) * (step as i64);
-                    let limit_offset = isize::try_from(limit_offset)
-                        .expect("ScanWithHint hint offset must fit in isize");
-
-                    out.push(AsmInst::MovRegReg(Reg64::R10, Reg64::R13));
-                    emit_add_reg_isize(&mut out, Reg64::R10, limit_offset);
-
-                    out.push(AsmInst::Label(fast_top));
-                    out.push(AsmInst::CmpMem8Imm8(Reg64::R13, 0));
-                    out.push(AsmInst::Jz(done));
-                    if step == 1 {
-                        out.push(AsmInst::CmpRegReg(Reg64::R13, Reg64::R10));
+                    out.push(AsmInst::MovRegImm64(Reg64::Rax, 0));
+                    out.push(AsmInst::MovRegReg(Reg64::Rdi, Reg64::R13));
+                    out.push(AsmInst::MovRegImm64(Reg64::Rcx, i64::from(*hint_bytes)));
+                    if step == -1 {
+                        out.push(AsmInst::Std);
                     } else {
-                        out.push(AsmInst::CmpRegReg(Reg64::R10, Reg64::R13));
+                        out.push(AsmInst::Cld);
                     }
-                    out.push(AsmInst::Jae(slow_top));
-                    out.push(AsmInst::AddRegImm32(Reg64::R13, step as i32));
-                    out.push(AsmInst::Jmp(fast_top));
+                    out.push(AsmInst::RepneScasb);
+                    if step == -1 {
+                        out.push(AsmInst::Cld);
+                    }
+                    out.push(AsmInst::MovRegReg(Reg64::R13, Reg64::Rdi));
+                    out.push(AsmInst::AddRegImm32(Reg64::R13, -(step as i32)));
                 }
 
                 out.push(AsmInst::Label(slow_top));
@@ -1146,51 +1147,47 @@ mod tests {
     }
 
     #[test]
-    fn windows_scan_with_hint_positive_dir_seeds_r10_and_uses_r13_vs_r10_compare() {
+    fn windows_scan_with_hint_positive_dir_uses_repne_scasb_with_cld() {
         let program = compile_lir_to_windows_program(&LirProgram {
             insts: vec![LirInst::ScanWithHint {
                 dir: 1,
                 hint_bytes: 5,
             }],
         });
-        let seeds_limit = program.asm.insts.windows(2).any(|w| {
+        let setup = program.asm.insts.windows(5).any(|w| {
             matches!(
                 w,
                 [
-                    AsmInst::MovRegReg(Reg64::R10, Reg64::R13),
-                    AsmInst::AddRegImm32(Reg64::R10, 5)
+                    AsmInst::MovRegImm64(Reg64::Rax, 0),
+                    AsmInst::MovRegReg(Reg64::Rdi, Reg64::R13),
+                    AsmInst::MovRegImm64(Reg64::Rcx, 5),
+                    AsmInst::Cld,
+                    AsmInst::RepneScasb,
                 ]
             )
         });
         assert!(
-            seeds_limit,
-            "Windows ScanWithHint(+1, 5) must seed r10 = r13 + 5"
-        );
-        assert!(
-            program
-                .asm
-                .insts
-                .iter()
-                .any(|i| matches!(i, AsmInst::CmpRegReg(Reg64::R13, Reg64::R10))),
-            "positive dir must use `cmp r13, r10` on Windows too"
+            setup,
+            "Windows ScanWithHint(+1, 5) must set up `al=0; rdi=r13; rcx=5; cld; repne scasb`"
         );
     }
 
     #[test]
-    fn windows_scan_with_hint_negative_dir_swaps_compare_operands() {
+    fn windows_scan_with_hint_negative_dir_brackets_scasb_with_std_cld() {
         let program = compile_lir_to_windows_program(&LirProgram {
             insts: vec![LirInst::ScanWithHint {
                 dir: -1,
                 hint_bytes: 4,
             }],
         });
+        let bracketed = program
+            .asm
+            .insts
+            .windows(3)
+            .any(|w| matches!(w, [AsmInst::Std, AsmInst::RepneScasb, AsmInst::Cld]));
         assert!(
-            program
-                .asm
-                .insts
-                .iter()
-                .any(|i| matches!(i, AsmInst::CmpRegReg(Reg64::R10, Reg64::R13))),
-            "Windows negative dir must swap compare operands to `cmp r10, r13`"
+            bracketed,
+            "Windows ScanWithHint(-1) must bracket scasb with `std` ... `cld` to keep DF=0 at the next call boundary"
         );
     }
 
@@ -1238,16 +1235,12 @@ mod tests {
                 .asm
                 .insts
                 .iter()
-                .any(|i| matches!(i, AsmInst::MovRegReg(Reg64::R10, Reg64::R13))),
-            "Windows hint=0 must not seed r10"
+                .any(|i| matches!(i, AsmInst::RepneScasb)),
+            "Windows hint=0 must not emit the SIMD `repne scasb` setup"
         );
         assert!(
-            !program.asm.insts.iter().any(|i| matches!(
-                i,
-                AsmInst::CmpRegReg(Reg64::R13, Reg64::R10)
-                    | AsmInst::CmpRegReg(Reg64::R10, Reg64::R13)
-            )),
-            "Windows hint=0 must not emit the fast-path boundary compare"
+            !program.asm.insts.iter().any(|i| matches!(i, AsmInst::Std)),
+            "Windows hint=0 must not flip the direction flag"
         );
     }
 

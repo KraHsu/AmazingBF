@@ -320,9 +320,29 @@ pub fn compile_lir_to_asm(lir: &LirProgram) -> AsmProgram {
                 verified_window = None;
             }
 
-            // ScanWithHint: fast unchecked body for `hint_bytes` iterations
-            // using a pre-computed boundary in R10, then fall through to the
-            // classic Scan loop (which handles bounds checks / tape growth).
+            // ScanWithHint: D2 SIMD fast path uses `repne scasb` over the
+            // hint_bytes-sized verified window, falling through to the
+            // classic bounds-checked Scan loop on rcx exhaustion.
+            //
+            // Setup:
+            //   rax = 0   (al is the comparand)
+            //   rdi = r13 (scan from current cell)
+            //   rcx = hint_bytes
+            //   DF  = (step == -1) so the hardware decrements rdi each iter
+            // Loop (one CPU instruction):
+            //   while rcx > 0 && [rdi] != al: rdi += step; rcx -= 1
+            // Recovery:
+            //   r13 = rdi - step  (back up: rdi went one past either the
+            //                      matching cell or the boundary cell)
+            // The classic slow_top body then re-checks [r13]: if it's zero
+            // (match case) it `jz done`; if non-zero (rcx-exhausted case)
+            // it walks one step with bounds check and continues. The
+            // "wasted" extra cmp on the match path is a rounding error
+            // versus the avoided per-iteration cmp/jae/add/jmp branches.
+            //
+            // DF restoration: when step == -1 we set DF=1 with `Std`; the
+            // Win64 + SysV ABIs both require DF=0 at function-call
+            // boundaries, so we re-emit `Cld` after the scasb.
             LirInst::ScanWithHint { dir, hint_bytes } => {
                 let step = *dir;
                 debug_assert!(step == 1 || step == -1, "ScanWithHint step must be ±1");
@@ -330,30 +350,24 @@ pub fn compile_lir_to_asm(lir: &LirProgram) -> AsmProgram {
                 let done = fresh_internal_label(&mut next_internal_label);
 
                 if *hint_bytes > 0 {
-                    let fast_top = fresh_internal_label(&mut next_internal_label);
-                    let limit_offset = i64::from(*hint_bytes) * (step as i64);
-                    let limit_offset = isize::try_from(limit_offset)
-                        .expect("ScanWithHint hint offset must fit in isize");
-
-                    // r10 = r13 + step * hint_bytes (boundary of the verified window).
-                    out.push(AsmInst::MovRegReg(Reg64::R10, Reg64::R13));
-                    emit_add_reg_isize(&mut out, Reg64::R10, limit_offset);
-
-                    out.push(AsmInst::Label(fast_top));
-                    out.push(AsmInst::CmpMem8Imm8(Reg64::R13, 0));
-                    out.push(AsmInst::Jz(done));
-                    // Direction picks operand order so Jae fires exactly when
-                    // the scan has reached the far end of the verified window.
-                    // dir = +1: bail when r13 >= r10 (Jae r13 vs r10).
-                    // dir = -1: bail when r13 <= r10 (Jae r10 vs r13).
-                    if step == 1 {
-                        out.push(AsmInst::CmpRegReg(Reg64::R13, Reg64::R10));
+                    out.push(AsmInst::MovRegImm64(Reg64::Rax, 0));
+                    out.push(AsmInst::MovRegReg(Reg64::Rdi, Reg64::R13));
+                    out.push(AsmInst::MovRegImm64(Reg64::Rcx, i64::from(*hint_bytes)));
+                    if step == -1 {
+                        out.push(AsmInst::Std);
                     } else {
-                        out.push(AsmInst::CmpRegReg(Reg64::R10, Reg64::R13));
+                        out.push(AsmInst::Cld);
                     }
-                    out.push(AsmInst::Jae(slow_top));
-                    out.push(AsmInst::AddRegImm32(Reg64::R13, step as i32));
-                    out.push(AsmInst::Jmp(fast_top));
+                    out.push(AsmInst::RepneScasb);
+                    if step == -1 {
+                        // Restore DF=0 before any function-call boundary
+                        // downstream (slow_top's emit_ptr_add_out -> Call).
+                        out.push(AsmInst::Cld);
+                    }
+                    out.push(AsmInst::MovRegReg(Reg64::R13, Reg64::Rdi));
+                    out.push(AsmInst::AddRegImm32(Reg64::R13, -(step as i32)));
+                    // Funnel into slow_top: it re-checks [r13] and exits
+                    // immediately on the match case.
                 }
 
                 // Classic bounds-checked scan body — exited once a zero cell
@@ -1594,11 +1608,13 @@ mod tests {
     }
 
     #[test]
-    fn scan_with_hint_positive_dir_sets_r10_limit_and_uses_r13_vs_r10_compare() {
-        // ScanWithHint(dir=+1, hint=5) must:
-        // 1. seed r10 = r13 + 5 (MovRegReg R10, R13 then AddRegImm32 R10, 5)
-        // 2. fast body compares r13 against r10 in that operand order, so Jae
-        //    fires exactly when r13 has reached the upper edge of the window.
+    fn scan_with_hint_positive_dir_sets_up_repne_scasb_forward() {
+        // ScanWithHint(dir=+1, hint=5) under D2 must:
+        //   1. zero al (the comparand) and load rdi=r13, rcx=5
+        //   2. clear DF (forward direction) before the scan
+        //   3. emit `repne scasb` (the SIMD loop)
+        //   4. recover r13 = rdi - step (= rdi - 1 here) and funnel into
+        //      the slow_top fallthrough.
         let asm = compile_lir_to_asm(&LirProgram {
             insts: vec![LirInst::ScanWithHint {
                 dir: 1,
@@ -1606,43 +1622,55 @@ mod tests {
             }],
         });
 
-        let seeds_limit = asm.insts.windows(2).any(|w| {
+        let setup = asm.insts.windows(5).any(|w| {
             matches!(
                 w,
                 [
-                    AsmInst::MovRegReg(Reg64::R10, Reg64::R13),
-                    AsmInst::AddRegImm32(Reg64::R10, 5)
+                    AsmInst::MovRegImm64(Reg64::Rax, 0),
+                    AsmInst::MovRegReg(Reg64::Rdi, Reg64::R13),
+                    AsmInst::MovRegImm64(Reg64::Rcx, 5),
+                    AsmInst::Cld,
+                    AsmInst::RepneScasb,
                 ]
             )
         });
         assert!(
-            seeds_limit,
-            "ScanWithHint(+1, 5) must seed r10 = r13 + 5 in the fast path"
+            setup,
+            "ScanWithHint(+1, 5) must set up `al=0; rdi=r13; rcx=5; cld; repne scasb`"
         );
 
-        let uses_r13_r10 = asm
-            .insts
-            .iter()
-            .any(|i| matches!(i, AsmInst::CmpRegReg(Reg64::R13, Reg64::R10)));
-        let uses_r10_r13 = asm
-            .insts
-            .iter()
-            .any(|i| matches!(i, AsmInst::CmpRegReg(Reg64::R10, Reg64::R13)));
+        let recovers = asm.insts.windows(2).any(|w| {
+            matches!(
+                w,
+                [
+                    AsmInst::MovRegReg(Reg64::R13, Reg64::Rdi),
+                    AsmInst::AddRegImm32(Reg64::R13, -1),
+                ]
+            )
+        });
         assert!(
-            uses_r13_r10,
-            "positive dir must use `cmp r13, r10` so Jae fires at the high edge"
+            recovers,
+            "after scasb, r13 must be set to rdi - 1 (back up the post-incremented rdi)"
         );
+
+        // No leftover R10 boundary compare from the legacy fast path
+        // (slow_top's bounds check still uses R15 / Jae against R12/R14;
+        // those are not the boundary compare we're checking for here).
         assert!(
-            !uses_r10_r13,
-            "positive dir must not use the reversed `cmp r10, r13` operand order"
+            !asm.insts.iter().any(|i| matches!(
+                i,
+                AsmInst::CmpRegReg(Reg64::R13, Reg64::R10)
+                    | AsmInst::CmpRegReg(Reg64::R10, Reg64::R13)
+            )),
+            "ScanWithHint must no longer reference the legacy R10 boundary compare"
         );
     }
 
     #[test]
-    fn scan_with_hint_negative_dir_swaps_compare_operands() {
-        // dir=-1 means "bail when r13 <= r10"; without a Jbe instruction we
-        // swap the operands and keep Jae, so the emitted compare must be
-        // `cmp r10, r13` (and the limit decrements r13).
+    fn scan_with_hint_negative_dir_uses_std_then_restores_cld() {
+        // dir=-1 needs DF=1 during the scan and DF=0 restored before any
+        // function-call boundary in the slow_top fallthrough. r13 is
+        // recovered as rdi - step = rdi + 1.
         let asm = compile_lir_to_asm(&LirProgram {
             insts: vec![LirInst::ScanWithHint {
                 dir: -1,
@@ -1650,34 +1678,31 @@ mod tests {
             }],
         });
 
-        let seeds_limit = asm.insts.windows(2).any(|w| {
+        let std_then_scasb_then_cld = asm
+            .insts
+            .windows(3)
+            .any(|w| matches!(w, [AsmInst::Std, AsmInst::RepneScasb, AsmInst::Cld]));
+        assert!(
+            std_then_scasb_then_cld,
+            "ScanWithHint(-1) must bracket scasb with `std` ... `cld` to honour the SysV/Win64 ABI"
+        );
+
+        let recovers = asm.insts.windows(2).any(|w| {
             matches!(
                 w,
                 [
-                    AsmInst::MovRegReg(Reg64::R10, Reg64::R13),
-                    AsmInst::AddRegImm32(Reg64::R10, -4)
+                    AsmInst::MovRegReg(Reg64::R13, Reg64::Rdi),
+                    AsmInst::AddRegImm32(Reg64::R13, 1),
                 ]
             )
         });
-        assert!(
-            seeds_limit,
-            "ScanWithHint(-1, 4) must seed r10 = r13 - 4 in the fast path"
-        );
-
-        let uses_r10_r13 = asm
-            .insts
-            .iter()
-            .any(|i| matches!(i, AsmInst::CmpRegReg(Reg64::R10, Reg64::R13)));
-        assert!(
-            uses_r10_r13,
-            "negative dir must swap operand order to `cmp r10, r13`"
-        );
+        assert!(recovers, "after backward scasb, r13 must be set to rdi + 1");
     }
 
     #[test]
     fn scan_with_hint_zero_hint_emits_only_slow_body() {
-        // hint_bytes == 0: no r10 seed, no fast loop; we only emit the slow
-        // body (`cmp [r13], 0; jz done; ptr_add; jmp slow_top`).
+        // hint_bytes == 0: no SIMD setup; we only emit the slow body
+        // (`cmp [r13], 0; jz done; ptr_add; jmp slow_top`).
         let asm = compile_lir_to_asm(&LirProgram {
             insts: vec![LirInst::ScanWithHint {
                 dir: 1,
@@ -1685,18 +1710,12 @@ mod tests {
             }],
         });
         assert!(
-            !asm.insts
-                .iter()
-                .any(|i| matches!(i, AsmInst::MovRegReg(Reg64::R10, Reg64::R13))),
-            "hint=0 must not emit the r10 limit seed"
+            !asm.insts.iter().any(|i| matches!(i, AsmInst::RepneScasb)),
+            "hint=0 must not emit the SIMD `repne scasb` setup"
         );
         assert!(
-            !asm.insts.iter().any(|i| matches!(
-                i,
-                AsmInst::CmpRegReg(Reg64::R13, Reg64::R10)
-                    | AsmInst::CmpRegReg(Reg64::R10, Reg64::R13)
-            )),
-            "hint=0 must not emit the fast-path boundary compare"
+            !asm.insts.iter().any(|i| matches!(i, AsmInst::Std)),
+            "hint=0 must not flip the direction flag"
         );
     }
 
@@ -1797,7 +1816,7 @@ mod tests {
     fn ptr_add_checked_then_scan_lowers_to_scan_with_hint_via_pipeline() {
         // End-to-end: a PtrAddChecked that verifies [-2, 3] followed by Scan(+1)
         // must go through `promote_scan_hints` and reach codegen as
-        // ScanWithHint(+1, 3), which we detect via the r10 seed sequence.
+        // ScanWithHint(+1, 3), which D2 lowers to a `repne scasb` with rcx=3.
         use crate::ir::lir_scan_hint::promote_scan_hints;
 
         let lir = promote_scan_hints(LirProgram {
@@ -1812,18 +1831,19 @@ mod tests {
         });
         let asm = compile_lir_to_asm(&lir);
 
-        let seeds_limit = asm.insts.windows(2).any(|w| {
+        let seeds_rcx_with_hint = asm.insts.windows(3).any(|w| {
             matches!(
                 w,
                 [
-                    AsmInst::MovRegReg(Reg64::R10, Reg64::R13),
-                    AsmInst::AddRegImm32(Reg64::R10, 3)
+                    AsmInst::MovRegImm64(Reg64::Rcx, 3),
+                    AsmInst::Cld,
+                    AsmInst::RepneScasb,
                 ]
             )
         });
         assert!(
-            seeds_limit,
-            "pipeline must promote Scan(+1) after PtrAddChecked([-2, 3]) to a ScanWithHint with hint=3"
+            seeds_rcx_with_hint,
+            "pipeline must promote Scan(+1) after PtrAddChecked([-2, 3]) to a `rcx=3; cld; repne scasb` SIMD scan"
         );
     }
 }

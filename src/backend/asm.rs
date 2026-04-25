@@ -386,6 +386,21 @@ pub enum AsmInst {
     /// to move old contents into the new buffer.
     RepMovsb,
 
+    /// `std` — set the direction flag (DF=1).
+    ///
+    /// Used by `Scan(-1)` lowering so the following `repne scasb` walks
+    /// backwards. Must be paired with a `Cld` before any function-boundary
+    /// `call` / `ret` (Win64 + SysV both require DF=0 at boundaries).
+    Std,
+
+    /// `repne scasb` — repeat-not-equal byte scan.
+    ///
+    /// While `rcx > 0`, compares `al` against `[rdi]` and post-{inc,dec}rements
+    /// `rdi` (sign of step set by DF: forward when `Cld`, backward when `Std`).
+    /// Stops on the first match (ZF=1) or when `rcx` underflows. The D2 SIMD
+    /// fast path for `[<]` / `[>]` searches the tape for `al = 0`.
+    RepneScasb,
+
     /// `syscall` — raise a Linux x86_64 system call.
     ///
     /// Calling convention:
