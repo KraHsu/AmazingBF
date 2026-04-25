@@ -195,6 +195,43 @@ fn scan_with_hint_negative_parity() {
     );
 }
 
+// ---- D2 SIMD: ZeroRun ----
+
+#[test]
+fn zero_run_small_count_parity() {
+    // Below the SIMD threshold: scalar store form.
+    assert_parity(
+        "ZeroRun(start=0, count=4)",
+        vec![LirInst::ZeroRun { start: 0, count: 4 }],
+    );
+    assert_parity(
+        "ZeroRun(start=-2, count=8)",
+        vec![LirInst::ZeroRun {
+            start: -2,
+            count: 8,
+        }],
+    );
+}
+
+#[test]
+fn zero_run_large_count_parity() {
+    // At/above the threshold: rep stosb form.
+    assert_parity(
+        "ZeroRun(start=0, count=16)",
+        vec![LirInst::ZeroRun {
+            start: 0,
+            count: 16,
+        }],
+    );
+    assert_parity(
+        "ZeroRun(start=-3, count=64)",
+        vec![LirInst::ZeroRun {
+            start: -3,
+            count: 64,
+        }],
+    );
+}
+
 #[test]
 fn scan_with_hint_zero_hint_parity() {
     // hint=0 must collapse to the slow_top body alone — both backends

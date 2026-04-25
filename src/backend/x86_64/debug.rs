@@ -482,6 +482,26 @@ fn format_inst_asm(out: &mut String, inst: &AsmInst) {
             .unwrap();
         }
 
+        AsmInst::XorEaxEax => {
+            writeln!(
+                out,
+                "    xor eax, eax                ; rax = 0 (2-byte form)"
+            )
+            .unwrap();
+        }
+
+        AsmInst::MovEcxImm32(imm) => {
+            writeln!(out, "    mov ecx, {imm}").unwrap();
+        }
+
+        AsmInst::RepStosb => {
+            writeln!(
+                out,
+                "    rep stosb                   ; while rcx>0: store al into [rdi]"
+            )
+            .unwrap();
+        }
+
         // System call.
         AsmInst::Syscall => {
             writeln!(out, "    syscall").unwrap();

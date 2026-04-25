@@ -445,19 +445,30 @@ pub fn compile_lir_to_asm(lir: &LirProgram) -> AsmProgram {
             }
 
             // ZeroRun { start, count }: zero `count` contiguous bytes at
-            // [r13 + start, r13 + start + count). For now we just peel the run
-            // into individual byte stores; D2 will swap this for `rep stosb`
-            // once the LEA / RCX setup is worth it. The verified window is not
-            // touched (r13 is unchanged).
+            // [r13 + start, r13 + start + count). For runs of at least 16
+            // bytes the D2 SIMD form `rep stosb` is shorter and faster than
+            // a peeled tail of disp8/disp32 stores; below that threshold we
+            // stick with the per-byte stores (each disp8 store is 5 bytes,
+            // so the crossover is exactly at 16). The verified window
+            // survives — r13 is unchanged in both forms (we use rdi as the
+            // SIMD destination).
             LirInst::ZeroRun { start, count } => {
                 debug_assert!(*count >= 2, "ZeroRun should hold at least two bytes");
-                for i in 0..*count {
-                    let off = isize::try_from(i64::from(*start) + i64::from(i))
-                        .expect("ZeroRun offset must fit in isize");
-                    if off == 0 {
-                        out.push(AsmInst::MovMem8Imm8(Reg64::R13, 0));
-                    } else {
-                        out.push(mem8_set_at_r13(off, 0));
+                if *count >= 16 {
+                    out.push(AsmInst::XorEaxEax);
+                    out.push(AsmInst::LeaRegMem(Reg64::Rdi, Reg64::R13, *start));
+                    out.push(AsmInst::MovEcxImm32(*count as i32));
+                    out.push(AsmInst::Cld);
+                    out.push(AsmInst::RepStosb);
+                } else {
+                    for i in 0..*count {
+                        let off = isize::try_from(i64::from(*start) + i64::from(i))
+                            .expect("ZeroRun offset must fit in isize");
+                        if off == 0 {
+                            out.push(AsmInst::MovMem8Imm8(Reg64::R13, 0));
+                        } else {
+                            out.push(mem8_set_at_r13(off, 0));
+                        }
                     }
                 }
             }
@@ -1716,6 +1727,53 @@ mod tests {
         assert!(
             !asm.insts.iter().any(|i| matches!(i, AsmInst::Std)),
             "hint=0 must not flip the direction flag"
+        );
+    }
+
+    #[test]
+    fn zero_run_count_at_least_16_uses_rep_stosb() {
+        // count=16 hits the D2 SIMD threshold: emit
+        // `xor eax, eax; lea rdi,[r13+start]; mov ecx, count; cld; rep stosb`.
+        let asm = compile_lir_to_asm(&LirProgram {
+            insts: vec![LirInst::ZeroRun {
+                start: 0,
+                count: 16,
+            }],
+        });
+        let simd = asm.insts.windows(5).any(|w| {
+            matches!(
+                w,
+                [
+                    AsmInst::XorEaxEax,
+                    AsmInst::LeaRegMem(Reg64::Rdi, Reg64::R13, 0),
+                    AsmInst::MovEcxImm32(16),
+                    AsmInst::Cld,
+                    AsmInst::RepStosb,
+                ]
+            )
+        });
+        assert!(
+            simd,
+            "ZeroRun with count >= 16 must lower to the rep stosb SIMD form"
+        );
+        assert!(
+            !asm.insts
+                .iter()
+                .any(|i| matches!(i, AsmInst::MovMem8ImmDisp8(_, _, _))),
+            "SIMD ZeroRun must not emit per-byte disp8 stores for the same range"
+        );
+    }
+
+    #[test]
+    fn zero_run_count_below_threshold_keeps_scalar_stores() {
+        // count=8 stays below the 16-byte threshold, so the scalar peeled
+        // form is preferred (no rep stosb / xor eax, eax).
+        let asm = compile_lir_to_asm(&LirProgram {
+            insts: vec![LirInst::ZeroRun { start: 0, count: 8 }],
+        });
+        assert!(
+            !asm.insts.iter().any(|i| matches!(i, AsmInst::RepStosb)),
+            "ZeroRun(count=8) must stay on the scalar store path"
         );
     }
 

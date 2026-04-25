@@ -429,15 +429,27 @@ pub fn compile_lir_to_windows_program(lir: &LirProgram) -> WindowsProgram {
                 );
                 out.push(mem8_set_at_r13(*off, *val));
             }
+            // ZeroRun: identical lowering to the Linux backend
+            // (`codegen.rs`). `rep stosb` is ABI-neutral — its only register
+            // dependencies are al/rdi/rcx, all caller-saved on both SysV and
+            // Win64 — so the threshold and instruction sequence match.
             LirInst::ZeroRun { start, count } => {
                 debug_assert!(*count >= 2, "ZeroRun should hold at least two bytes");
-                for i in 0..*count {
-                    let off = isize::try_from(i64::from(*start) + i64::from(i))
-                        .expect("ZeroRun offset must fit in isize");
-                    if off == 0 {
-                        out.push(AsmInst::MovMem8Imm8(Reg64::R13, 0));
-                    } else {
-                        out.push(mem8_set_at_r13(off, 0));
+                if *count >= 16 {
+                    out.push(AsmInst::XorEaxEax);
+                    out.push(AsmInst::LeaRegMem(Reg64::Rdi, Reg64::R13, *start));
+                    out.push(AsmInst::MovEcxImm32(*count as i32));
+                    out.push(AsmInst::Cld);
+                    out.push(AsmInst::RepStosb);
+                } else {
+                    for i in 0..*count {
+                        let off = isize::try_from(i64::from(*start) + i64::from(i))
+                            .expect("ZeroRun offset must fit in isize");
+                        if off == 0 {
+                            out.push(AsmInst::MovMem8Imm8(Reg64::R13, 0));
+                        } else {
+                            out.push(mem8_set_at_r13(off, 0));
+                        }
                     }
                 }
             }
@@ -1188,6 +1200,32 @@ mod tests {
         assert!(
             bracketed,
             "Windows ScanWithHint(-1) must bracket scasb with `std` ... `cld` to keep DF=0 at the next call boundary"
+        );
+    }
+
+    #[test]
+    fn windows_zero_run_count_at_least_16_uses_rep_stosb() {
+        let program = compile_lir_to_windows_program(&LirProgram {
+            insts: vec![LirInst::ZeroRun {
+                start: -2,
+                count: 32,
+            }],
+        });
+        let simd = program.asm.insts.windows(5).any(|w| {
+            matches!(
+                w,
+                [
+                    AsmInst::XorEaxEax,
+                    AsmInst::LeaRegMem(Reg64::Rdi, Reg64::R13, -2),
+                    AsmInst::MovEcxImm32(32),
+                    AsmInst::Cld,
+                    AsmInst::RepStosb,
+                ]
+            )
+        });
+        assert!(
+            simd,
+            "Windows ZeroRun(count >= 16) must lower to rep stosb identically to Linux"
         );
     }
 

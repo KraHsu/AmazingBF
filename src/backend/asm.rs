@@ -401,6 +401,27 @@ pub enum AsmInst {
     /// fast path for `[<]` / `[>]` searches the tape for `al = 0`.
     RepneScasb,
 
+    /// `xor eax, eax` — zero RAX (the upper 32 bits are also cleared).
+    ///
+    /// 2 bytes; replaces the 10-byte `mov rax, 0` when only the value 0 is
+    /// needed. Used by D2's `rep stosb` setup (the comparand byte is `al`)
+    /// and `repne scasb` setup.
+    XorEaxEax,
+
+    /// `mov ecx, imm32` — load a 32-bit immediate into ECX (zero-extended into RCX).
+    ///
+    /// 5 bytes (`B9 + imm32`). Distinct from `MovRegImm64` so the encoder can
+    /// pick the shorter form when `rcx` only needs a 32-bit count (e.g. D2's
+    /// `rep stosb` over a `ZeroRun`).
+    MovEcxImm32(i32),
+
+    /// `rep stosb` — repeat byte store.
+    ///
+    /// While `rcx > 0`, stores `al` into `[rdi]` and post-{inc,dec}rements
+    /// `rdi` (DF). The D2 SIMD path uses it to zero a `ZeroRun(count >= 16)`
+    /// in a single hardware-driven loop.
+    RepStosb,
+
     /// `syscall` — raise a Linux x86_64 system call.
     ///
     /// Calling convention:

@@ -785,6 +785,26 @@ fn encode_inst(buf: &mut CodeBuffer, inst: &AsmInst) {
             buf.emit_u8(0xAE);
         }
 
+        // xor eax, eax: 0x31 0xC0 — zero RAX (upper 32 bits also cleared).
+        AsmInst::XorEaxEax => {
+            buf.emit_u8(0x31);
+            buf.emit_u8(0xC0);
+        }
+
+        // mov ecx, imm32: 0xB9 + imm32 (5 bytes; upper 32 bits of RCX cleared).
+        AsmInst::MovEcxImm32(imm) => {
+            buf.emit_u8(0xB9);
+            buf.emit_i32(*imm);
+        }
+
+        // rep stosb: 0xF3 (REP prefix) + 0xAA (STOSB).
+        // Stores al into [rdi], post-{inc,dec}rements rdi (DF), decrements rcx;
+        // continues until rcx == 0.
+        AsmInst::RepStosb => {
+            buf.emit_u8(0xF3);
+            buf.emit_u8(0xAA);
+        }
+
         // syscall: 0x0F 0x05.
         AsmInst::Syscall => {
             buf.emit_u8(0x0F);
@@ -1132,6 +1152,37 @@ mod tests {
         };
         let encoded = encode_program(&program);
         assert_eq!(encoded.text, vec![0xF2, 0xAE]);
+    }
+
+    #[test]
+    fn xor_eax_eax_encodes_to_two_bytes_31_c0() {
+        // xor eax, eax — 2-byte form replacing the 10-byte `mov rax, 0`.
+        let program = AsmProgram {
+            insts: vec![AsmInst::XorEaxEax],
+        };
+        let encoded = encode_program(&program);
+        assert_eq!(encoded.text, vec![0x31, 0xC0]);
+    }
+
+    #[test]
+    fn mov_ecx_imm32_encodes_with_imm_little_endian() {
+        // mov ecx, 0x12345678 — 0xB9 + LE imm32. Upper 32 bits of RCX
+        // are zeroed by the implicit zero-extension.
+        let program = AsmProgram {
+            insts: vec![AsmInst::MovEcxImm32(0x12345678)],
+        };
+        let encoded = encode_program(&program);
+        assert_eq!(encoded.text, vec![0xB9, 0x78, 0x56, 0x34, 0x12]);
+    }
+
+    #[test]
+    fn rep_stosb_encodes_to_f3_aa() {
+        // rep stosb — REP prefix 0xF3, then STOSB opcode 0xAA.
+        let program = AsmProgram {
+            insts: vec![AsmInst::RepStosb],
+        };
+        let encoded = encode_program(&program);
+        assert_eq!(encoded.text, vec![0xF3, 0xAA]);
     }
 
     #[test]
