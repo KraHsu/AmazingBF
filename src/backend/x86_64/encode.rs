@@ -848,6 +848,26 @@ fn encode_inst(buf: &mut CodeBuffer, inst: &AsmInst) {
             buf.emit_u8(0x00);
         }
 
+        // add byte [r13+0], bl
+        //   REX.B (0x41) + 0x00 + ModRM(mod=01, reg=bl=3, rm=r13 low3=5) + disp8(0)
+        //   = 41 00 5D 00
+        AsmInst::AddMemR13Bl => {
+            buf.emit_u8(0x41);
+            buf.emit_u8(0x00);
+            buf.emit_u8(0x5D);
+            buf.emit_u8(0x00);
+        }
+
+        // sub byte [r13+0], bl
+        //   REX.B (0x41) + 0x28 + ModRM(mod=01, reg=bl=3, rm=r13 low3=5) + disp8(0)
+        //   = 41 28 5D 00
+        AsmInst::SubMemR13Bl => {
+            buf.emit_u8(0x41);
+            buf.emit_u8(0x28);
+            buf.emit_u8(0x5D);
+            buf.emit_u8(0x00);
+        }
+
         // mov al, byte [r13+0]
         //   REX.B (0x41) + 0x8A + ModRM(mod=01, reg=al=0, rm=r13 low3=5) + disp8(0)
         //   = 41 8A 45 00
@@ -1173,6 +1193,28 @@ mod tests {
         };
         let encoded = encode_program(&program);
         assert_eq!(encoded.text, vec![0xB9, 0x78, 0x56, 0x34, 0x12]);
+    }
+
+    #[test]
+    fn add_mem_r13_bl_encodes_to_41_00_5d_00() {
+        // add byte [r13+0], bl — REX.B + 0x00 (add r/m8, r8) +
+        // ModRM(mod=01, reg=bl=3, rm=r13_low3=5) + disp8(0).
+        let program = AsmProgram {
+            insts: vec![AsmInst::AddMemR13Bl],
+        };
+        let encoded = encode_program(&program);
+        assert_eq!(encoded.text, vec![0x41, 0x00, 0x5D, 0x00]);
+    }
+
+    #[test]
+    fn sub_mem_r13_bl_encodes_to_41_28_5d_00() {
+        // sub byte [r13+0], bl — REX.B + 0x28 (sub r/m8, r8) +
+        // ModRM(mod=01, reg=bl=3, rm=r13_low3=5) + disp8(0).
+        let program = AsmProgram {
+            insts: vec![AsmInst::SubMemR13Bl],
+        };
+        let encoded = encode_program(&program);
+        assert_eq!(encoded.text, vec![0x41, 0x28, 0x5D, 0x00]);
     }
 
     #[test]

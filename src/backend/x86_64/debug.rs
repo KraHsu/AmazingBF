@@ -534,6 +534,12 @@ fn format_inst_asm(out: &mut String, inst: &AsmInst) {
         AsmInst::AddMemR13Al => {
             writeln!(out, "    add     byte [r13], al").unwrap();
         }
+        AsmInst::AddMemR13Bl => {
+            writeln!(out, "    add     byte [r13], bl").unwrap();
+        }
+        AsmInst::SubMemR13Bl => {
+            writeln!(out, "    sub     byte [r13], bl").unwrap();
+        }
         AsmInst::MovAlMemR13 => {
             writeln!(out, "    mov     al, byte [r13]").unwrap();
         }

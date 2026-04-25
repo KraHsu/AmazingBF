@@ -335,9 +335,17 @@ pub fn compile_lir_to_windows_program(lir: &LirProgram) -> WindowsProgram {
                 out.push(AsmInst::MovMem8Imm8(Reg64::R13, 0));
                 for (off, factor) in factors {
                     emit_ptr_add_out(&mut out, &mut labels, *off, ensure_tape_label);
-                    out.push(AsmInst::MovEaxEbx);
-                    out.push(AsmInst::ImulEaxEbxImm32(*factor));
-                    out.push(AsmInst::AddMemR13Al);
+                    let f_mod = ((factor % 256) + 256) % 256;
+                    match f_mod {
+                        0 => {}
+                        1 => out.push(AsmInst::AddMemR13Bl),
+                        255 => out.push(AsmInst::SubMemR13Bl),
+                        _ => {
+                            out.push(AsmInst::MovEaxEbx);
+                            out.push(AsmInst::ImulEaxEbxImm32(*factor));
+                            out.push(AsmInst::AddMemR13Al);
+                        }
+                    }
                     emit_ptr_add_out(&mut out, &mut labels, -*off, ensure_tape_label);
                 }
                 out.push(AsmInst::AddRegImm32(Reg64::Rsp, 8));
@@ -1200,6 +1208,36 @@ mod tests {
         assert!(
             bracketed,
             "Windows ScanWithHint(-1) must bracket scasb with `std` ... `cld` to keep DF=0 at the next call boundary"
+        );
+    }
+
+    #[test]
+    fn windows_linear_mul_factor_one_uses_add_mem_r13_bl() {
+        let program = compile_lir_to_windows_program(&LirProgram {
+            insts: vec![LirInst::LinearMul(vec![(2, 1)])],
+        });
+        assert!(
+            program.asm.insts.contains(&AsmInst::AddMemR13Bl),
+            "Windows LinearMul factor=1 must emit AddMemR13Bl"
+        );
+        assert!(
+            !program
+                .asm
+                .insts
+                .iter()
+                .any(|i| matches!(i, AsmInst::ImulEaxEbxImm32(_))),
+            "Windows LinearMul factor=1 must skip imul on the ±1 column"
+        );
+    }
+
+    #[test]
+    fn windows_linear_mul_factor_minus_one_uses_sub_mem_r13_bl() {
+        let program = compile_lir_to_windows_program(&LirProgram {
+            insts: vec![LirInst::LinearMul(vec![(3, -1)])],
+        });
+        assert!(
+            program.asm.insts.contains(&AsmInst::SubMemR13Bl),
+            "Windows LinearMul factor=-1 must emit SubMemR13Bl"
         );
     }
 

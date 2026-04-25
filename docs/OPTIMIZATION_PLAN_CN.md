@@ -91,7 +91,7 @@
 - **D2 SIMD 专用形式**：
   - **D2a `ScanWithHint(±1, hint_bytes)` → `repne scasb`** · **[已实现，双端对称]**：C4 升格而来的 `ScanWithHint` 在 hint > 0 的快路径上发 `xor eax, eax / mov rdi, r13 / mov rcx, hint_bytes / [cld 或 std] / repne scasb / [反向时再 cld 恢复 DF=0]`，再 `mov r13, rdi; add r13, -step` 把多走的一格回退；之后无条件 fall through 到既有的 slow_top（`cmp [r13], 0; jz done; ptr_add(step); jmp slow_top`）。命中时 slow_top 第一条 cmp 即触发 `jz done`；rcx 用尽时 r13 落在 hint 区间内最后一格（已 bounds-checked），slow_top 自然继续向边界外做 ptr_add 时由 `emit_ptr_add_out` 兜底。`AsmInst::{Std, RepneScasb}` 在共享编码层加（`asm.rs`、`encode.rs` 含字节级单测、`debug.rs`），Linux/Windows codegen 改造完全对称——单条裸 `Scan(dir)`（无 hint）保留原慢路径以避免无界 rcx 触发越界读。
   - **D2b `ZeroRun(count ≥ 16)` → `rep stosb`** · **[已实现，双端对称]**：单条 `MovMem8ImmDisp8` 长 5 字节，标量 N 次 = 5N 字节；SIMD setup（`xor eax, eax` 2B + `lea rdi, [r13+start]` 4-7B + `mov ecx, count` 5B + `cld` 1B + `rep stosb` 2B）≈ 14-17 字节，与 N 无关——交叉点 `count == 16`。`AsmInst::{XorEaxEax, MovEcxImm32, RepStosb}` 在共享编码层加（字节级单测齐全：`31 C0` / `B9 + LE imm32` / `F3 AA`），双后端 `LirInst::ZeroRun` 分支按同一阈值切换；`r13` 在两条路径上都不变（SIMD 走 `rdi`），verified_window 不清。Win64 ABI 无影响——`rep stosb` 仅 clobber 易失寄存器 al/rdi/rcx。
-  - **D2c `LinearMul` 因子为 ±1 的列** → `add/sub byte [r13], bl` 直接下降，跳过 imul。
+  - **D2c `LinearMul` 因子为 ±1 的列** · **[已实现，双端对称]**：`bl` 已通过 `MovzxEbxFromMemR13` 持有头格 8 位值；factor=1 直接发 `AddMemR13Bl`（`41 00 5D 00`），factor=-1（mod 256 = 255）直接发 `SubMemR13Bl`（`41 28 5D 00`）——8 位 wrap 让 `cell + 255*bl ≡ cell - bl`，所以 -1 列同样跳过 imul。两条新 `AsmInst` 在共享编码层加（字节级单测齐全）；其它 factor 仍走 `MovEaxEbx; ImulEaxEbxImm32; AddMemR13Al`。每个 ±1 列省掉 8 字节（`mov eax,ebx` + `imul eax,ebx,imm32`），常见的 `[->+<]` / `[->-<]` 程序累计收益可观。**注**：LinearMul body 在 Win64 上比 Linux 多一对 `AddRegImm32(Rsp, ±8)` 是 P2-d 引入的合理 ABI 差异，不属本变更；列级 ±1 fast path 本身仍 byte-equal，由两个后端各自的 `add/sub_mem_r13_bl_*` 单测把关。
 - **D3 Buffered I/O** · **[已实现]**：
   - **解释器侧**：`src/runtime/io.rs::BufferedStdIo` 以 4 KiB `BufWriter<Stdout>` + `BufReader<Stdin>` 包住进程 stdio；`RuntimeIo` trait 新增默认 `flush()` 方法（no-op），`BufferedStdIo::flush` 通过 `BufWriter::flush` 把延迟 flush 错误经 `IoError::WriteError → RuntimeError::Io` 上抛，避免 `Drop` 中吞错。`Interpreter::run()` 尾部显式调用 `io.flush()?`，按 "exec 错误优先，成功后才报告 flush 错误" 排序。CLI `run_interpret` 默认构造 `BufferedStdIo::new()`。
   - **Linux 后端侧**：`src/backend/codegen.rs` 新增 `emit_init_output_buffer`（`mmap` 4 KiB 匿名区，`Rbx = buffer_base = 写指针`，`Rbp = buffer_base + 4096 = 结束哨兵`）与 `emit_flush_output`（helper 子程序，`lea rsi, [rbp - 4096]` 恢复 base，发 `write(1, base, rbx - base)` 后重置 `rbx`）。`PutByte` 从 5 指令 inline syscall（~42 字节）改为 `mov al, [r13]; mov [rbx], al; add rbx, 1; cmp rbx, rbp; jne skip; call flush_output; skip:`（~20 字节热路径、1/4096 触发 syscall）。`GetByte` 前 `call flush_output` 以便交互式提示在 `,` 可能阻塞前可见；`exit(0)` 前同样 flush。新 `AsmInst::{MovAlMemR13, MovMemRbxAl}` 变体 + 编码与 3 条编码单测；`Reg64::Rbp` 首次被本后端使用，加入 reg_num / Display 表。
@@ -149,7 +149,7 @@ C1 (LIR peephole) ✓、D1 (指令选择) ✓、
 D3 (buffered I/O — 解释器 ✓ / Linux 后端 ✓ / Windows 后端 ✓)、
 E1 / E2 (superinstruction + threaded dispatch) ✓、
 E3 (interp LinearMul ±1 快路径) ✓、E4 (tape 倍增) ✓ 均可并行启动。
-已落地：E5、C1、D1、E4、Phase A (A1–A4)、B1、B2、B3、B4、B6、C2、C3、C4、E1、E2、E3、D3 (解释器 + Linux 后端 + Windows 后端)、D5 (分支提示；对齐暂缓)。
+已落地：E5、C1、D1、E4、Phase A (A1–A4)、B1、B2、B3、B4、B6、C2、C3、C4、E1、E2、E3、D2 (a/b/c 三项双端对称)、D3 (解释器 + Linux 后端 + Windows 后端)、D5 (分支提示；对齐暂缓)。
 
 Phase F 全部不在近期依赖图内。
 ```

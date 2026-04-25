@@ -296,9 +296,20 @@ pub fn compile_lir_to_asm(lir: &LirProgram) -> AsmProgram {
                 out.push(AsmInst::MovMem8Imm8(Reg64::R13, 0));
                 for (off, f) in factors {
                     emit_ptr_add_out(&mut out, &mut next_internal_label, *off, ensure_tape_label);
-                    out.push(AsmInst::MovEaxEbx);
-                    out.push(AsmInst::ImulEaxEbxImm32(*f));
-                    out.push(AsmInst::AddMemR13Al);
+                    // D2c: ±1 columns skip the imul. bl already holds the
+                    // head value (8-bit semantics make `cell + 255*bl` ≡
+                    // `cell - bl`, so factor==-1 routes to SubMemR13Bl).
+                    let f_mod = ((f % 256) + 256) % 256;
+                    match f_mod {
+                        0 => {} // earlier passes should drop factor-zero columns
+                        1 => out.push(AsmInst::AddMemR13Bl),
+                        255 => out.push(AsmInst::SubMemR13Bl),
+                        _ => {
+                            out.push(AsmInst::MovEaxEbx);
+                            out.push(AsmInst::ImulEaxEbxImm32(*f));
+                            out.push(AsmInst::AddMemR13Al);
+                        }
+                    }
                     emit_ptr_add_out(&mut out, &mut next_internal_label, -*off, ensure_tape_label);
                 }
                 out.push(AsmInst::Pop(Reg64::Rbx));
@@ -1728,6 +1739,73 @@ mod tests {
             !asm.insts.iter().any(|i| matches!(i, AsmInst::Std)),
             "hint=0 must not flip the direction flag"
         );
+    }
+
+    #[test]
+    fn linear_mul_factor_one_emits_add_mem_r13_bl_skipping_imul() {
+        // factor==1 must produce a single `add [r13], bl` per column with
+        // no surrounding `MovEaxEbx; ImulEaxEbxImm32`.
+        let asm = compile_lir_to_asm(&LirProgram {
+            insts: vec![LirInst::LinearMul(vec![(2, 1)])],
+        });
+        assert!(
+            asm.insts.contains(&AsmInst::AddMemR13Bl),
+            "LinearMul factor=1 must emit AddMemR13Bl"
+        );
+        assert!(
+            !asm.insts
+                .iter()
+                .any(|i| matches!(i, AsmInst::ImulEaxEbxImm32(_))),
+            "LinearMul factor=1 must not emit `imul` for the ±1 column"
+        );
+    }
+
+    #[test]
+    fn linear_mul_factor_minus_one_emits_sub_mem_r13_bl() {
+        let asm = compile_lir_to_asm(&LirProgram {
+            insts: vec![LirInst::LinearMul(vec![(3, -1)])],
+        });
+        assert!(
+            asm.insts.contains(&AsmInst::SubMemR13Bl),
+            "LinearMul factor=-1 must emit SubMemR13Bl"
+        );
+        assert!(
+            !asm.insts
+                .iter()
+                .any(|i| matches!(i, AsmInst::ImulEaxEbxImm32(_))),
+            "LinearMul factor=-1 must not emit `imul` for the ±1 column"
+        );
+    }
+
+    #[test]
+    fn linear_mul_other_factor_keeps_imul_path() {
+        let asm = compile_lir_to_asm(&LirProgram {
+            insts: vec![LirInst::LinearMul(vec![(1, 7)])],
+        });
+        assert!(
+            asm.insts
+                .iter()
+                .any(|i| matches!(i, AsmInst::ImulEaxEbxImm32(7))),
+            "non-±1 factor must keep the imul path"
+        );
+        assert!(
+            !asm.insts
+                .iter()
+                .any(|i| matches!(i, AsmInst::AddMemR13Bl | AsmInst::SubMemR13Bl)),
+            "non-±1 factor must not emit ±bl variants"
+        );
+    }
+
+    #[test]
+    fn linear_mul_mixed_columns_pick_per_column() {
+        // Mixed ±1 and non-±1 columns: the body must contain the right
+        // mix of fast-path and imul-path emissions.
+        let asm = compile_lir_to_asm(&LirProgram {
+            insts: vec![LirInst::LinearMul(vec![(1, 1), (2, -1), (3, 5)])],
+        });
+        assert!(asm.insts.contains(&AsmInst::AddMemR13Bl));
+        assert!(asm.insts.contains(&AsmInst::SubMemR13Bl));
+        assert!(asm.insts.contains(&AsmInst::ImulEaxEbxImm32(5)));
     }
 
     #[test]

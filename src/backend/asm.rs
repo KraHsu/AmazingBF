@@ -457,6 +457,22 @@ pub enum AsmInst {
     /// `add byte [r13], al` — add `al` into the current tape cell.
     AddMemR13Al,
 
+    /// `add byte [r13], bl` — add `bl` into the current tape cell.
+    ///
+    /// D2c uses this for `LinearMul` columns whose factor is `1`: `bl` already
+    /// holds the head-cell value (loaded by `MovzxEbxFromMemR13`), so the
+    /// multiplication can be skipped entirely. Same SIB-free encoding as
+    /// `AddMemR13Al` (`41 00 5D 00`); only the source register differs.
+    AddMemR13Bl,
+
+    /// `sub byte [r13], bl` — subtract `bl` from the current tape cell.
+    ///
+    /// D2c uses this for `LinearMul` columns whose factor is `-1` (255 mod
+    /// 256). 8-bit semantics make `cell + 255*bl` equivalent to `cell - bl`,
+    /// so we go straight to subtraction and skip the imul. Encoding `41 28
+    /// 5D 00`.
+    SubMemR13Bl,
+
     /// `mov al, byte [r13]` — load the current tape cell into `al`.
     ///
     /// Used by the buffered-stdout `PutByte` emit: reads `*data_ptr` into

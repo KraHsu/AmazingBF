@@ -195,6 +195,18 @@ fn scan_with_hint_negative_parity() {
     );
 }
 
+// ---- LinearMul ±1 fast path ----
+//
+// The body of LinearMul is *not* ABI-neutral: the Windows backend wraps it
+// with an extra `AddRegImm32(Rsp, ±8)` pair to keep RSP 16-byte aligned at
+// the inner `call ensure_tape` site (Win64 ABI; Linux uses bare push/pop
+// because syscall has no alignment requirement — see the comment in
+// `windows.rs::compile_lir_to_windows_program` LinearMul arm). The per-
+// column ±1 fast-path symmetry itself is checked by parallel unit tests
+// in `codegen.rs::tests` and `windows.rs::tests` (AddMemR13Bl /
+// SubMemR13Bl emission, no-imul shape) — those assert byte-equal column
+// bodies without conflating with the alignment cushion.
+
 // ---- D2 SIMD: ZeroRun ----
 
 #[test]
