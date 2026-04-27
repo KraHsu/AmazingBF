@@ -6,7 +6,8 @@
 //! code references so the PE builder can emit a minimal import table.
 
 use crate::backend::asm::{AsmInst, AsmLabel, AsmProgram, Reg64};
-use crate::ir::lir::{LabelId, LirInst, LirProgram};
+use crate::backend::codegen_common::{LabelAllocator, PlatformEmitter, emit_lir_body};
+use crate::ir::lir::LirProgram;
 
 const INITIAL_TAPE_SIZE: usize = 4096;
 /// Size of the buffered-output ring, in bytes. Mirrors the Linux backend so
@@ -195,19 +196,72 @@ impl Kernel32Imports {
     }
 }
 
-struct LabelAllocator {
-    next: u32,
+struct WindowsEmitter {
+    read_file_iat: AsmLabel,
+    get_last_error_iat: AsmLabel,
 }
 
-impl LabelAllocator {
-    fn new() -> Self {
-        Self { next: 0xFFFE_FFFF }
+impl PlatformEmitter for WindowsEmitter {
+    fn emit_put_byte(
+        &self,
+        out: &mut Vec<AsmInst>,
+        labels: &mut LabelAllocator,
+        flush_output_label: AsmLabel,
+    ) {
+        let skip = labels.fresh();
+        out.push(AsmInst::MovAlMemR13);
+        out.push(AsmInst::MovMemRbxAl);
+        out.push(AsmInst::AddRegImm32(Reg64::Rbx, 1));
+        out.push(AsmInst::CmpRegReg(Reg64::Rbx, Reg64::Rbp));
+        out.push(AsmInst::Jnz(skip));
+        out.push(AsmInst::Call(flush_output_label));
+        out.push(AsmInst::Label(skip));
     }
 
-    fn fresh(&mut self) -> AsmLabel {
-        let label = AsmLabel(self.next);
-        self.next -= 1;
-        label
+    fn emit_get_byte(
+        &self,
+        out: &mut Vec<AsmInst>,
+        labels: &mut LabelAllocator,
+        exit_one_label: AsmLabel,
+        flush_output_label: AsmLabel,
+    ) {
+        out.push(AsmInst::Call(flush_output_label));
+        let done = labels.fresh();
+        let eof = labels.fresh();
+        let read_ok = labels.fresh();
+        emit_zero_stack_qword(out, IO_COUNT_SLOT_DISP);
+        out.push(AsmInst::MovRegReg(Reg64::Rcx, Reg64::Rsi));
+        out.push(AsmInst::MovRegReg(Reg64::Rdx, Reg64::R13));
+        out.push(AsmInst::MovRegImm64(Reg64::R8, 1));
+        out.push(AsmInst::LeaRegMem(
+            Reg64::R9,
+            Reg64::Rsp,
+            IO_COUNT_SLOT_DISP,
+        ));
+        out.push(AsmInst::CallMemLabel(self.read_file_iat));
+        out.push(AsmInst::CmpRegImm32(Reg64::Rax, 0));
+        out.push(AsmInst::Jnz(read_ok));
+        out.push(AsmInst::CallMemLabel(self.get_last_error_iat));
+        out.push(AsmInst::CmpRegImm32(Reg64::Rax, ERROR_HANDLE_EOF as i32));
+        out.push(AsmInst::Jz(eof));
+        out.push(AsmInst::CmpRegImm32(Reg64::Rax, ERROR_BROKEN_PIPE as i32));
+        out.push(AsmInst::Jz(eof));
+        out.push(AsmInst::Jmp(exit_one_label));
+        out.push(AsmInst::Label(read_ok));
+        out.push(AsmInst::MovRegMem64(
+            Reg64::Rax,
+            Reg64::Rsp,
+            IO_COUNT_SLOT_DISP,
+        ));
+        out.push(AsmInst::CmpRegImm32(Reg64::Rax, 0));
+        out.push(AsmInst::Jnz(done));
+        out.push(AsmInst::Label(eof));
+        out.push(AsmInst::MovMem8Imm8(Reg64::R13, 255));
+        out.push(AsmInst::Label(done));
+    }
+
+    fn needs_rsp_alignment(&self) -> bool {
+        true
     }
 }
 
@@ -215,7 +269,7 @@ impl LabelAllocator {
 /// tape management, `ReadFile`/`WriteFile` helpers, and the main LIR-to-ASM
 /// translation with kernel32 imports.
 pub fn compile_lir_to_windows_program(lir: &LirProgram) -> WindowsProgram {
-    let mut labels = LabelAllocator::new();
+    let mut labels = LabelAllocator::new(0xFFFE_FFFF, 0);
     let entry_label = labels.fresh();
     let ensure_tape_label = labels.fresh();
     let exit_one_label = labels.fresh();
@@ -233,16 +287,6 @@ pub fn compile_lir_to_windows_program(lir: &LirProgram) -> WindowsProgram {
             Kernel32Import::VirtualFree,
         ],
     );
-
-    // D5: collect loop-head labels (targets of JumpIfNonZero back-edges).
-    let loop_heads: std::collections::HashSet<_> = lir
-        .insts
-        .iter()
-        .filter_map(|inst| match inst {
-            LirInst::JumpIfNonZero(id) => Some(*id),
-            _ => None,
-        })
-        .collect();
 
     let mut out = Vec::new();
     emit_entry_prologue(&mut out, entry_label);
@@ -272,311 +316,20 @@ pub fn compile_lir_to_windows_program(lir: &LirProgram) -> WindowsProgram {
         exit_one_label,
     );
 
-    // See the Linux backend: tracks offsets relative to current `r13` that have
-    // been proven mapped by a preceding `PtrAddChecked`, so later moves and
-    // `PtrAddChecked`s within the window can skip their probes. Barriers clear.
-    let mut verified_window: Option<(isize, isize)> = None;
-
-    for inst in &lir.insts {
-        match inst {
-            LirInst::PtrAdd(0) => {}
-            LirInst::PtrAdd(n) => {
-                let n = *n;
-                if let Some((wlo, whi)) = verified_window
-                    && wlo <= n
-                    && n <= whi
-                {
-                    emit_add_reg_isize(&mut out, Reg64::R13, n);
-                    verified_window = Some((wlo - n, whi - n));
-                } else {
-                    emit_ptr_add_out(&mut out, &mut labels, n, ensure_tape_label);
-                    verified_window = None;
-                }
-            }
-            LirInst::PtrAddChecked {
-                delta,
-                lo_extent,
-                hi_extent,
-            } => {
-                let delta = *delta;
-                let lo_extent = *lo_extent;
-                let hi_extent = *hi_extent;
-                let covered = matches!(
-                    verified_window,
-                    Some((wlo, whi)) if wlo <= lo_extent && hi_extent <= whi
-                );
-                if covered {
-                    if delta != 0 {
-                        emit_add_reg_isize(&mut out, Reg64::R13, delta);
-                    }
-                } else {
-                    emit_ptr_add_checked_out(
-                        &mut out,
-                        &mut labels,
-                        delta,
-                        lo_extent,
-                        hi_extent,
-                        ensure_tape_label,
-                    );
-                }
-                let (nlo, nhi) = match verified_window {
-                    Some((wlo, whi)) => (wlo.min(lo_extent), whi.max(hi_extent)),
-                    None => (lo_extent, hi_extent),
-                };
-                verified_window = Some((nlo - delta, nhi - delta));
-            }
-            LirInst::LinearMul(factors) => {
-                if factors.is_empty() {
-                    out.push(AsmInst::MovMem8Imm8(Reg64::R13, 0));
-                    continue;
-                }
-                let all_disp8 = factors.iter().all(|(off, _)| i8::try_from(*off).is_ok());
-                out.push(AsmInst::Push(Reg64::Rbx));
-                out.push(AsmInst::AddRegImm32(Reg64::Rsp, -8));
-                out.push(AsmInst::MovzxEbxFromMemR13);
-                out.push(AsmInst::MovMem8Imm8(Reg64::R13, 0));
-                if all_disp8 {
-                    let lo = factors.iter().map(|(o, _)| *o).min().unwrap_or(0).min(0);
-                    let hi = factors.iter().map(|(o, _)| *o).max().unwrap_or(0).max(0);
-                    emit_ptr_add_checked_out(&mut out, &mut labels, 0, lo, hi, ensure_tape_label);
-                    for (off, factor) in factors {
-                        let d = *off as i8;
-                        let f_mod = ((factor % 256) + 256) % 256;
-                        match f_mod {
-                            0 => {}
-                            1 => out.push(AsmInst::AddMemR13BlDisp8(d)),
-                            255 => out.push(AsmInst::SubMemR13BlDisp8(d)),
-                            _ => {
-                                out.push(AsmInst::ImulEaxEbxImm32(*factor));
-                                out.push(AsmInst::AddMemR13AlDisp8(d));
-                            }
-                        }
-                    }
-                    verified_window = Some((lo, hi));
-                } else {
-                    for (off, factor) in factors {
-                        emit_ptr_add_out(&mut out, &mut labels, *off, ensure_tape_label);
-                        let f_mod = ((factor % 256) + 256) % 256;
-                        match f_mod {
-                            0 => {}
-                            1 => out.push(AsmInst::AddMemR13Bl),
-                            255 => out.push(AsmInst::SubMemR13Bl),
-                            _ => {
-                                out.push(AsmInst::ImulEaxEbxImm32(*factor));
-                                out.push(AsmInst::AddMemR13Al);
-                            }
-                        }
-                        emit_ptr_add_out(&mut out, &mut labels, -*off, ensure_tape_label);
-                    }
-                    verified_window = None;
-                }
-                out.push(AsmInst::AddRegImm32(Reg64::Rsp, 8));
-                out.push(AsmInst::Pop(Reg64::Rbx));
-            }
-            LirInst::LinearMulWithSets { factors, sets } => {
-                let done_label = labels.fresh();
-                out.push(AsmInst::CmpMem8Imm8(Reg64::R13, 0));
-                out.push(AsmInst::Jz(done_label));
-                let all_offsets: Vec<isize> = factors
-                    .iter()
-                    .map(|(o, _)| *o)
-                    .chain(sets.iter().copied())
-                    .collect();
-                let all_disp8 = all_offsets.iter().all(|o| i8::try_from(*o).is_ok());
-                out.push(AsmInst::Push(Reg64::Rbx));
-                out.push(AsmInst::AddRegImm32(Reg64::Rsp, -8));
-                out.push(AsmInst::MovzxEbxFromMemR13);
-                out.push(AsmInst::MovMem8Imm8(Reg64::R13, 0));
-                if all_disp8 {
-                    let lo = all_offsets.iter().copied().min().unwrap_or(0).min(0);
-                    let hi = all_offsets.iter().copied().max().unwrap_or(0).max(0);
-                    emit_ptr_add_checked_out(&mut out, &mut labels, 0, lo, hi, ensure_tape_label);
-                    for (off, factor) in factors {
-                        let d = *off as i8;
-                        let f_mod = ((factor % 256) + 256) % 256;
-                        match f_mod {
-                            0 => {}
-                            1 => out.push(AsmInst::AddMemR13BlDisp8(d)),
-                            255 => out.push(AsmInst::SubMemR13BlDisp8(d)),
-                            _ => {
-                                out.push(AsmInst::ImulEaxEbxImm32(*factor));
-                                out.push(AsmInst::AddMemR13AlDisp8(d));
-                            }
-                        }
-                    }
-                    for off in sets {
-                        out.push(AsmInst::MovMem8ImmDisp8(Reg64::R13, *off as i8, 0));
-                    }
-                    verified_window = Some((lo, hi));
-                } else {
-                    for (off, factor) in factors {
-                        emit_ptr_add_out(&mut out, &mut labels, *off, ensure_tape_label);
-                        let f_mod = ((factor % 256) + 256) % 256;
-                        match f_mod {
-                            0 => {}
-                            1 => out.push(AsmInst::AddMemR13Bl),
-                            255 => out.push(AsmInst::SubMemR13Bl),
-                            _ => {
-                                out.push(AsmInst::ImulEaxEbxImm32(*factor));
-                                out.push(AsmInst::AddMemR13Al);
-                            }
-                        }
-                        emit_ptr_add_out(&mut out, &mut labels, -*off, ensure_tape_label);
-                    }
-                    for off in sets {
-                        emit_ptr_add_out(&mut out, &mut labels, *off, ensure_tape_label);
-                        out.push(AsmInst::MovMem8Imm8(Reg64::R13, 0));
-                        emit_ptr_add_out(&mut out, &mut labels, -*off, ensure_tape_label);
-                    }
-                    verified_window = None;
-                }
-                out.push(AsmInst::AddRegImm32(Reg64::Rsp, 8));
-                out.push(AsmInst::Pop(Reg64::Rbx));
-                out.push(AsmInst::Label(done_label));
-            }
-            LirInst::Scan(dir) => {
-                let loop_top = labels.fresh();
-                let loop_done = labels.fresh();
-                out.push(AsmInst::Label(loop_top));
-                out.push(AsmInst::CmpMem8Imm8(Reg64::R13, 0));
-                out.push(AsmInst::Jz(loop_done));
-                emit_ptr_add_out(&mut out, &mut labels, *dir, ensure_tape_label);
-                out.push(AsmInst::Jmp(loop_top));
-                out.push(AsmInst::Label(loop_done));
-                verified_window = None;
-            }
-            // ScanWithHint: D2 SIMD fast path uses `repne scasb` over the
-            // hint_bytes-sized verified window. Mirrors the Linux backend
-            // (`codegen.rs`) — see the comment there for the recovery
-            // story. Win64-specific note: the `Std` / `Cld` pair around
-            // `RepneScasb` exists precisely so DF=0 holds at the inner
-            // `call ensure_tape` site inside the slow_top fallthrough.
-            LirInst::ScanWithHint { dir, hint_bytes } => {
-                let step = *dir;
-                debug_assert!(step == 1 || step == -1, "ScanWithHint step must be ±1");
-                let slow_top = labels.fresh();
-                let done = labels.fresh();
-
-                if *hint_bytes > 0 {
-                    out.push(AsmInst::MovRegImm64(Reg64::Rax, 0));
-                    out.push(AsmInst::MovRegReg(Reg64::Rdi, Reg64::R13));
-                    out.push(AsmInst::MovRegImm64(Reg64::Rcx, i64::from(*hint_bytes)));
-                    if step == -1 {
-                        out.push(AsmInst::Std);
-                    } else {
-                        out.push(AsmInst::Cld);
-                    }
-                    out.push(AsmInst::RepneScasb);
-                    if step == -1 {
-                        out.push(AsmInst::Cld);
-                    }
-                    out.push(AsmInst::MovRegReg(Reg64::R13, Reg64::Rdi));
-                    out.push(AsmInst::AddRegImm32(Reg64::R13, -(step as i32)));
-                }
-
-                out.push(AsmInst::Label(slow_top));
-                out.push(AsmInst::CmpMem8Imm8(Reg64::R13, 0));
-                out.push(AsmInst::Jz(done));
-                emit_ptr_add_out(&mut out, &mut labels, step, ensure_tape_label);
-                out.push(AsmInst::Jmp(slow_top));
-                out.push(AsmInst::Label(done));
-
-                verified_window = None;
-            }
-            LirInst::CellAdd(0) => {}
-            // CellAdd(n): mirror the Linux backend's inc/dec selection.
-            //
-            // ±1 → 4-byte `inc`/`dec byte [r13]`; everything else falls back to
-            // the 5-byte `add byte [r13], imm8` (or no-op when `n % 256 == 0`).
-            // Keeps the two backends byte-for-byte equivalent on this opcode
-            // (see `tests/backend_parity.rs`).
-            LirInst::CellAdd(n) => {
-                let imm = ((*n % 256) + 256) % 256;
-                match imm {
-                    0 => {}
-                    1 => out.push(AsmInst::IncMem8(Reg64::R13)),
-                    255 => out.push(AsmInst::DecMem8(Reg64::R13)),
-                    other => {
-                        out.push(AsmInst::AddMem8Imm8(Reg64::R13, other as u8 as i8));
-                    }
-                }
-            }
-            LirInst::CellSet(v) => out.push(AsmInst::MovMem8Imm8(Reg64::R13, *v)),
-            LirInst::CellAddAt { off, delta } => {
-                debug_assert!(
-                    *off != 0,
-                    "CellAddAt(off=0) should be canonicalised to CellAdd"
-                );
-                let imm = ((*delta % 256) + 256) % 256;
-                if imm != 0 {
-                    out.push(mem8_add_at_r13(*off, imm as u8 as i8));
-                }
-            }
-            LirInst::CellSetAt { off, val } => {
-                debug_assert!(
-                    *off != 0,
-                    "CellSetAt(off=0) should be canonicalised to CellSet"
-                );
-                out.push(mem8_set_at_r13(*off, *val));
-            }
-            // ZeroRun: identical lowering to the Linux backend
-            // (`codegen.rs`). `rep stosb` is ABI-neutral — its only register
-            // dependencies are al/rdi/rcx, all caller-saved on both SysV and
-            // Win64 — so the threshold and instruction sequence match.
-            LirInst::ZeroRun { start, count } => {
-                debug_assert!(*count >= 2, "ZeroRun should hold at least two bytes");
-                if *count >= 16 {
-                    out.push(AsmInst::XorEaxEax);
-                    out.push(AsmInst::LeaRegMem(Reg64::Rdi, Reg64::R13, *start));
-                    out.push(AsmInst::MovEcxImm32(*count as i32));
-                    out.push(AsmInst::Cld);
-                    out.push(AsmInst::RepStosb);
-                } else {
-                    for i in 0..*count {
-                        let off = isize::try_from(i64::from(*start) + i64::from(i))
-                            .expect("ZeroRun offset must fit in isize");
-                        if off == 0 {
-                            out.push(AsmInst::MovMem8Imm8(Reg64::R13, 0));
-                        } else {
-                            out.push(mem8_set_at_r13(off, 0));
-                        }
-                    }
-                }
-            }
-            LirInst::PutByte => {
-                emit_put_byte(&mut out, &mut labels, flush_output_label);
-                verified_window = None;
-            }
-            LirInst::GetByte => {
-                emit_get_byte(
-                    &mut out,
-                    &mut labels,
-                    imports.iat_label(Kernel32Import::ReadFile),
-                    imports.iat_label(Kernel32Import::GetLastError),
-                    exit_one_label,
-                    flush_output_label,
-                );
-                verified_window = None;
-            }
-            LirInst::Label(id) => {
-                if loop_heads.contains(id) {
-                    out.push(AsmInst::Align16);
-                }
-                out.push(AsmInst::Label(map_label(*id)));
-                verified_window = None;
-            }
-            LirInst::JumpIfZero(id) => {
-                out.push(AsmInst::CmpMem8Imm8(Reg64::R13, 0));
-                out.push(AsmInst::Jz(map_label(*id)));
-                verified_window = None;
-            }
-            LirInst::JumpIfNonZero(id) => {
-                out.push(AsmInst::CmpMem8Imm8(Reg64::R13, 0));
-                out.push(AsmInst::Jnz(map_label(*id)));
-                verified_window = None;
-            }
-        }
-    }
+    // 2. Translate LIR instructions (shared logic with Linux backend).
+    let win_emitter = WindowsEmitter {
+        read_file_iat: imports.iat_label(Kernel32Import::ReadFile),
+        get_last_error_iat: imports.iat_label(Kernel32Import::GetLastError),
+    };
+    emit_lir_body(
+        &mut out,
+        &mut labels,
+        lir,
+        ensure_tape_label,
+        flush_output_label,
+        exit_one_label,
+        &win_emitter,
+    );
 
     // Flush before the normal exit so any tail output (whether less than
     // a buffer page, or partially through the next page) actually reaches
@@ -623,7 +376,7 @@ pub fn compile_lir_to_windows_program(lir: &LirProgram) -> WindowsProgram {
 /// Emit a minimal Windows executable that calls `ExitProcess(exit_code)`. Used
 /// by `-O3` when the input Brainfuck program has no side effects.
 pub fn compile_trivial_exit_program(exit_code: u32) -> WindowsProgram {
-    let mut labels = LabelAllocator::new();
+    let mut labels = LabelAllocator::new(0xFFFE_FFFF, 0);
     let entry_label = labels.fresh();
     let imports = Kernel32Imports::new(&mut labels, &[Kernel32Import::ExitProcess]);
     let mut out = Vec::new();
@@ -659,7 +412,7 @@ pub fn compile_precomputed_stdout_program(data: &[u8]) -> WindowsProgram {
         return compile_trivial_exit_program(0);
     }
 
-    let mut labels = LabelAllocator::new();
+    let mut labels = LabelAllocator::new(0xFFFE_FFFF, 0);
     let entry_label = labels.fresh();
     let stdout_bytes_label = labels.fresh();
     let exit_one_label = labels.fresh();
@@ -723,90 +476,6 @@ fn emit_entry_prologue(out: &mut Vec<AsmInst>, entry_label: AsmLabel) {
     out.push(AsmInst::Label(entry_label));
     out.push(AsmInst::AndRegImm32(Reg64::Rsp, -16));
     out.push(AsmInst::AddRegImm32(Reg64::Rsp, -ENTRY_STACK_FRAME_BYTES));
-}
-
-fn emit_ptr_add_out(
-    out: &mut Vec<AsmInst>,
-    labels: &mut LabelAllocator,
-    n: isize,
-    ensure_tape_label: AsmLabel,
-) {
-    if n == 0 {
-        return;
-    }
-
-    let slow_path = labels.fresh();
-    let done = labels.fresh();
-
-    out.push(AsmInst::MovRegReg(Reg64::R15, Reg64::R13));
-    emit_add_reg_isize(out, Reg64::R15, n);
-    out.push(AsmInst::CmpRegReg(Reg64::R15, Reg64::R12));
-    out.push(AsmInst::Jb(slow_path));
-    out.push(AsmInst::CmpRegReg(Reg64::R15, Reg64::R14));
-    out.push(AsmInst::Jae(slow_path));
-    out.push(AsmInst::MovRegReg(Reg64::R13, Reg64::R15));
-    out.push(AsmInst::Jmp(done));
-    out.push(AsmInst::Label(slow_path));
-    out.push(AsmInst::Call(ensure_tape_label));
-    out.push(AsmInst::Label(done));
-}
-
-/// Windows counterpart of [`crate::backend::codegen::emit_ptr_add_checked_out`].
-fn emit_ptr_add_checked_out(
-    out: &mut Vec<AsmInst>,
-    labels: &mut LabelAllocator,
-    delta: isize,
-    lo_extent: isize,
-    hi_extent: isize,
-    ensure_tape_label: AsmLabel,
-) {
-    debug_assert!(lo_extent <= 0 && 0 <= hi_extent);
-    debug_assert!(lo_extent <= delta && delta <= hi_extent);
-
-    if lo_extent == 0 && hi_extent == 0 {
-        debug_assert_eq!(delta, 0);
-        return;
-    }
-
-    let retry = labels.fresh();
-    let slow_lo = labels.fresh();
-    let slow_hi = labels.fresh();
-    let done = labels.fresh();
-
-    out.push(AsmInst::Label(retry));
-
-    if lo_extent < 0 {
-        out.push(AsmInst::MovRegReg(Reg64::R15, Reg64::R13));
-        emit_add_reg_isize(out, Reg64::R15, lo_extent);
-        out.push(AsmInst::CmpRegReg(Reg64::R15, Reg64::R12));
-        out.push(AsmInst::Jb(slow_lo));
-    }
-    if hi_extent > 0 {
-        out.push(AsmInst::MovRegReg(Reg64::R15, Reg64::R13));
-        emit_add_reg_isize(out, Reg64::R15, hi_extent);
-        out.push(AsmInst::CmpRegReg(Reg64::R15, Reg64::R14));
-        out.push(AsmInst::Jae(slow_hi));
-    }
-
-    if delta != 0 {
-        emit_add_reg_isize(out, Reg64::R13, delta);
-    }
-    out.push(AsmInst::Jmp(done));
-
-    if lo_extent < 0 {
-        out.push(AsmInst::Label(slow_lo));
-        out.push(AsmInst::Call(ensure_tape_label));
-        emit_add_reg_isize(out, Reg64::R13, -lo_extent);
-        out.push(AsmInst::Jmp(retry));
-    }
-    if hi_extent > 0 {
-        out.push(AsmInst::Label(slow_hi));
-        out.push(AsmInst::Call(ensure_tape_label));
-        emit_add_reg_isize(out, Reg64::R13, -hi_extent);
-        out.push(AsmInst::Jmp(retry));
-    }
-
-    out.push(AsmInst::Label(done));
 }
 
 fn emit_get_std_handle(
@@ -949,70 +618,6 @@ fn emit_flush_output(out: &mut Vec<AsmInst>, label: AsmLabel, write_file_iat: As
 ///
 /// Mirrors the Linux backend's per-byte hot path (`codegen.rs:461-471`):
 /// store the current cell into `[rbx]`, advance `rbx`, and `call
-/// flush_output` only when `rbx == rbp` (every 4096 bytes). The actual
-/// `WriteFile` IAT call lives entirely inside `emit_flush_output`.
-fn emit_put_byte(
-    out: &mut Vec<AsmInst>,
-    labels: &mut LabelAllocator,
-    flush_output_label: AsmLabel,
-) {
-    let skip = labels.fresh();
-    out.push(AsmInst::MovAlMemR13);
-    out.push(AsmInst::MovMemRbxAl);
-    out.push(AsmInst::AddRegImm32(Reg64::Rbx, 1));
-    out.push(AsmInst::CmpRegReg(Reg64::Rbx, Reg64::Rbp));
-    out.push(AsmInst::Jnz(skip));
-    out.push(AsmInst::Call(flush_output_label));
-    out.push(AsmInst::Label(skip));
-}
-
-fn emit_get_byte(
-    out: &mut Vec<AsmInst>,
-    labels: &mut LabelAllocator,
-    read_file_iat: AsmLabel,
-    get_last_error_iat: AsmLabel,
-    exit_one_label: AsmLabel,
-    flush_output_label: AsmLabel,
-) {
-    // Drain any buffered stdout first so interactive prompts reach the
-    // user before ReadFile blocks. Mirrors the Linux backend's flush
-    // ahead of the read syscall.
-    out.push(AsmInst::Call(flush_output_label));
-
-    let done = labels.fresh();
-    let eof = labels.fresh();
-    let read_ok = labels.fresh();
-    emit_zero_stack_qword(out, IO_COUNT_SLOT_DISP);
-    out.push(AsmInst::MovRegReg(Reg64::Rcx, Reg64::Rsi));
-    out.push(AsmInst::MovRegReg(Reg64::Rdx, Reg64::R13));
-    out.push(AsmInst::MovRegImm64(Reg64::R8, 1));
-    out.push(AsmInst::LeaRegMem(
-        Reg64::R9,
-        Reg64::Rsp,
-        IO_COUNT_SLOT_DISP,
-    ));
-    out.push(AsmInst::CallMemLabel(read_file_iat));
-    out.push(AsmInst::CmpRegImm32(Reg64::Rax, 0));
-    out.push(AsmInst::Jnz(read_ok));
-    out.push(AsmInst::CallMemLabel(get_last_error_iat));
-    out.push(AsmInst::CmpRegImm32(Reg64::Rax, ERROR_HANDLE_EOF as i32));
-    out.push(AsmInst::Jz(eof));
-    out.push(AsmInst::CmpRegImm32(Reg64::Rax, ERROR_BROKEN_PIPE as i32));
-    out.push(AsmInst::Jz(eof));
-    out.push(AsmInst::Jmp(exit_one_label));
-    out.push(AsmInst::Label(read_ok));
-    out.push(AsmInst::MovRegMem64(
-        Reg64::Rax,
-        Reg64::Rsp,
-        IO_COUNT_SLOT_DISP,
-    ));
-    out.push(AsmInst::CmpRegImm32(Reg64::Rax, 0));
-    out.push(AsmInst::Jnz(done));
-    out.push(AsmInst::Label(eof));
-    out.push(AsmInst::MovMem8Imm8(Reg64::R13, 255));
-    out.push(AsmInst::Label(done));
-}
-
 fn emit_exit_process(out: &mut Vec<AsmInst>, exit_process_iat: AsmLabel, code: i64) {
     out.push(AsmInst::MovRegImm64(Reg64::Rcx, code));
     out.push(AsmInst::CallMemLabel(exit_process_iat));
@@ -1151,50 +756,11 @@ fn emit_ensure_tape_contains_r15(
     out.push(AsmInst::Ret);
 }
 
-fn mem8_add_at_r13(off: isize, imm: i8) -> AsmInst {
-    if let Ok(disp8) = i8::try_from(off) {
-        AsmInst::AddMem8ImmDisp8(Reg64::R13, disp8, imm)
-    } else {
-        let disp32 =
-            i32::try_from(off).expect("CellAddAt offset must fit in i32 (lir_postpone DISP32 cap)");
-        AsmInst::AddMem8ImmDisp32(Reg64::R13, disp32, imm)
-    }
-}
-
-fn mem8_set_at_r13(off: isize, val: u8) -> AsmInst {
-    if let Ok(disp8) = i8::try_from(off) {
-        AsmInst::MovMem8ImmDisp8(Reg64::R13, disp8, val)
-    } else {
-        let disp32 =
-            i32::try_from(off).expect("CellSetAt offset must fit in i32 (lir_postpone DISP32 cap)");
-        AsmInst::MovMem8ImmDisp32(Reg64::R13, disp32, val)
-    }
-}
-
-fn emit_add_reg_isize(out: &mut Vec<AsmInst>, reg: Reg64, value: isize) {
-    let mut remaining = i64::try_from(value).expect("pointer delta did not fit in i64");
-    while remaining != 0 {
-        let chunk = if remaining > i64::from(i32::MAX) {
-            i32::MAX
-        } else if remaining < i64::from(i32::MIN) {
-            i32::MIN
-        } else {
-            remaining as i32
-        };
-        out.push(AsmInst::AddRegImm32(reg, chunk));
-        remaining -= i64::from(chunk);
-    }
-}
-
-fn map_label(id: LabelId) -> AsmLabel {
-    AsmLabel(id.0)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::backend::asm::AsmInst;
-    use crate::ir::lir::LirProgram;
+    use crate::ir::lir::{LirInst, LirProgram};
 
     #[test]
     fn trivial_exit_imports_exitprocess_only() {

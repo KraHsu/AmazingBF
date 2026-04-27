@@ -141,6 +141,17 @@
 - **F4 LLVM 后端（可选）**：代价是破坏“零运行时依赖”承诺；作为可开关的 feature flag 存在。
 - **F5 增量编译缓存**：对固定 `.bf` 源缓存 HIR / LIR / obj，结合内容哈希。只有当 E5 表明编译时长占比明显时才值得。
 
+### Phase G — 后端重构（已落地）
+
+> 目标：消除 Linux / Windows 后端之间的代码重复，为后续新增后端（F2 ARM64、F3 macOS）降低成本。
+
+- **G1 提取共享 codegen 逻辑** ✓：新建 `src/backend/codegen_common.rs`，包含：
+  - `LabelAllocator`：统一的内部标签分配器（替代 Linux 的 `fresh_internal_label(&mut u32)` 和 Windows 的 `LabelAllocator::new()`）。
+  - 6 个工具函数：`map_label`、`mem8_add_at_r13`、`mem8_set_at_r13`、`emit_add_reg_isize`、`emit_ptr_add_out`、`emit_ptr_add_checked_out`。
+  - `PlatformEmitter` trait：抽象 `emit_put_byte` / `emit_get_byte` / `needs_rsp_alignment()` 三个 ABI 差异点。
+  - `emit_lir_body()`：完整的 LIR→AsmInst 翻译循环，覆盖所有 ABI 无关的 match arm（PtrAdd、PtrAddChecked、CellAdd、CellSet、CellAddAt、CellSetAt、ZeroRun、LinearMul、LinearMulWithSets、Scan、ScanWithHint、Label、JumpIfZero、JumpIfNonZero），通过 `PlatformEmitter` 回调处理 PutByte/GetByte，通过 `needs_rsp_alignment` 参数化 LinearMul 的 Win64 RSP 对齐。
+  - 效果：`codegen.rs` 2120→1532 行（-588），`windows.rs` 1655→1221 行（-434），`codegen_common.rs` 516 行，净减 506 行。
+
 ---
 
 ## 3. 依赖总览
@@ -162,7 +173,7 @@ C1 (LIR peephole) ✓、D1 (指令选择) ✓、
 D3 (buffered I/O — 解释器 ✓ / Linux 后端 ✓ / Windows 后端 ✓)、
 E1 / E2 (superinstruction + threaded dispatch) ✓、
 E3 (interp LinearMul ±1 快路径) ✓、E4 (tape 倍增) ✓ 均可并行启动。
-已落地：E5、C1、D1、E4、Phase A (A1–A4)、B1、B2、B3、B4、B5、B6、B7-α (P1+P2+P3)、C2、C3、C4、E1、E2、E3、D2 (a/b/c/d 四项双端对称)、D3 (解释器 + Linux 后端 + Windows 后端)、D4 (冗余 mov 消除)、D5 (分支提示 + loop 头 16B 对齐)。
+已落地：E5、C1、D1、E4、Phase A (A1–A4)、B1、B2、B3、B4、B5、B6、B7-α (P1+P2+P3)、C2、C3、C4、E1、E2、E3、D2 (a/b/c/d 四项双端对称)、D3 (解释器 + Linux 后端 + Windows 后端)、D4 (冗余 mov 消除)、D5 (分支提示 + loop 头 16B 对齐)、G1 (后端重构)。
 已调查搁置：B7-β（ROI <2%，需完整 K6 算法）。
 
 Phase F 全部不在近期依赖图内。
@@ -181,8 +192,8 @@ Phase F 全部不在近期依赖图内。
 | HIR | `src/ir/loop_stats.rs`、`src/ir/loop_profile.rs` | B7 Phase 0 测量（已落地） |
 | LIR | `src/ir/lir.rs`, `src/ir/lower.rs` | B / C 可能新增 `PtrAddChecked` / `CellAddAt` |
 | LIR | `src/ir/lir_opt.rs`（新） | Phase C 主场 |
-| Backend | `src/backend/codegen.rs`, `src/backend/x86_64/encode.rs`, `src/backend/asm.rs` | Phase D |
-| Backend | `src/backend/x86_64/elf.rs`, `src/backend/x86_64/windows.rs` | D3 buffered I/O |
+| Backend | `src/backend/codegen.rs`, `src/backend/codegen_common.rs`, `src/backend/x86_64/encode.rs`, `src/backend/asm.rs` | Phase D / G1 |
+| Backend | `src/backend/x86_64/elf.rs`, `src/backend/x86_64/windows.rs` | D3 buffered I/O / G1 |
 | Runtime | `src/interp/engine.rs`, `src/runtime/{tape,io,host}.rs` | Phase E |
 | Bench | `benches/`（新） | E5 |
 | Tests | `tests/cases_pipeline.rs`, `tests/compile_artifacts.rs` | 每阶段新增 pass 后回归 |
