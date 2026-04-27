@@ -352,6 +352,39 @@ pub fn compile_lir_to_windows_program(lir: &LirProgram) -> WindowsProgram {
                 out.push(AsmInst::Pop(Reg64::Rbx));
                 verified_window = None;
             }
+            LirInst::LinearMulWithSets { factors, sets } => {
+                let done_label = labels.fresh();
+                out.push(AsmInst::CmpMem8Imm8(Reg64::R13, 0));
+                out.push(AsmInst::Jz(done_label));
+                out.push(AsmInst::Push(Reg64::Rbx));
+                out.push(AsmInst::AddRegImm32(Reg64::Rsp, -8));
+                out.push(AsmInst::MovzxEbxFromMemR13);
+                out.push(AsmInst::MovMem8Imm8(Reg64::R13, 0));
+                for (off, factor) in factors {
+                    emit_ptr_add_out(&mut out, &mut labels, *off, ensure_tape_label);
+                    let f_mod = ((factor % 256) + 256) % 256;
+                    match f_mod {
+                        0 => {}
+                        1 => out.push(AsmInst::AddMemR13Bl),
+                        255 => out.push(AsmInst::SubMemR13Bl),
+                        _ => {
+                            out.push(AsmInst::MovEaxEbx);
+                            out.push(AsmInst::ImulEaxEbxImm32(*factor));
+                            out.push(AsmInst::AddMemR13Al);
+                        }
+                    }
+                    emit_ptr_add_out(&mut out, &mut labels, -*off, ensure_tape_label);
+                }
+                for off in sets {
+                    emit_ptr_add_out(&mut out, &mut labels, *off, ensure_tape_label);
+                    out.push(AsmInst::MovMem8Imm8(Reg64::R13, 0));
+                    emit_ptr_add_out(&mut out, &mut labels, -*off, ensure_tape_label);
+                }
+                out.push(AsmInst::AddRegImm32(Reg64::Rsp, 8));
+                out.push(AsmInst::Pop(Reg64::Rbx));
+                out.push(AsmInst::Label(done_label));
+                verified_window = None;
+            }
             LirInst::Scan(dir) => {
                 let loop_top = labels.fresh();
                 let loop_done = labels.fresh();

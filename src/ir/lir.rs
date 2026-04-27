@@ -87,6 +87,12 @@ pub(crate) enum LirInst {
     /// Same semantics as [`crate::ir::hir::HirInst::LinearMul`].
     LinearMul(Vec<(isize, i32)>),
 
+    /// Same semantics as [`crate::ir::hir::HirInst::LinearMulWithSets`].
+    LinearMulWithSets {
+        factors: Vec<(isize, i32)>,
+        sets: Vec<isize>,
+    },
+
     /// Same semantics as [`crate::ir::hir::HirInst::Scan`] (`dir` is ±1).
     Scan(isize),
 

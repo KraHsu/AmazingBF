@@ -63,6 +63,13 @@ fn lower_to_lir_block(hir: &[HirInst], labels: &mut LabelGen) -> Vec<LirInst> {
 
             HirInst::LinearMul(factors) => out.push(LirInst::LinearMul(factors.clone())),
 
+            HirInst::LinearMulWithSets { factors, sets } => {
+                out.push(LirInst::LinearMulWithSets {
+                    factors: factors.clone(),
+                    sets: sets.clone(),
+                });
+            }
+
             HirInst::Scan(dir) => out.push(LirInst::Scan(*dir)),
 
             HirInst::Loop(body) => {

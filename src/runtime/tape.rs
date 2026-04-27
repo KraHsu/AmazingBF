@@ -151,6 +151,20 @@ impl Tape {
         };
     }
 
+    /// Set the cell at `self.ptr + off` to `val`, growing the tape on
+    /// demand.  Like [`add_at`](Self::add_at), does not move `self.ptr`
+    /// and does not register move-unit stats.
+    pub(crate) fn set_at(&mut self, off: isize, val: u8) {
+        let target = self.ptr + off;
+        self.ensure_range(target);
+        let cell = if target >= 0 {
+            &mut self.right[target as usize]
+        } else {
+            &mut self.left[(-target - 1) as usize]
+        };
+        *cell = val;
+    }
+
     /// Shared tape-growth helper for `move_ptr` / `add_at`.  Grows the
     /// appropriate side geometrically (with the left-side-8 floor) and
     /// updates `ptr_min` / `ptr_max` / `right_grew_bytes` / `final_len`.
@@ -313,5 +327,33 @@ mod tests {
         assert_eq!(t.current(), 42);
         let s = t.stats();
         assert_eq!(s.ptr_min, -3);
+    }
+
+    #[test]
+    fn set_at_writes_without_moving_ptr() {
+        let mut t = Tape::new(8);
+        t.set_at(5, 99);
+        assert_eq!(t.ptr(), 0);
+        t.move_ptr(5);
+        assert_eq!(t.current(), 99);
+    }
+
+    #[test]
+    fn set_at_negative_offset() {
+        let mut t = Tape::new(4);
+        t.set_at(-2, 77);
+        assert_eq!(t.ptr(), 0);
+        t.move_ptr(-2);
+        assert_eq!(t.current(), 77);
+        assert_eq!(t.stats().ptr_min, -2);
+    }
+
+    #[test]
+    fn set_at_grows_tape_on_demand() {
+        let mut t = Tape::new(4);
+        t.set_at(20, 1);
+        assert!(t.stats().final_len >= 21);
+        assert_eq!(t.stats().ptr_max, 20);
+        assert_eq!(t.ptr(), 0);
     }
 }

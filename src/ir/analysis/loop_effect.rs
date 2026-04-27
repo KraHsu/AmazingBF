@@ -148,6 +148,21 @@ impl LoopEffect {
                     }
                     // Per HIR semantics the pointer is unchanged.
                 }
+                HirInst::LinearMulWithSets { factors, sets, .. } => {
+                    reads = true;
+                    writes = true;
+                    if ptr_known {
+                        touched = union(touched, single_cell(cur_ptr));
+                        for (off, _) in factors {
+                            touched = union(touched, single_cell(cur_ptr.saturating_add(*off)));
+                        }
+                        for off in sets {
+                            touched = union(touched, single_cell(cur_ptr.saturating_add(*off)));
+                        }
+                    } else {
+                        touched = unbounded_range();
+                    }
+                }
                 HirInst::Scan(_dir) => {
                     reads = true;
                     touched = unbounded_range();

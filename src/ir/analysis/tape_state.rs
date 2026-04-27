@@ -146,7 +146,10 @@ impl TapeState {
                 self.cells.remove(&self.ptr);
             }
             HirInst::PutByte => { /* pure side effect on stdout */ }
-            HirInst::LinearMul(_) | HirInst::Scan(_) | HirInst::Loop(_) => {
+            HirInst::LinearMul(_)
+            | HirInst::LinearMulWithSets { .. }
+            | HirInst::Scan(_)
+            | HirInst::Loop(_) => {
                 self.clobber_all();
             }
         }

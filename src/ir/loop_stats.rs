@@ -87,7 +87,7 @@ pub(crate) fn classify_loop_body(body: &[HirInst]) -> LoopClass {
             HirInst::Scan(_) => has_scan = true,
             HirInst::Loop(_) => has_nested = true,
             HirInst::Zero => has_zero = true,
-            HirInst::LinearMul(_) => has_lmul = true,
+            HirInst::LinearMul(_) | HirInst::LinearMulWithSets { .. } => has_lmul = true,
             HirInst::Add(_) | HirInst::Move(_) => {}
         }
     }
@@ -119,7 +119,7 @@ pub(crate) fn classify_loop_body(body: &[HirInst]) -> LoopClass {
                     head_clobbered = true;
                 }
             }
-            HirInst::LinearMul(_) => {
+            HirInst::LinearMul(_) | HirInst::LinearMulWithSets { .. } => {
                 if ptr == 0 {
                     head_clobbered = true;
                 }

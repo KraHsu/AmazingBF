@@ -38,8 +38,15 @@ enum ProfileInst {
     GetByte,
     Zero,
     LinearMul(Vec<(isize, i32)>),
+    LinearMulWithSets {
+        factors: Vec<(isize, i32)>,
+        sets: Vec<isize>,
+    },
     Scan(isize),
-    Loop { id: usize, body: Vec<ProfileInst> },
+    Loop {
+        id: usize,
+        body: Vec<ProfileInst>,
+    },
 }
 
 pub(crate) struct Profile {
@@ -103,6 +110,12 @@ fn label_block(
             HirInst::GetByte => out.push(ProfileInst::GetByte),
             HirInst::Zero => out.push(ProfileInst::Zero),
             HirInst::LinearMul(factors) => out.push(ProfileInst::LinearMul(factors.clone())),
+            HirInst::LinearMulWithSets { factors, sets } => {
+                out.push(ProfileInst::LinearMulWithSets {
+                    factors: factors.clone(),
+                    sets: sets.clone(),
+                });
+            }
             HirInst::Scan(d) => out.push(ProfileInst::Scan(*d)),
             HirInst::Loop(body) => {
                 let id = *next_id;
@@ -147,6 +160,23 @@ fn format_body_compact(body: &[HirInst]) -> String {
                 }
                 out.push(']');
             }
+            HirInst::LinearMulWithSets { factors, sets } => {
+                out.push_str("LinearMulWithSets[");
+                for (j, (off, f)) in factors.iter().enumerate() {
+                    if j > 0 {
+                        out.push(',');
+                    }
+                    out.push_str(&format!("({},{})", off, f));
+                }
+                out.push_str(";sets=");
+                for (j, off) in sets.iter().enumerate() {
+                    if j > 0 {
+                        out.push(',');
+                    }
+                    out.push_str(&format!("{}", off));
+                }
+                out.push(']');
+            }
             HirInst::Scan(d) => out.push_str(&format!("Scan({})", d)),
             HirInst::Loop(_) => out.push_str("Loop(...)"),
         }
@@ -181,6 +211,19 @@ fn exec(
                 for (off, f) in factors {
                     let delta = (v as i32).wrapping_mul(*f);
                     tape.add_at(*off, delta);
+                }
+            }
+            ProfileInst::LinearMulWithSets { factors, sets } => {
+                let v = tape.current();
+                if v != 0 {
+                    tape.set_current(0);
+                    for (off, f) in factors {
+                        let delta = (v as i32).wrapping_mul(*f);
+                        tape.add_at(*off, delta);
+                    }
+                    for off in sets {
+                        tape.set_at(*off, 0);
+                    }
                 }
             }
             ProfileInst::Scan(dir) => {

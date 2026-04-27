@@ -29,6 +29,19 @@ pub(crate) enum HirInst {
     /// Produced from simple affine loops like `[->+<]` / `[->+>+<<]` at `-O1`.
     LinearMul(Vec<(isize, i32)>),
 
+    /// Like [`LinearMul`](Self::LinearMul), but the loop body also contains
+    /// `Zero` writes at non-head offsets.
+    ///
+    /// Semantics: `v = *p; if v != 0 { *p = 0; for (off,f): *(p+off) += v*f; for off in sets: *(p+off) = 0; }`
+    ///
+    /// The `v == 0` guard is a correctness requirement: the original loop
+    /// body never executes when the head cell is zero, so the `sets` must
+    /// not fire either.
+    LinearMulWithSets {
+        factors: Vec<(isize, i32)>,
+        sets: Vec<isize>,
+    },
+
     /// While the current cell is non-zero, move the pointer by `dir` (−1 or +1). Matches `[<]` / `[>]`.
     Scan(isize),
 

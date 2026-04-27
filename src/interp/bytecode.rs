@@ -33,6 +33,17 @@ pub(crate) struct LinearMulPlan {
     pub(crate) factors: Box<[(i32, i16)]>,
 }
 
+/// Packed factor + set list for a `LinearMulWithSets` op.
+///
+/// Same layout as [`LinearMulPlan`] for the factor columns, plus a
+/// `Box<[i32]>` of offsets that are unconditionally zeroed (only when
+/// the head cell is non-zero).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LinearMulWithSetsPlan {
+    pub(crate) factors: Box<[(i32, i16)]>,
+    pub(crate) sets: Box<[i32]>,
+}
+
 /// Superinstruction form used by the HIR interpreter.
 ///
 /// Every variant carries all state the dispatch handler needs so the engine
@@ -58,6 +69,9 @@ pub(crate) enum InterpOp {
     /// Execute a `LinearMul` plan: scale-and-add several offsets by the
     /// current cell value, then zero the head cell.
     LinearMul(Arc<LinearMulPlan>),
+    /// Like [`LinearMul`](Self::LinearMul), but also zeroes a set of offsets
+    /// when the head cell is non-zero. Guarded by `v != 0`.
+    LinearMulWithSets(Arc<LinearMulWithSetsPlan>),
     /// `[<]` / `[>]`: while `*p != 0`, advance the pointer by `dir` (±1).
     Scan(i8),
     /// `[`: if `*p == 0`, jump to `end_pc + 1`. Otherwise fall through.
@@ -91,15 +105,16 @@ impl InterpOp {
             InterpOp::GetByte => 5,
             InterpOp::Zero => 6,
             InterpOp::LinearMul(_) => 7,
-            InterpOp::Scan(_) => 8,
-            InterpOp::LoopStart { .. } => 9,
-            InterpOp::LoopEnd { .. } => 10,
+            InterpOp::LinearMulWithSets(_) => 8,
+            InterpOp::Scan(_) => 9,
+            InterpOp::LoopStart { .. } => 10,
+            InterpOp::LoopEnd { .. } => 11,
         }
     }
 }
 
 /// Number of distinct [`InterpOp`] tags. Sizes the dispatch table.
-pub(crate) const INTERP_OP_TAG_COUNT: usize = 11;
+pub(crate) const INTERP_OP_TAG_COUNT: usize = 12;
 
 /// A program in interpreter-bytecode form.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

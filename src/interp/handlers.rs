@@ -20,7 +20,9 @@
 //! Loop entry/exit uses the `end_pc` / `start_pc` fields baked in by the
 //! bytecode lowering pass.
 
-use crate::interp::bytecode::{INTERP_OP_TAG_COUNT, InterpOp, LinearMulPlan};
+use crate::interp::bytecode::{
+    INTERP_OP_TAG_COUNT, InterpOp, LinearMulPlan, LinearMulWithSetsPlan,
+};
 use crate::interp::engine::{Interpreter, RuntimeError};
 use crate::runtime::host::HostRuntime;
 use crate::runtime::io::RuntimeIo;
@@ -160,6 +162,42 @@ fn exec_linear_mul<I: RuntimeIo, H: HostRuntime>(
     }
 }
 
+fn handle_linear_mul_with_sets<I: RuntimeIo, H: HostRuntime>(
+    interp: &mut Interpreter<I, H>,
+    op: &InterpOp,
+    pc: usize,
+) -> Result<usize, RuntimeError> {
+    if let InterpOp::LinearMulWithSets(plan) = op {
+        exec_linear_mul_with_sets(interp, plan);
+        Ok(pc + 1)
+    } else {
+        unreachable!("dispatch invariant: handle_linear_mul_with_sets only for LinearMulWithSets")
+    }
+}
+
+#[inline]
+fn exec_linear_mul_with_sets<I: RuntimeIo, H: HostRuntime>(
+    interp: &mut Interpreter<I, H>,
+    plan: &LinearMulWithSetsPlan,
+) {
+    let v = interp.tape.current();
+    if v == 0 {
+        return;
+    }
+    interp.tape.set_current(0);
+    for (off, f) in plan.factors.iter() {
+        let delta = match *f {
+            1 => v as i32,
+            -1 => -(v as i32),
+            f => mul_add_delta_u8(v, f as i32),
+        };
+        interp.tape.add_at(*off as isize, delta);
+    }
+    for off in plan.sets.iter() {
+        interp.tape.set_at(*off as isize, 0);
+    }
+}
+
 fn handle_scan<I: RuntimeIo, H: HostRuntime>(
     interp: &mut Interpreter<I, H>,
     op: &InterpOp,
@@ -214,16 +252,17 @@ fn handle_loop_end<I: RuntimeIo, H: HostRuntime>(
 pub(crate) fn dispatch_table<I: RuntimeIo, H: HostRuntime>() -> [Handler<I, H>; INTERP_OP_TAG_COUNT]
 {
     [
-        handle_move::<I, H>,       // 0: Move
-        handle_add::<I, H>,        // 1: Add
-        handle_move_add::<I, H>,   // 2: MoveAdd
-        handle_zero_move::<I, H>,  // 3: ZeroMove
-        handle_put_byte::<I, H>,   // 4: PutByte
-        handle_get_byte::<I, H>,   // 5: GetByte
-        handle_zero::<I, H>,       // 6: Zero
-        handle_linear_mul::<I, H>, // 7: LinearMul
-        handle_scan::<I, H>,       // 8: Scan
-        handle_loop_start::<I, H>, // 9: LoopStart
-        handle_loop_end::<I, H>,   // 10: LoopEnd
+        handle_move::<I, H>,                 // 0: Move
+        handle_add::<I, H>,                  // 1: Add
+        handle_move_add::<I, H>,             // 2: MoveAdd
+        handle_zero_move::<I, H>,            // 3: ZeroMove
+        handle_put_byte::<I, H>,             // 4: PutByte
+        handle_get_byte::<I, H>,             // 5: GetByte
+        handle_zero::<I, H>,                 // 6: Zero
+        handle_linear_mul::<I, H>,           // 7: LinearMul
+        handle_linear_mul_with_sets::<I, H>, // 8: LinearMulWithSets
+        handle_scan::<I, H>,                 // 9: Scan
+        handle_loop_start::<I, H>,           // 10: LoopStart
+        handle_loop_end::<I, H>,             // 11: LoopEnd
     ]
 }

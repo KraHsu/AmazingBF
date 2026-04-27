@@ -316,7 +316,39 @@ pub fn compile_lir_to_asm(lir: &LirProgram) -> AsmProgram {
                 verified_window = None;
             }
 
-            // Scan: `while *p { < or > }` (`[<]` / `[>]`).
+            // LinearMulWithSets: like LinearMul but with a v!=0 guard and
+            // unconditional zero-writes at `sets` offsets.
+            LirInst::LinearMulWithSets { factors, sets } => {
+                let done_label = fresh_internal_label(&mut next_internal_label);
+                out.push(AsmInst::CmpMem8Imm8(Reg64::R13, 0));
+                out.push(AsmInst::Jz(done_label));
+                out.push(AsmInst::Push(Reg64::Rbx));
+                out.push(AsmInst::MovzxEbxFromMemR13);
+                out.push(AsmInst::MovMem8Imm8(Reg64::R13, 0));
+                for (off, f) in factors {
+                    emit_ptr_add_out(&mut out, &mut next_internal_label, *off, ensure_tape_label);
+                    let f_mod = ((f % 256) + 256) % 256;
+                    match f_mod {
+                        0 => {}
+                        1 => out.push(AsmInst::AddMemR13Bl),
+                        255 => out.push(AsmInst::SubMemR13Bl),
+                        _ => {
+                            out.push(AsmInst::MovEaxEbx);
+                            out.push(AsmInst::ImulEaxEbxImm32(*f));
+                            out.push(AsmInst::AddMemR13Al);
+                        }
+                    }
+                    emit_ptr_add_out(&mut out, &mut next_internal_label, -*off, ensure_tape_label);
+                }
+                for off in sets {
+                    emit_ptr_add_out(&mut out, &mut next_internal_label, *off, ensure_tape_label);
+                    out.push(AsmInst::MovMem8Imm8(Reg64::R13, 0));
+                    emit_ptr_add_out(&mut out, &mut next_internal_label, -*off, ensure_tape_label);
+                }
+                out.push(AsmInst::Pop(Reg64::Rbx));
+                out.push(AsmInst::Label(done_label));
+                verified_window = None;
+            }
             LirInst::Scan(dir) => {
                 let step = *dir;
                 debug_assert!(step == 1 || step == -1, "Scan step must be ±1");

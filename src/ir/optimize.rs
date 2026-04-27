@@ -7,7 +7,7 @@
 //! input). Every pass is driven from the entry point
 //! `optimize_program_for_opt_level`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::ir::analysis::dataflow::Transfer;
 use crate::ir::analysis::tape_state::TapeState;
@@ -185,6 +185,7 @@ fn try_linear_loop(body: &[HirInst]) -> Option<Vec<(isize, i32)>> {
             | HirInst::GetByte
             | HirInst::Zero
             | HirInst::LinearMul(_)
+            | HirInst::LinearMulWithSets { .. }
             | HirInst::Scan(_) => return None,
         }
     }
@@ -205,6 +206,78 @@ fn try_linear_loop(body: &[HirInst]) -> Option<Vec<(isize, i32)>> {
         .collect();
     factors.sort_by_key(|(o, _)| *o);
     Some(factors)
+}
+
+type LinearMulWithSetsParts = (Vec<(isize, i32)>, Vec<isize>);
+
+/// Like [`try_linear_loop`], but also accepts `Zero` writes at non-head
+/// offsets. Returns `None` when the body is pure-affine (no `Zero` at all)
+/// so the caller can fall back to the cheaper `LinearMul` path.
+///
+/// Rejects:
+/// - body containing `Loop` / `PutByte` / `GetByte` / `Scan` / `LinearMul`
+///   (P2 will relax `LinearMul`)
+/// - unbalanced pointer (`net_ptr != 0`)
+/// - head cell (offset 0) being zeroed
+/// - same offset appearing in both `delta` and `zeroed`
+/// - even head-cell delta (non-invertible mod 256)
+fn try_linear_loop_with_sets(body: &[HirInst]) -> Option<LinearMulWithSetsParts> {
+    let mut ptr: isize = 0;
+    let mut delta: BTreeMap<isize, i32> = BTreeMap::new();
+    let mut zeroed: BTreeSet<isize> = BTreeSet::new();
+
+    for inst in body {
+        match inst {
+            HirInst::Move(d) => ptr += *d,
+            HirInst::Add(k) => {
+                *delta.entry(ptr).or_insert(0) += k;
+            }
+            HirInst::Zero => {
+                zeroed.insert(ptr);
+            }
+            HirInst::Loop(_)
+            | HirInst::PutByte
+            | HirInst::GetByte
+            | HirInst::LinearMul(_)
+            | HirInst::LinearMulWithSets { .. }
+            | HirInst::Scan(_) => return None,
+        }
+    }
+
+    if zeroed.is_empty() {
+        return None;
+    }
+
+    if ptr != 0 {
+        return None;
+    }
+
+    if zeroed.contains(&0) {
+        return None;
+    }
+
+    for off in &zeroed {
+        if delta.contains_key(off) {
+            return None;
+        }
+    }
+
+    let d0 = *delta.get(&0).unwrap_or(&0);
+    let inv = invmod_256(d0)?;
+    let scale = (256 - inv).rem_euclid(256);
+
+    let mut factors: Vec<(isize, i32)> = delta
+        .into_iter()
+        .filter(|(off, _)| *off != 0)
+        .map(|(off, f)| (off, f.wrapping_mul(scale)))
+        .filter(|(_, f)| f.rem_euclid(256) != 0)
+        .collect();
+    factors.sort_by_key(|(o, _)| *o);
+
+    let mut sets: Vec<isize> = zeroed.into_iter().collect();
+    sets.sort();
+
+    Some((factors, sets))
 }
 
 fn try_scan_loop(body: &[HirInst]) -> Option<isize> {
@@ -246,13 +319,19 @@ fn try_unroll_known_head(env: &TapeState, inner: &[HirInst]) -> Option<Vec<HirIn
     if v == 0 {
         return None;
     }
-    let factors = try_linear_loop(inner)?;
+    if let Some(factors) = try_linear_loop(inner) {
+        return Some(unroll_factors(v, &factors));
+    }
+    if let Some((factors, sets)) = try_linear_loop_with_sets(inner) {
+        return Some(unroll_factors_with_sets(v, &factors, &sets));
+    }
+    None
+}
+
+fn unroll_factors(v: u8, factors: &[(isize, i32)]) -> Vec<HirInst> {
     let mut out: Vec<HirInst> = Vec::with_capacity(factors.len() * 2 + 2);
     let mut cur: isize = 0;
-    for (off, f) in &factors {
-        // `LinearMul` semantics: *(p + off) += v * f (mod 256).  With `v`
-        // known, fold to a constant `Add`.  `as i8 as i32` canonicalises
-        // the wrapped byte delta into `-128..=127`.
+    for (off, f) in factors {
         let delta = (v as i32).wrapping_mul(*f) as i8 as i32;
         if delta == 0 {
             continue;
@@ -268,7 +347,37 @@ fn try_unroll_known_head(env: &TapeState, inner: &[HirInst]) -> Option<Vec<HirIn
         out.push(HirInst::Move(-cur));
     }
     out.push(HirInst::Zero);
-    Some(out)
+    out
+}
+
+fn unroll_factors_with_sets(v: u8, factors: &[(isize, i32)], sets: &[isize]) -> Vec<HirInst> {
+    let mut out: Vec<HirInst> = Vec::with_capacity(factors.len() * 2 + sets.len() * 2 + 2);
+    let mut cur: isize = 0;
+    for (off, f) in factors {
+        let delta = (v as i32).wrapping_mul(*f) as i8 as i32;
+        if delta == 0 {
+            continue;
+        }
+        let step = off - cur;
+        if step != 0 {
+            out.push(HirInst::Move(step));
+        }
+        out.push(HirInst::Add(delta));
+        cur = *off;
+    }
+    for off in sets {
+        let step = off - cur;
+        if step != 0 {
+            out.push(HirInst::Move(step));
+        }
+        out.push(HirInst::Zero);
+        cur = *off;
+    }
+    if cur != 0 {
+        out.push(HirInst::Move(-cur));
+    }
+    out.push(HirInst::Zero);
+    out
 }
 
 fn try_loop_specialize(inner: &[HirInst]) -> Option<HirInst> {
@@ -283,6 +392,12 @@ fn try_loop_specialize(inner: &[HirInst]) -> Option<HirInst> {
             return Some(HirInst::Zero);
         }
         return Some(HirInst::LinearMul(factors));
+    }
+    if let Some((factors, sets)) = try_linear_loop_with_sets(inner) {
+        if factors.is_empty() && sets.is_empty() {
+            return Some(HirInst::Zero);
+        }
+        return Some(HirInst::LinearMulWithSets { factors, sets });
     }
     None
 }
@@ -884,6 +999,178 @@ mod tests {
             insts: vec![HirInst::Loop(vec![
                 HirInst::Loop(vec![HirInst::Add(-1)]),
                 HirInst::Move(1),
+            ])],
+        };
+        let o = optimize_o1(p);
+        assert!(o.insts.is_empty(), "expected empty, got {:?}", o.insts);
+    }
+
+    // ---- B7-α-P1: try_linear_loop_with_sets ----
+
+    #[test]
+    fn b7a_hanoi_pattern() {
+        // hanoi hot loop: [Add(-1) Move(1) Zero Move(1) Add(1) Move(-2)]
+        let body = vec![
+            HirInst::Add(-1),
+            HirInst::Move(1),
+            HirInst::Zero,
+            HirInst::Move(1),
+            HirInst::Add(1),
+            HirInst::Move(-2),
+        ];
+        let result = try_linear_loop_with_sets(&body);
+        assert!(result.is_some(), "should accept hanoi pattern");
+        let (factors, sets) = result.unwrap();
+        assert_eq!(sets, vec![1]);
+        assert_eq!(factors.len(), 1);
+        assert_eq!(factors[0].0, 2); // offset 2
+        assert_eq!(factors[0].1.rem_euclid(256), 1); // factor 1
+    }
+
+    #[test]
+    fn b7a_rejects_head_zeroed() {
+        // Zero at offset 0 (head cell) → reject
+        let body = vec![HirInst::Zero, HirInst::Add(-1)];
+        assert!(try_linear_loop_with_sets(&body).is_none());
+    }
+
+    #[test]
+    fn b7a_rejects_overlap_add_and_zero() {
+        // Same offset has both Add and Zero → reject
+        let body = vec![
+            HirInst::Add(-1),
+            HirInst::Move(1),
+            HirInst::Add(3),
+            HirInst::Zero,
+            HirInst::Move(-1),
+        ];
+        assert!(try_linear_loop_with_sets(&body).is_none());
+    }
+
+    #[test]
+    fn b7a_rejects_unbalanced_pointer() {
+        let body = vec![HirInst::Add(-1), HirInst::Move(1), HirInst::Zero];
+        assert!(try_linear_loop_with_sets(&body).is_none());
+    }
+
+    #[test]
+    fn b7a_rejects_even_head_delta() {
+        let body = vec![
+            HirInst::Add(-2),
+            HirInst::Move(1),
+            HirInst::Zero,
+            HirInst::Move(-1),
+        ];
+        assert!(try_linear_loop_with_sets(&body).is_none());
+    }
+
+    #[test]
+    fn b7a_returns_none_for_pure_affine() {
+        // No Zero in body → returns None (let try_linear_loop handle it)
+        let body = vec![
+            HirInst::Add(-1),
+            HirInst::Move(1),
+            HirInst::Add(1),
+            HirInst::Move(-1),
+        ];
+        assert!(try_linear_loop_with_sets(&body).is_none());
+    }
+
+    #[test]
+    fn b7a_multiple_sets() {
+        // Two Zero writes at different offsets
+        let body = vec![
+            HirInst::Add(-1),
+            HirInst::Move(1),
+            HirInst::Zero,
+            HirInst::Move(1),
+            HirInst::Zero,
+            HirInst::Move(1),
+            HirInst::Add(1),
+            HirInst::Move(-3),
+        ];
+        let result = try_linear_loop_with_sets(&body);
+        assert!(result.is_some());
+        let (factors, sets) = result.unwrap();
+        assert_eq!(sets, vec![1, 2]);
+        assert_eq!(factors.len(), 1);
+        assert_eq!(factors[0].0, 3);
+    }
+
+    #[test]
+    fn b7a_odd_negative_head_delta() {
+        // Head delta = -3 (odd, invertible mod 256)
+        let body = vec![
+            HirInst::Add(-3),
+            HirInst::Move(1),
+            HirInst::Zero,
+            HirInst::Move(-1),
+        ];
+        let result = try_linear_loop_with_sets(&body);
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn b7a_optimizer_produces_linear_mul_with_sets() {
+        // Full pipeline: GetByte [Add(-1) Move(1) Zero Move(-1)]
+        let p = HirProgram {
+            insts: vec![
+                HirInst::GetByte,
+                HirInst::Loop(vec![
+                    HirInst::Add(-1),
+                    HirInst::Move(1),
+                    HirInst::Zero,
+                    HirInst::Move(-1),
+                ]),
+            ],
+        };
+        let o = optimize_o1(p);
+        assert!(
+            matches!(
+                o.insts.as_slice(),
+                [HirInst::GetByte, HirInst::LinearMulWithSets { .. }]
+            ),
+            "expected [GetByte, LinearMulWithSets], got {:?}",
+            o.insts
+        );
+    }
+
+    #[test]
+    fn b7a_unroll_known_head_with_sets() {
+        // Known head value + LinearMulWithSets body → unrolled
+        let p = HirProgram {
+            insts: vec![
+                HirInst::Add(5),
+                HirInst::Loop(vec![
+                    HirInst::Add(-1),
+                    HirInst::Move(1),
+                    HirInst::Zero,
+                    HirInst::Move(1),
+                    HirInst::Add(1),
+                    HirInst::Move(-2),
+                ]),
+            ],
+        };
+        let o = optimize_o2(p);
+        // Should be unrolled: no Loop or LinearMulWithSets in output
+        assert!(
+            !o.insts
+                .iter()
+                .any(|i| matches!(i, HirInst::Loop(_) | HirInst::LinearMulWithSets { .. })),
+            "expected unrolled output, got {:?}",
+            o.insts
+        );
+    }
+
+    #[test]
+    fn b7a_zero_head_drops_loop_with_sets_body() {
+        // Head known zero → B2 drops the loop entirely
+        let p = HirProgram {
+            insts: vec![HirInst::Loop(vec![
+                HirInst::Add(-1),
+                HirInst::Move(1),
+                HirInst::Zero,
+                HirInst::Move(-1),
             ])],
         };
         let o = optimize_o1(p);

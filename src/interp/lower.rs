@@ -16,7 +16,7 @@
 
 use std::sync::Arc;
 
-use crate::interp::bytecode::{InterpOp, InterpProgram, LinearMulPlan};
+use crate::interp::bytecode::{InterpOp, InterpProgram, LinearMulPlan, LinearMulWithSetsPlan};
 use crate::ir::hir::{HirInst, HirProgram};
 
 /// Lower a [`HirProgram`] to a flat [`InterpProgram`] with resolved jump
@@ -78,6 +78,26 @@ fn lower_block(insts: &[HirInst], ops: &mut Vec<InterpOp>, loop_stack: &mut Vec<
                 ops.push(InterpOp::LinearMul(Arc::new(LinearMulPlan {
                     factors: packed,
                 })));
+            }
+            HirInst::LinearMulWithSets { factors, sets } => {
+                let packed_factors: Box<[(i32, i16)]> = factors
+                    .iter()
+                    .map(|(off, f)| {
+                        let off = clamp_i32("LinearMulWithSets offset", *off);
+                        let f = clamp_i16_mod256("LinearMulWithSets factor", *f);
+                        (off, f)
+                    })
+                    .collect();
+                let packed_sets: Box<[i32]> = sets
+                    .iter()
+                    .map(|off| clamp_i32("LinearMulWithSets set offset", *off))
+                    .collect();
+                ops.push(InterpOp::LinearMulWithSets(Arc::new(
+                    LinearMulWithSetsPlan {
+                        factors: packed_factors,
+                        sets: packed_sets,
+                    },
+                )));
             }
             HirInst::Scan(dir) => {
                 let step: i8 = match dir.signum() {

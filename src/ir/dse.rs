@@ -91,6 +91,10 @@ fn dse_block(insts: Vec<HirInst>) -> Vec<HirInst> {
                 pending.clear();
                 out.push(Some(HirInst::LinearMul(factors)));
             }
+            HirInst::LinearMulWithSets { factors, sets } => {
+                pending.clear();
+                out.push(Some(HirInst::LinearMulWithSets { factors, sets }));
+            }
         }
     }
 
