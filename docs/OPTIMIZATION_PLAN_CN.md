@@ -19,23 +19,29 @@
 - **O3**：不是独立 HIR pass，在 `src/driver/run.rs:138-176` 做整程序折叠（无 `PutByte` → `exit(0)`；无 `GetByte` → 离线跑完再 `write + exit`）
 - **分析基础设施**：`src/ir/analysis/` 下的 A1 `TapeState` / A2 `LoopEffect` / A3 `CellLattice` 四点格 / A4 `run_forward` forward dataflow 骨架全部落地（57 单元测试覆盖）。A1 + A3 已接入 O1 常量传播（A3 的 `add_wrapping` 驱动 `TapeState::apply` 的 `Add` 分支）；A3 `is_zero` 进一步驱动 B2 `Loop` 丢弃与 B6 小循环展开。A2 / A4 仍是待接入的基础设施——`run_forward` 的跨循环 fixpoint 精度留给 B5 LICM；`LoopEffect` 是 B7 K6 的前置
 
-### 1.2 LIR 层（`src/ir/lir.rs`, `src/ir/lower.rs`）
+### 1.2 LIR 层（`src/ir/lir.rs`, `src/ir/lower.rs`, `src/ir/lir_opt.rs`, `src/ir/lir_postpone.rs`, `src/ir/lir_scan_hint.rs`）
 
-- LIR 变体：`PtrAdd` / `CellAdd` / `CellSet` / `LinearMul` / `Scan` / `PutByte` / `GetByte` / `Label` / `JumpIfZero` / `JumpIfNonZero`
-- `lower_to_lir_block`（`lower.rs:48-82`）纯机械下降，只剔除零 delta
-- **无 peephole、无 scheduling、无 bounds-check 聚合**
+- LIR 变体：`PtrAdd` / `PtrAddChecked { delta, lo_extent, hi_extent }` / `CellAdd` / `CellSet` / `CellAddAt { off, delta }` / `CellSetAt { off, val }` / `ZeroRun { start, count }` / `LinearMul` / `LinearMulWithSets` / `Scan` / `ScanWithHint { dir, hint_bytes }` / `PutByte` / `GetByte` / `Label` / `JumpIfZero` / `JumpIfNonZero`
+- `lower_to_lir`（`lower.rs`）纯机械下降，只剔除零 delta
+- `-O1` 及以上经三轮 LIR pass：`postpone_pointer_adds`（B4 指针延后，产出 `CellAddAt` / `CellSetAt` displacement 写）→ `optimize_lir`（C1 peephole：合并相邻 `PtrAdd` / `PtrAddChecked`、折叠 `CellSet(0);CellAdd(k)` → `CellSet(k)`、同 offset `CellAddAt` / `CellSetAt` 折叠、`Zero` 连续段合并为 `ZeroRun`）→ `promote_scan_hints`（C4 将 bounds-check 窗口内的 `Scan` 升格为 `ScanWithHint`）
+- C2 bounds-check batching 通过 `PtrAddChecked` 承载区间语义，后端维护 "已验证窗口" 状态机省略冗余 bounds check
 
-### 1.3 Backend（`src/backend/codegen.rs`, `src/backend/x86_64/`）
+### 1.3 Backend（`src/backend/codegen.rs`, `src/backend/codegen_common.rs`, `src/backend/x86_64/`）
 
-- 固定寄存器：`R12 = tape_base` / `R13 = data_ptr` / `R14 = tape_end` / `R15 = scratch`（`asm.rs:16-33`）
-- 每个 `PtrAdd` ≈ 12 指令 fast path（`codegen.rs:78-107`），越界走 `ensure_tape_contains_r15`（`codegen.rs:442-563`）
-- 每个 `.` / `,` 对应一个 `write` / `read` syscall 或 `WriteFile` / `ReadFile`（`codegen.rs:204-231`, `windows.rs:518-572`）
-- 跳转一律 5 字节 `rel32`；无 `inc` / `dec` 选择；无 SIMD；无 codegen peephole
+- 固定寄存器：`R12 = tape_base` / `R13 = data_ptr` / `R14 = tape_end` / `R15 = scratch`；`Rbx = output_buf_ptr` / `Rbp = output_buf_end`（D3 buffered I/O）
+- G1 共享 codegen：`codegen_common.rs` 的 `PlatformEmitter` trait 抽象 `emit_put_byte` / `emit_get_byte` / `needs_rsp_alignment()` 三个 ABI 差异点；`emit_lir_body()` 覆盖所有 ABI 无关的 LIR→AsmInst 翻译
+- D1 指令选择：`CellAdd(±1)` → `inc` / `dec`（4 字节短形）；`add/and/cmp r, imm` 自动选 `imm8`（4 字节）或 `imm32`（7 字节）；`relax.rs` 迭代收缩长跳 `rel32` → 短跳 `rel8`
+- D2 SIMD 专用形式：`ScanWithHint` → `repne scasb`（D2a）；`ZeroRun(count≥16)` → `rep stosb`（D2b）；`LinearMul` factor ±1 列 → `add/sub [r13], bl`（D2c）；`LinearMul` / `LinearMulWithSets` 批量 bounds-check + displacement 写（D2d）
+- D3 buffered I/O：4 KiB 输出缓冲区（`mmap` 匿名页），`PutByte` 热路径 ~20 字节（1/4096 触发 `write` syscall）；`GetByte` 前 flush；Linux / Windows 双端对称
+- D4 冗余 mov 消除：`LinearMul` 非 ±1 列移除多余的 `mov eax, ebx`
+- D5 分支提示前缀：`Jz` 前置 `0x2E`（not-taken）、`Jnz` 前置 `0x3E`（taken）；loop 头 `Label` 前插 `Align16` 伪指令（多字节 NOP 填充）
 
 ### 1.4 Interpreter + Runtime（`src/interp/engine.rs`, `src/runtime/`）
 
 - **E1 / E2 已落地**：HIR 先经 `src/interp/lower.rs::lower_hir_to_bytecode` 下降到 `src/interp/bytecode.rs::InterpOp` 超级指令流（含 `MoveAdd` / `ZeroMove` 融合，`LoopStart` / `LoopEnd` 携绝对 pc），再由 `engine.rs::exec_bytecode` 用 `src/interp/handlers.rs` 的 tag-indexed 函数指针表派发；原递归 `exec_block` + 单层 `match` 已整体替换
-- `Tape` 用 `Vec<u8>` 左右拼接（`tape.rs:34-209`），`Vec::resize` 同步增长；**与 `CLAUDE.md` 所述 “mmap + doubling” 不一致**
+- **E3 已落地**：`LinearMul` handler 对 factor ±1 列短路，跳过 `wrapping_mul` / `rem_euclid`；所有 factor 统一走 `Tape::add_at(off, delta)` 而非三联 `move_ptr(off); add_current; move_ptr(-off)`
+- **E4 已落地**：`Tape` 用 `Vec<u8>` 左右拼接，几何倍增（`new_len = max(needed, old_len * 2)`），均摊 O(1) 每访问格
+- **D3 解释器侧已落地**：`BufferedStdIo` 以 4 KiB `BufWriter<Stdout>` + `BufReader<Stdin>` 包住进程 stdio；`Interpreter::run()` 尾部显式 `io.flush()?`
 - 基准基础设施（E5）已落地：`benches/standard_suite.rs`（Criterion，matslina 套件的解释/执行）与 `benches/compile_levels.rs`（自定义 harness，`tests/cases/*.bf` 的编译+运行耗时总表）。`tests/compile_artifacts.rs` 仅做产物正确性校验
 
 ---

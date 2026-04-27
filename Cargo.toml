@@ -1,3 +1,7 @@
+[workspace]
+members = [".", "crates/jit"]
+resolver = "3"
+
 [package]
 name = "AmazingBF"
 version = "0.3.0+10code"
@@ -15,6 +19,9 @@ required-features = ["gui"]
 
 [dependencies]
 tauri = { version = "2", optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+amazingbf-jit = { path = "crates/jit" }
 
 [dev-dependencies]
 assert_cmd = "2.2.0"

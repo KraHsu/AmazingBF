@@ -51,6 +51,8 @@ pub(crate) fn run(config: DriverConfig) -> Result<()> {
         RunMode::Interpret => run_interpret(&config, &frontend.hir)?,
         RunMode::Compile => run_compile(&config, &frontend.hir)?,
         RunMode::Dump => run_dump(&frontend.hir, config.opt_level),
+        #[cfg(target_os = "linux")]
+        RunMode::Jit => run_jit(&config, &frontend.hir)?,
     }
 
     log_info("pipeline finished");
@@ -200,4 +202,20 @@ fn build_optimized_lir(hir: &HirProgram, opt_level: OptLevel) -> LirProgram {
     } else {
         promote_scan_hints(optimize_lir(postpone_pointer_adds(lowered)))
     }
+}
+
+#[cfg(target_os = "linux")]
+fn run_jit(config: &DriverConfig, hir: &HirProgram) -> Result<()> {
+    let asm = relax_jumps(compile_linux_asm(hir, config.opt_level)?);
+    let encoded = crate::backend::x86_64::encode::encode_program(&asm);
+    log_debug(format!(
+        "jit: encoded x86_64 machine code (text_bytes={})",
+        encoded.text.len()
+    ));
+    let buf = amazingbf_jit::JitBuffer::new(&encoded.text)
+        .map_err(|e| crate::error::Error::Jit(e.to_string()))?;
+    log_info("jit: executing compiled code");
+    buf.execute()
+        .map_err(|e| crate::error::Error::Jit(e.to_string()))?;
+    Ok(())
 }

@@ -1,0 +1,9 @@
+[package]
+name = "amazingbf-jit"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+description = "JIT execution buffer for AmazingBF — mmap/mprotect/munmap via raw syscalls."
+
+[lints.rust]
+unsafe_code = "deny"

@@ -19,23 +19,29 @@ This document is the modernization roadmap for the AmazingBF toolchain's compila
 - **O3**: not a standalone HIR pass; `src/driver/run.rs:138-176` performs whole-program folding (no `PutByte` → `exit(0)`; no `GetByte` → run offline then `write + exit`)
 - **Analysis infrastructure**: under `src/ir/analysis/`, all of A1 `TapeState` / A2 `LoopEffect` / A3 `CellLattice` four-point lattice / A4 `run_forward` forward dataflow skeleton are in place (57 unit tests). A1 + A3 drive O1's constant propagation (A3's `add_wrapping` powers the `Add` arm of `TapeState::apply`); A3 `is_zero` further drives B2 `Loop` drops and B6 small-loop unrolling. A2 / A4 remain pending — `run_forward`'s per-loop fixed-point precision is reserved for B5 LICM; `LoopEffect` is the prerequisite for B7 K6
 
-### 1.2 LIR layer (`src/ir/lir.rs`, `src/ir/lower.rs`)
+### 1.2 LIR layer (`src/ir/lir.rs`, `src/ir/lower.rs`, `src/ir/lir_opt.rs`, `src/ir/lir_postpone.rs`, `src/ir/lir_scan_hint.rs`)
 
-- LIR variants: `PtrAdd` / `CellAdd` / `CellSet` / `LinearMul` / `Scan` / `PutByte` / `GetByte` / `Label` / `JumpIfZero` / `JumpIfNonZero`
-- `lower_to_lir_block` (`lower.rs:48-82`) is a pure mechanical lowering that only drops zero deltas
-- **No peephole, no scheduling, no bounds-check aggregation**
+- LIR variants: `PtrAdd` / `PtrAddChecked { delta, lo_extent, hi_extent }` / `CellAdd` / `CellSet` / `CellAddAt { off, delta }` / `CellSetAt { off, val }` / `ZeroRun { start, count }` / `LinearMul` / `LinearMulWithSets` / `Scan` / `ScanWithHint { dir, hint_bytes }` / `PutByte` / `GetByte` / `Label` / `JumpIfZero` / `JumpIfNonZero`
+- `lower_to_lir` (`lower.rs`) is a pure mechanical lowering that only drops zero deltas
+- At `-O1` and above, three LIR passes run in sequence: `postpone_pointer_adds` (B4 pointer postponement, producing `CellAddAt` / `CellSetAt` displacement writes) → `optimize_lir` (C1 peephole: merge adjacent `PtrAdd` / `PtrAddChecked`, fold `CellSet(0);CellAdd(k)` → `CellSet(k)`, same-offset `CellAddAt` / `CellSetAt` folding, consecutive `Zero` merged into `ZeroRun`) → `promote_scan_hints` (C4 promotes `Scan` within a bounds-check window to `ScanWithHint`)
+- C2 bounds-check batching is carried by `PtrAddChecked`; the backend maintains a "verified window" state machine to elide redundant bounds checks
 
-### 1.3 Backend (`src/backend/codegen.rs`, `src/backend/x86_64/`)
+### 1.3 Backend (`src/backend/codegen.rs`, `src/backend/codegen_common.rs`, `src/backend/x86_64/`)
 
-- Fixed register assignment: `R12 = tape_base` / `R13 = data_ptr` / `R14 = tape_end` / `R15 = scratch` (`asm.rs:16-33`)
-- Each `PtrAdd` ≈ 12-instruction fast path (`codegen.rs:78-107`); out-of-range cases call `ensure_tape_contains_r15` (`codegen.rs:442-563`)
-- Each `.` / `,` maps to a `write` / `read` syscall or `WriteFile` / `ReadFile` (`codegen.rs:204-231`, `windows.rs:518-572`)
-- All jumps are 5-byte `rel32`; no `inc` / `dec` selection; no SIMD; no codegen peephole
+- Fixed register assignment: `R12 = tape_base` / `R13 = data_ptr` / `R14 = tape_end` / `R15 = scratch`; `Rbx = output_buf_ptr` / `Rbp = output_buf_end` (D3 buffered I/O)
+- G1 shared codegen: `codegen_common.rs`'s `PlatformEmitter` trait abstracts `emit_put_byte` / `emit_get_byte` / `needs_rsp_alignment()` (the three ABI-specific hooks); `emit_lir_body()` covers all ABI-neutral LIR→AsmInst translation
+- D1 instruction selection: `CellAdd(±1)` → `inc` / `dec` (4-byte short form); `add/and/cmp r, imm` auto-selects `imm8` (4 bytes) or `imm32` (7 bytes); `relax.rs` iteratively shrinks long `rel32` jumps to short `rel8`
+- D2 SIMD specializations: `ScanWithHint` → `repne scasb` (D2a); `ZeroRun(count≥16)` → `rep stosb` (D2b); `LinearMul` factor ±1 columns → `add/sub [r13], bl` (D2c); `LinearMul` / `LinearMulWithSets` batch bounds-check + displacement writes (D2d)
+- D3 buffered I/O: 4 KiB output buffer (`mmap` anonymous page); `PutByte` hot path ~20 bytes (1/4096 triggers a `write` syscall); `GetByte` flushes first; Linux / Windows symmetric
+- D4 redundant mov elimination: `LinearMul` non-±1 columns drop the superfluous `mov eax, ebx`
+- D5 branch hint prefixes: `Jz` prefixed with `0x2E` (not-taken); `Jnz` prefixed with `0x3E` (taken); loop-head `Label` preceded by `Align16` pseudo-instruction (multi-byte NOP padding)
 
 ### 1.4 Interpreter + Runtime (`src/interp/engine.rs`, `src/runtime/`)
 
 - **E1 / E2 landed**: HIR is first lowered via `src/interp/lower.rs::lower_hir_to_bytecode` to a superinstruction stream in `src/interp/bytecode.rs::InterpOp` (with `MoveAdd` / `ZeroMove` fusion and absolute-pc `LoopStart` / `LoopEnd`); `engine.rs::exec_bytecode` then dispatches through the tag-indexed function-pointer table in `src/interp/handlers.rs`. The former recursive `exec_block` + monolithic `match` has been fully replaced
-- `Tape` uses a `Vec<u8>` with left/right halves spliced together (`tape.rs:34-209`), grown with `Vec::resize`; **inconsistent with the "mmap + doubling" wording in `CLAUDE.md`**
+- **E3 landed**: `LinearMul` handler short-circuits factor ±1 columns, skipping `wrapping_mul` / `rem_euclid`; all factors use `Tape::add_at(off, delta)` instead of the triple `move_ptr(off); add_current; move_ptr(-off)`
+- **E4 landed**: `Tape` uses `Vec<u8>` with left/right halves, geometric doubling (`new_len = max(needed, old_len * 2)`), amortized O(1) per cell access
+- **D3 interpreter side landed**: `BufferedStdIo` wraps process stdio with 4 KiB `BufWriter<Stdout>` + `BufReader<Stdin>`; `Interpreter::run()` explicitly calls `io.flush()?` at the tail
 - Benchmark infrastructure (E5) landed: `benches/standard_suite.rs` (Criterion, interpret/execute the matslina suite) and `benches/compile_levels.rs` (custom harness, compile+run timings for `tests/cases/*.bf`). `tests/compile_artifacts.rs` only checks artifact correctness
 
 ---

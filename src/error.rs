@@ -25,6 +25,9 @@ pub enum Error {
     Runtime(crate::interp::engine::RuntimeError),
     /// Catch-all for errors stringified from other subsystems (e.g. `bfsc`).
     Other(String),
+    /// JIT execution failed (Linux x86_64 only).
+    #[cfg(target_os = "linux")]
+    Jit(String),
 }
 
 impl std::fmt::Display for Error {
@@ -38,6 +41,8 @@ impl std::fmt::Display for Error {
             Error::Optimize(e) => write!(f, "{e}"),
             Error::Runtime(e) => write!(f, "{e}"),
             Error::Other(s) => f.write_str(s),
+            #[cfg(target_os = "linux")]
+            Error::Jit(s) => write!(f, "jit: {s}"),
         }
     }
 }

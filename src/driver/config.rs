@@ -36,6 +36,9 @@ pub(crate) enum RunMode {
     Interpret,
     /// Emit a native executable for `target` plus `.asm` / `.lst` alongside `-o`.
     Compile,
+    /// JIT-compile and execute in-process (Linux x86_64 only).
+    #[cfg(target_os = "linux")]
+    Jit,
 }
 
 impl RunMode {
@@ -45,6 +48,8 @@ impl RunMode {
             "dump" => Some(Self::Dump),
             "interpret" => Some(Self::Interpret),
             "compile" => Some(Self::Compile),
+            #[cfg(target_os = "linux")]
+            "jit" => Some(Self::Jit),
             _ => None,
         }
     }
@@ -55,6 +60,8 @@ impl RunMode {
             Self::Dump => "dump",
             Self::Interpret => "interpret",
             Self::Compile => "compile",
+            #[cfg(target_os = "linux")]
+            Self::Jit => "jit",
         }
     }
 }

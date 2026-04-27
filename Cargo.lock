@@ -6,6 +6,7 @@ version = 4
 name = "AmazingBF"
 version = "0.3.0+10code"
 dependencies = [
+ "amazingbf-jit",
  "assert_cmd",
  "criterion",
  "tauri",
@@ -41,6 +42,10 @@ checksum = "94fb8275041c72129eb51b7d0322c29b8387a0386127718b096429201a5d6ece"
 dependencies = [
  "alloc-no-stdlib",
 ]
+
+[[package]]
+name = "amazingbf-jit"
+version = "0.1.0"
 
 [[package]]
 name = "android_system_properties"
