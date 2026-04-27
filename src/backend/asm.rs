@@ -147,6 +147,10 @@ pub enum AsmInst {
     /// Marks a code position referenced by jumps and calls.
     Label(AsmLabel),
 
+    /// Emit multi-byte NOPs to align the next instruction to a 16-byte
+    /// boundary. D5 loop-head alignment for instruction-fetch throughput.
+    Align16,
+
     /// `mov reg, imm64` — load a 64-bit immediate into a register.
     ///
     /// The only x86_64 form that can load a full 64-bit value directly; the
@@ -445,9 +449,6 @@ pub enum AsmInst {
     /// byte, zero-extending the upper bits.
     MovzxEbxFromMemR13,
 
-    /// `mov eax, ebx` — copy `ebx` to `eax` (upper 32 bits of `rax` cleared).
-    MovEaxEbx,
-
     /// `imul eax, ebx, imm32` — multiply `ebx` by an immediate into `eax`.
     ///
     /// Used only by `-O1 LinearMul`; the low 8 bits of the result match tape
@@ -472,6 +473,26 @@ pub enum AsmInst {
     /// so we go straight to subtraction and skip the imul. Encoding `41 28
     /// 5D 00`.
     SubMemR13Bl,
+
+    /// `add byte [r13 + disp8], bl` — add `bl` into a tape cell at a signed
+    /// 8-bit displacement from the data pointer.
+    ///
+    /// Displacement-form counterpart of [`AsmInst::AddMemR13Bl`], used by
+    /// the batched LinearMul codegen to avoid per-factor pointer movement.
+    AddMemR13BlDisp8(i8),
+
+    /// `sub byte [r13 + disp8], bl` — subtract `bl` from a tape cell at a
+    /// signed 8-bit displacement.
+    ///
+    /// Displacement-form counterpart of [`AsmInst::SubMemR13Bl`].
+    SubMemR13BlDisp8(i8),
+
+    /// `add byte [r13 + disp8], al` — add `al` into a tape cell at a signed
+    /// 8-bit displacement from the data pointer.
+    ///
+    /// Displacement-form counterpart of [`AsmInst::AddMemR13Al`], used by
+    /// the batched LinearMul codegen for non-±1 factor columns after `imul`.
+    AddMemR13AlDisp8(i8),
 
     /// `mov al, byte [r13]` — load the current tape cell into `al`.
     ///

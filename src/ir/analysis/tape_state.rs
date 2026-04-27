@@ -17,6 +17,7 @@
 use std::collections::BTreeMap;
 
 use crate::ir::analysis::lattice::CellLattice;
+use crate::ir::analysis::loop_effect::LoopEffect;
 use crate::ir::hir::HirInst;
 
 /// Symbolic tape state for a straight-line HIR fragment.
@@ -117,8 +118,9 @@ impl TapeState {
     }
 
     /// Drop every known cell fact but keep `ptr`. Used when control flow or
-    /// unanalysed control structures (`Loop` / `Scan` / `LinearMul`) render
-    /// prior cell facts unreliable.
+    /// unanalysed control structures (`Loop` / `Scan`) render prior cell
+    /// facts unreliable. `LinearMul` / `LinearMulWithSets` have precise
+    /// transfer functions and do not use this path.
     pub(crate) fn clobber_all(&mut self) {
         self.cells.clear();
     }
@@ -146,11 +148,80 @@ impl TapeState {
                 self.cells.remove(&self.ptr);
             }
             HirInst::PutByte => { /* pure side effect on stdout */ }
-            HirInst::LinearMul(_)
-            | HirInst::LinearMulWithSets { .. }
-            | HirInst::Scan(_)
-            | HirInst::Loop(_) => {
+            HirInst::LinearMul(factors) => {
+                let head_val = self.lattice_at(self.ptr);
+                self.cells.insert(self.ptr, CellLattice::Zero);
+                for &(off, f) in factors {
+                    let abs_off = self.ptr + off;
+                    match head_val.known_u8() {
+                        Some(v) => {
+                            let delta = (v as i32).wrapping_mul(f);
+                            let cur = self.lattice_at(abs_off);
+                            let next = cur.add_wrapping(delta);
+                            if matches!(next, CellLattice::Top) {
+                                self.cells.remove(&abs_off);
+                            } else {
+                                self.cells.insert(abs_off, next);
+                            }
+                        }
+                        None => {
+                            self.cells.remove(&abs_off);
+                        }
+                    }
+                }
+            }
+            HirInst::LinearMulWithSets { factors, sets } => {
+                let head_lat = self.lattice_at(self.ptr);
+                if head_lat.is_zero() {
+                    // v == 0 → entire instruction is a no-op.
+                } else {
+                    self.cells.insert(self.ptr, CellLattice::Zero);
+                    let head_known = head_lat.known_u8();
+                    for &(off, f) in factors {
+                        let abs_off = self.ptr + off;
+                        match head_known {
+                            Some(v) => {
+                                let delta = (v as i32).wrapping_mul(f);
+                                let cur = self.lattice_at(abs_off);
+                                let next = cur.add_wrapping(delta);
+                                if matches!(next, CellLattice::Top) {
+                                    self.cells.remove(&abs_off);
+                                } else {
+                                    self.cells.insert(abs_off, next);
+                                }
+                            }
+                            None => {
+                                self.cells.remove(&abs_off);
+                            }
+                        }
+                    }
+                    for &off in sets {
+                        let abs_off = self.ptr + off;
+                        if head_lat.is_nonzero() {
+                            self.cells.insert(abs_off, CellLattice::Zero);
+                        } else {
+                            // head is Top: sets may or may not fire
+                            self.cells.remove(&abs_off);
+                        }
+                    }
+                }
+            }
+            HirInst::Scan(_) => {
                 self.clobber_all();
+            }
+            HirInst::Loop(body) => {
+                let eff = LoopEffect::analyze(body);
+                if eff.touched.start == isize::MIN && eff.touched.end == isize::MAX {
+                    self.clobber_all();
+                } else if matches!(eff.net_ptr_delta, Some(0)) {
+                    self.cells.retain(|off, _| {
+                        let rel = *off - self.ptr;
+                        rel < eff.touched.start || rel >= eff.touched.end
+                    });
+                } else {
+                    self.clobber_all();
+                }
+                self.cells.insert(self.ptr, CellLattice::Zero);
             }
         }
     }
@@ -253,12 +324,51 @@ mod tests {
     }
 
     #[test]
-    fn loop_clobbers_all_cells() {
+    fn loop_preserves_untouched_cells_and_zeroes_head() {
+        let mut st = TapeState::new_program();
+        st.apply(&HirInst::Add(5)); // cell[0] = 5
+        st.apply(&HirInst::Move(5));
+        st.apply(&HirInst::Zero);
+        st.apply(&HirInst::Add(42)); // cell[5] = 42
+        st.apply(&HirInst::Move(-5)); // ptr = 0
+        // Balanced loop body: Add(-1), Move(1), Add(1), Move(-1) — touches 0..2
+        st.apply(&HirInst::Loop(vec![
+            HirInst::Add(-1),
+            HirInst::Move(1),
+            HirInst::Add(1),
+            HirInst::Move(-1),
+        ]));
+        // Head cell is zero after loop exit
+        assert_eq!(st.lattice_at(0), CellLattice::Zero);
+        // cell[1] is in the touched range (0..2), so clobbered
+        assert_eq!(st.lattice_at(1), CellLattice::Top);
+        // cell[5] is outside the touched range, preserved
+        assert_eq!(st.value_at(5), Some(42));
+    }
+
+    #[test]
+    fn loop_unbalanced_clobbers_all_but_zeroes_head() {
+        let mut st = TapeState::new_program();
+        st.apply(&HirInst::Add(5));
+        st.apply(&HirInst::Move(3));
+        st.apply(&HirInst::Zero);
+        st.apply(&HirInst::Add(99)); // cell[3] = 99
+        st.apply(&HirInst::Move(-3));
+        // Unbalanced loop: body has net_ptr_delta != 0
+        st.apply(&HirInst::Loop(vec![HirInst::Move(1)]));
+        // Head cell is still zero after loop exit
+        assert_eq!(st.lattice_at(0), CellLattice::Zero);
+        // Everything else is clobbered
+        assert_eq!(st.value_at(3), None);
+    }
+
+    #[test]
+    fn empty_loop_preserves_all_facts_and_zeroes_head() {
         let mut st = TapeState::new_program();
         st.apply(&HirInst::Zero);
         st.apply(&HirInst::Loop(vec![]));
-        assert_eq!(st.value_at(0), None);
-        assert_eq!(st.lattice_at(0), CellLattice::Top);
+        // Empty loop body touches nothing; head is zero after exit
+        assert_eq!(st.lattice_at(0), CellLattice::Zero);
     }
 
     #[test]
@@ -270,11 +380,104 @@ mod tests {
     }
 
     #[test]
-    fn linear_mul_clobbers_all_cells() {
+    fn linear_mul_zeroes_head_and_preserves_remote() {
         let mut st = TapeState::new_program();
+        // Set cell[0] = 0 (already), cell[5] = 42 via Zero+Add
+        st.apply(&HirInst::Move(5));
         st.apply(&HirInst::Zero);
+        st.apply(&HirInst::Add(42));
+        st.apply(&HirInst::Move(-5));
+        // LinearMul at ptr=0 with factors [(1,1), (2,3)]
+        st.apply(&HirInst::LinearMul(vec![(1, 1), (2, 3)]));
+        // Head cell is always zeroed
+        assert_eq!(st.lattice_at(0), CellLattice::Zero);
+        // cell[5] is untouched by LinearMul (not in factors)
+        assert_eq!(st.value_at(5), Some(42));
+    }
+
+    #[test]
+    fn linear_mul_known_head_computes_factor_targets() {
+        let mut st = TapeState::new_block();
+        st.apply(&HirInst::Zero);
+        st.apply(&HirInst::Add(3)); // cell[0] = 3
+        st.apply(&HirInst::Move(1));
+        st.apply(&HirInst::Zero); // cell[1] = 0
+        st.apply(&HirInst::Move(1));
+        st.apply(&HirInst::Zero);
+        st.apply(&HirInst::Add(10)); // cell[2] = 10
+        st.apply(&HirInst::Move(-2)); // ptr = 0
+        // LinearMul: v=3, *p=0, cell[1] += 3*1=3, cell[2] += 3*2=6
+        st.apply(&HirInst::LinearMul(vec![(1, 1), (2, 2)]));
+        assert_eq!(st.lattice_at(0), CellLattice::Zero);
+        assert_eq!(st.value_at(1), Some(3)); // 0 + 3*1
+        assert_eq!(st.value_at(2), Some(16)); // 10 + 3*2
+    }
+
+    #[test]
+    fn linear_mul_unknown_head_clobbers_factor_targets_only() {
+        let mut st = TapeState::new_block();
+        st.apply(&HirInst::GetByte); // cell[0] = Top
+        st.apply(&HirInst::Move(2));
+        st.apply(&HirInst::Zero);
+        st.apply(&HirInst::Add(99)); // cell[2] = 99
+        st.apply(&HirInst::Move(-2)); // ptr = 0
         st.apply(&HirInst::LinearMul(vec![(1, 1)]));
-        assert_eq!(st.value_at(0), None);
+        assert_eq!(st.lattice_at(0), CellLattice::Zero); // head always zeroed
+        assert_eq!(st.lattice_at(1), CellLattice::Top); // factor target clobbered
+        assert_eq!(st.value_at(2), Some(99)); // untouched
+    }
+
+    #[test]
+    fn linear_mul_with_sets_zero_head_is_noop() {
+        let mut st = TapeState::new_block();
+        st.apply(&HirInst::Zero); // cell[0] = 0
+        st.apply(&HirInst::Move(1));
+        st.apply(&HirInst::Zero);
+        st.apply(&HirInst::Add(77)); // cell[1] = 77
+        st.apply(&HirInst::Move(-1));
+        st.apply(&HirInst::LinearMulWithSets {
+            factors: vec![(1, 1)],
+            sets: vec![2],
+        });
+        // v == 0 → no-op, all facts preserved
+        assert_eq!(st.lattice_at(0), CellLattice::Zero);
+        assert_eq!(st.value_at(1), Some(77));
+    }
+
+    #[test]
+    fn linear_mul_with_sets_known_nonzero_head() {
+        let mut st = TapeState::new_block();
+        st.apply(&HirInst::Zero);
+        st.apply(&HirInst::Add(5)); // cell[0] = 5
+        st.apply(&HirInst::Move(1));
+        st.apply(&HirInst::Zero); // cell[1] = 0
+        st.apply(&HirInst::Move(-1));
+        st.apply(&HirInst::LinearMulWithSets {
+            factors: vec![(1, 2)],
+            sets: vec![3],
+        });
+        assert_eq!(st.lattice_at(0), CellLattice::Zero); // head zeroed
+        assert_eq!(st.value_at(1), Some(10)); // 0 + 5*2
+        assert_eq!(st.lattice_at(3), CellLattice::Zero); // set target zeroed
+    }
+
+    #[test]
+    fn linear_mul_with_sets_top_head_clobbers_sets() {
+        let mut st = TapeState::new_block();
+        st.apply(&HirInst::GetByte); // cell[0] = Top
+        st.apply(&HirInst::Move(2));
+        st.apply(&HirInst::Zero);
+        st.apply(&HirInst::Add(50)); // cell[2] = 50
+        st.apply(&HirInst::Move(-2));
+        st.apply(&HirInst::LinearMulWithSets {
+            factors: vec![(1, 1)],
+            sets: vec![3],
+        });
+        // head is Top (not provably zero), so instruction may or may not fire
+        assert_eq!(st.lattice_at(0), CellLattice::Zero); // head zeroed either way
+        assert_eq!(st.lattice_at(1), CellLattice::Top); // factor target clobbered
+        assert_eq!(st.lattice_at(3), CellLattice::Top); // set target uncertain
+        assert_eq!(st.value_at(2), Some(50)); // untouched
     }
 
     #[test]

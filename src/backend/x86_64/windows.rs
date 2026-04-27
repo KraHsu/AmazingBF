@@ -234,6 +234,16 @@ pub fn compile_lir_to_windows_program(lir: &LirProgram) -> WindowsProgram {
         ],
     );
 
+    // D5: collect loop-head labels (targets of JumpIfNonZero back-edges).
+    let loop_heads: std::collections::HashSet<_> = lir
+        .insts
+        .iter()
+        .filter_map(|inst| match inst {
+            LirInst::JumpIfNonZero(id) => Some(*id),
+            _ => None,
+        })
+        .collect();
+
     let mut out = Vec::new();
     emit_entry_prologue(&mut out, entry_label);
     emit_zero_stack_qword(&mut out, OVERLAPPED_SLOT_DISP);
@@ -320,70 +330,109 @@ pub fn compile_lir_to_windows_program(lir: &LirProgram) -> WindowsProgram {
                     out.push(AsmInst::MovMem8Imm8(Reg64::R13, 0));
                     continue;
                 }
-                // D3 pinned Rbx as the output-buffer write pointer, so the
-                // body must save/restore it across MovzxEbxFromMemR13. Bare
-                // push/pop would shift Rsp by 8, leaving it 8-byte (not
-                // 16-byte) aligned at the inner `call ensure_tape` site
-                // inside emit_ptr_add_out — which violates Win64 ABI. The
-                // paired (push, sub rsp, 8) / (add rsp, 8, pop) keeps Rsp
-                // 16-aligned at every internal `call`. (The Linux backend
-                // uses bare push/pop because syscall has no alignment
-                // requirement.)
+                let all_disp8 = factors.iter().all(|(off, _)| i8::try_from(*off).is_ok());
                 out.push(AsmInst::Push(Reg64::Rbx));
                 out.push(AsmInst::AddRegImm32(Reg64::Rsp, -8));
                 out.push(AsmInst::MovzxEbxFromMemR13);
                 out.push(AsmInst::MovMem8Imm8(Reg64::R13, 0));
-                for (off, factor) in factors {
-                    emit_ptr_add_out(&mut out, &mut labels, *off, ensure_tape_label);
-                    let f_mod = ((factor % 256) + 256) % 256;
-                    match f_mod {
-                        0 => {}
-                        1 => out.push(AsmInst::AddMemR13Bl),
-                        255 => out.push(AsmInst::SubMemR13Bl),
-                        _ => {
-                            out.push(AsmInst::MovEaxEbx);
-                            out.push(AsmInst::ImulEaxEbxImm32(*factor));
-                            out.push(AsmInst::AddMemR13Al);
+                if all_disp8 {
+                    let lo = factors.iter().map(|(o, _)| *o).min().unwrap_or(0).min(0);
+                    let hi = factors.iter().map(|(o, _)| *o).max().unwrap_or(0).max(0);
+                    emit_ptr_add_checked_out(&mut out, &mut labels, 0, lo, hi, ensure_tape_label);
+                    for (off, factor) in factors {
+                        let d = *off as i8;
+                        let f_mod = ((factor % 256) + 256) % 256;
+                        match f_mod {
+                            0 => {}
+                            1 => out.push(AsmInst::AddMemR13BlDisp8(d)),
+                            255 => out.push(AsmInst::SubMemR13BlDisp8(d)),
+                            _ => {
+                                out.push(AsmInst::ImulEaxEbxImm32(*factor));
+                                out.push(AsmInst::AddMemR13AlDisp8(d));
+                            }
                         }
                     }
-                    emit_ptr_add_out(&mut out, &mut labels, -*off, ensure_tape_label);
+                    verified_window = Some((lo, hi));
+                } else {
+                    for (off, factor) in factors {
+                        emit_ptr_add_out(&mut out, &mut labels, *off, ensure_tape_label);
+                        let f_mod = ((factor % 256) + 256) % 256;
+                        match f_mod {
+                            0 => {}
+                            1 => out.push(AsmInst::AddMemR13Bl),
+                            255 => out.push(AsmInst::SubMemR13Bl),
+                            _ => {
+                                out.push(AsmInst::ImulEaxEbxImm32(*factor));
+                                out.push(AsmInst::AddMemR13Al);
+                            }
+                        }
+                        emit_ptr_add_out(&mut out, &mut labels, -*off, ensure_tape_label);
+                    }
+                    verified_window = None;
                 }
                 out.push(AsmInst::AddRegImm32(Reg64::Rsp, 8));
                 out.push(AsmInst::Pop(Reg64::Rbx));
-                verified_window = None;
             }
             LirInst::LinearMulWithSets { factors, sets } => {
                 let done_label = labels.fresh();
                 out.push(AsmInst::CmpMem8Imm8(Reg64::R13, 0));
                 out.push(AsmInst::Jz(done_label));
+                let all_offsets: Vec<isize> = factors
+                    .iter()
+                    .map(|(o, _)| *o)
+                    .chain(sets.iter().copied())
+                    .collect();
+                let all_disp8 = all_offsets.iter().all(|o| i8::try_from(*o).is_ok());
                 out.push(AsmInst::Push(Reg64::Rbx));
                 out.push(AsmInst::AddRegImm32(Reg64::Rsp, -8));
                 out.push(AsmInst::MovzxEbxFromMemR13);
                 out.push(AsmInst::MovMem8Imm8(Reg64::R13, 0));
-                for (off, factor) in factors {
-                    emit_ptr_add_out(&mut out, &mut labels, *off, ensure_tape_label);
-                    let f_mod = ((factor % 256) + 256) % 256;
-                    match f_mod {
-                        0 => {}
-                        1 => out.push(AsmInst::AddMemR13Bl),
-                        255 => out.push(AsmInst::SubMemR13Bl),
-                        _ => {
-                            out.push(AsmInst::MovEaxEbx);
-                            out.push(AsmInst::ImulEaxEbxImm32(*factor));
-                            out.push(AsmInst::AddMemR13Al);
+                if all_disp8 {
+                    let lo = all_offsets.iter().copied().min().unwrap_or(0).min(0);
+                    let hi = all_offsets.iter().copied().max().unwrap_or(0).max(0);
+                    emit_ptr_add_checked_out(&mut out, &mut labels, 0, lo, hi, ensure_tape_label);
+                    for (off, factor) in factors {
+                        let d = *off as i8;
+                        let f_mod = ((factor % 256) + 256) % 256;
+                        match f_mod {
+                            0 => {}
+                            1 => out.push(AsmInst::AddMemR13BlDisp8(d)),
+                            255 => out.push(AsmInst::SubMemR13BlDisp8(d)),
+                            _ => {
+                                out.push(AsmInst::ImulEaxEbxImm32(*factor));
+                                out.push(AsmInst::AddMemR13AlDisp8(d));
+                            }
                         }
                     }
-                    emit_ptr_add_out(&mut out, &mut labels, -*off, ensure_tape_label);
-                }
-                for off in sets {
-                    emit_ptr_add_out(&mut out, &mut labels, *off, ensure_tape_label);
-                    out.push(AsmInst::MovMem8Imm8(Reg64::R13, 0));
-                    emit_ptr_add_out(&mut out, &mut labels, -*off, ensure_tape_label);
+                    for off in sets {
+                        out.push(AsmInst::MovMem8ImmDisp8(Reg64::R13, *off as i8, 0));
+                    }
+                    verified_window = Some((lo, hi));
+                } else {
+                    for (off, factor) in factors {
+                        emit_ptr_add_out(&mut out, &mut labels, *off, ensure_tape_label);
+                        let f_mod = ((factor % 256) + 256) % 256;
+                        match f_mod {
+                            0 => {}
+                            1 => out.push(AsmInst::AddMemR13Bl),
+                            255 => out.push(AsmInst::SubMemR13Bl),
+                            _ => {
+                                out.push(AsmInst::ImulEaxEbxImm32(*factor));
+                                out.push(AsmInst::AddMemR13Al);
+                            }
+                        }
+                        emit_ptr_add_out(&mut out, &mut labels, -*off, ensure_tape_label);
+                    }
+                    for off in sets {
+                        emit_ptr_add_out(&mut out, &mut labels, *off, ensure_tape_label);
+                        out.push(AsmInst::MovMem8Imm8(Reg64::R13, 0));
+                        emit_ptr_add_out(&mut out, &mut labels, -*off, ensure_tape_label);
+                    }
+                    verified_window = None;
                 }
                 out.push(AsmInst::AddRegImm32(Reg64::Rsp, 8));
                 out.push(AsmInst::Pop(Reg64::Rbx));
                 out.push(AsmInst::Label(done_label));
-                verified_window = None;
             }
             LirInst::Scan(dir) => {
                 let loop_top = labels.fresh();
@@ -510,6 +559,9 @@ pub fn compile_lir_to_windows_program(lir: &LirProgram) -> WindowsProgram {
                 verified_window = None;
             }
             LirInst::Label(id) => {
+                if loop_heads.contains(id) {
+                    out.push(AsmInst::Align16);
+                }
                 out.push(AsmInst::Label(map_label(*id)));
                 verified_window = None;
             }
@@ -1245,13 +1297,13 @@ mod tests {
     }
 
     #[test]
-    fn windows_linear_mul_factor_one_uses_add_mem_r13_bl() {
+    fn windows_linear_mul_factor_one_uses_add_mem_r13_bl_disp8() {
         let program = compile_lir_to_windows_program(&LirProgram {
             insts: vec![LirInst::LinearMul(vec![(2, 1)])],
         });
         assert!(
-            program.asm.insts.contains(&AsmInst::AddMemR13Bl),
-            "Windows LinearMul factor=1 must emit AddMemR13Bl"
+            program.asm.insts.contains(&AsmInst::AddMemR13BlDisp8(2)),
+            "Windows LinearMul factor=1 must emit AddMemR13BlDisp8"
         );
         assert!(
             !program
@@ -1264,13 +1316,13 @@ mod tests {
     }
 
     #[test]
-    fn windows_linear_mul_factor_minus_one_uses_sub_mem_r13_bl() {
+    fn windows_linear_mul_factor_minus_one_uses_sub_mem_r13_bl_disp8() {
         let program = compile_lir_to_windows_program(&LirProgram {
             insts: vec![LirInst::LinearMul(vec![(3, -1)])],
         });
         assert!(
-            program.asm.insts.contains(&AsmInst::SubMemR13Bl),
-            "Windows LinearMul factor=-1 must emit SubMemR13Bl"
+            program.asm.insts.contains(&AsmInst::SubMemR13BlDisp8(3)),
+            "Windows LinearMul factor=-1 must emit SubMemR13BlDisp8"
         );
     }
 

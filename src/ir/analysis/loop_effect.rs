@@ -19,11 +19,7 @@
 //! For `Loop`, the while-non-zero check itself counts as a read of the
 //! entry cell.
 //!
-//! Non-test consumers of this module arrive with the B3 / C2 passes; until
-//! then the module-level `allow(dead_code)` keeps the build clean. Remove it
-//! once real consumers reference these items.
-
-#![cfg_attr(not(test), allow(dead_code))]
+//! Consumed by `TapeState::apply` (B5 selective clobber) and future passes.
 
 use std::ops::Range;
 
@@ -213,6 +209,7 @@ impl LoopEffect {
 /// a `Scan` or a `Loop` whose body does not have `net_ptr_delta == Some(0)`.
 /// `min_off` / `max_off` cover every position the pointer holds *between*
 /// instructions, including the entry position `0`.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn pointer_delta_range(insts: &[HirInst]) -> (isize, isize, Option<isize>) {
     let mut cur: isize = 0;
     let mut ptr_known = true;

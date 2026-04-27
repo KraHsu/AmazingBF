@@ -214,6 +214,17 @@ pub fn compile_lir_to_asm(lir: &LirProgram) -> AsmProgram {
 
     let mut out = Vec::new();
 
+    // D5: collect loop-head labels (targets of JumpIfNonZero back-edges)
+    // so we can insert Align16 before them.
+    let loop_heads: std::collections::HashSet<_> = lir
+        .insts
+        .iter()
+        .filter_map(|inst| match inst {
+            LirInst::JumpIfNonZero(id) => Some(*id),
+            _ => None,
+        })
+        .collect();
+
     // Window of offsets (relative to current `r13`) that have already been
     // proven to lie in `[r12, r14)` by a preceding `PtrAddChecked`. Subsequent
     // `PtrAdd` ops whose delta falls inside this window can skip the bounds
@@ -291,29 +302,63 @@ pub fn compile_lir_to_asm(lir: &LirProgram) -> AsmProgram {
                     out.push(AsmInst::MovMem8Imm8(Reg64::R13, 0));
                     continue;
                 }
+                let all_disp8 = factors.iter().all(|(off, _)| i8::try_from(*off).is_ok());
                 out.push(AsmInst::Push(Reg64::Rbx));
                 out.push(AsmInst::MovzxEbxFromMemR13);
                 out.push(AsmInst::MovMem8Imm8(Reg64::R13, 0));
-                for (off, f) in factors {
-                    emit_ptr_add_out(&mut out, &mut next_internal_label, *off, ensure_tape_label);
-                    // D2c: ±1 columns skip the imul. bl already holds the
-                    // head value (8-bit semantics make `cell + 255*bl` ≡
-                    // `cell - bl`, so factor==-1 routes to SubMemR13Bl).
-                    let f_mod = ((f % 256) + 256) % 256;
-                    match f_mod {
-                        0 => {} // earlier passes should drop factor-zero columns
-                        1 => out.push(AsmInst::AddMemR13Bl),
-                        255 => out.push(AsmInst::SubMemR13Bl),
-                        _ => {
-                            out.push(AsmInst::MovEaxEbx);
-                            out.push(AsmInst::ImulEaxEbxImm32(*f));
-                            out.push(AsmInst::AddMemR13Al);
+                if all_disp8 {
+                    let lo = factors.iter().map(|(o, _)| *o).min().unwrap_or(0).min(0);
+                    let hi = factors.iter().map(|(o, _)| *o).max().unwrap_or(0).max(0);
+                    emit_ptr_add_checked_out(
+                        &mut out,
+                        &mut next_internal_label,
+                        0,
+                        lo,
+                        hi,
+                        ensure_tape_label,
+                    );
+                    for (off, f) in factors {
+                        let d = *off as i8;
+                        let f_mod = ((f % 256) + 256) % 256;
+                        match f_mod {
+                            0 => {}
+                            1 => out.push(AsmInst::AddMemR13BlDisp8(d)),
+                            255 => out.push(AsmInst::SubMemR13BlDisp8(d)),
+                            _ => {
+                                out.push(AsmInst::ImulEaxEbxImm32(*f));
+                                out.push(AsmInst::AddMemR13AlDisp8(d));
+                            }
                         }
                     }
-                    emit_ptr_add_out(&mut out, &mut next_internal_label, -*off, ensure_tape_label);
+                    verified_window = Some((lo, hi));
+                } else {
+                    for (off, f) in factors {
+                        emit_ptr_add_out(
+                            &mut out,
+                            &mut next_internal_label,
+                            *off,
+                            ensure_tape_label,
+                        );
+                        let f_mod = ((f % 256) + 256) % 256;
+                        match f_mod {
+                            0 => {}
+                            1 => out.push(AsmInst::AddMemR13Bl),
+                            255 => out.push(AsmInst::SubMemR13Bl),
+                            _ => {
+                                out.push(AsmInst::ImulEaxEbxImm32(*f));
+                                out.push(AsmInst::AddMemR13Al);
+                            }
+                        }
+                        emit_ptr_add_out(
+                            &mut out,
+                            &mut next_internal_label,
+                            -*off,
+                            ensure_tape_label,
+                        );
+                    }
+                    verified_window = None;
                 }
                 out.push(AsmInst::Pop(Reg64::Rbx));
-                verified_window = None;
             }
 
             // LinearMulWithSets: like LinearMul but with a v!=0 guard and
@@ -322,32 +367,87 @@ pub fn compile_lir_to_asm(lir: &LirProgram) -> AsmProgram {
                 let done_label = fresh_internal_label(&mut next_internal_label);
                 out.push(AsmInst::CmpMem8Imm8(Reg64::R13, 0));
                 out.push(AsmInst::Jz(done_label));
+                let all_offsets: Vec<isize> = factors
+                    .iter()
+                    .map(|(o, _)| *o)
+                    .chain(sets.iter().copied())
+                    .collect();
+                let all_disp8 = all_offsets.iter().all(|o| i8::try_from(*o).is_ok());
                 out.push(AsmInst::Push(Reg64::Rbx));
                 out.push(AsmInst::MovzxEbxFromMemR13);
                 out.push(AsmInst::MovMem8Imm8(Reg64::R13, 0));
-                for (off, f) in factors {
-                    emit_ptr_add_out(&mut out, &mut next_internal_label, *off, ensure_tape_label);
-                    let f_mod = ((f % 256) + 256) % 256;
-                    match f_mod {
-                        0 => {}
-                        1 => out.push(AsmInst::AddMemR13Bl),
-                        255 => out.push(AsmInst::SubMemR13Bl),
-                        _ => {
-                            out.push(AsmInst::MovEaxEbx);
-                            out.push(AsmInst::ImulEaxEbxImm32(*f));
-                            out.push(AsmInst::AddMemR13Al);
+                if all_disp8 {
+                    let lo = all_offsets.iter().copied().min().unwrap_or(0).min(0);
+                    let hi = all_offsets.iter().copied().max().unwrap_or(0).max(0);
+                    emit_ptr_add_checked_out(
+                        &mut out,
+                        &mut next_internal_label,
+                        0,
+                        lo,
+                        hi,
+                        ensure_tape_label,
+                    );
+                    for (off, f) in factors {
+                        let d = *off as i8;
+                        let f_mod = ((f % 256) + 256) % 256;
+                        match f_mod {
+                            0 => {}
+                            1 => out.push(AsmInst::AddMemR13BlDisp8(d)),
+                            255 => out.push(AsmInst::SubMemR13BlDisp8(d)),
+                            _ => {
+                                out.push(AsmInst::ImulEaxEbxImm32(*f));
+                                out.push(AsmInst::AddMemR13AlDisp8(d));
+                            }
                         }
                     }
-                    emit_ptr_add_out(&mut out, &mut next_internal_label, -*off, ensure_tape_label);
-                }
-                for off in sets {
-                    emit_ptr_add_out(&mut out, &mut next_internal_label, *off, ensure_tape_label);
-                    out.push(AsmInst::MovMem8Imm8(Reg64::R13, 0));
-                    emit_ptr_add_out(&mut out, &mut next_internal_label, -*off, ensure_tape_label);
+                    for off in sets {
+                        out.push(AsmInst::MovMem8ImmDisp8(Reg64::R13, *off as i8, 0));
+                    }
+                    verified_window = Some((lo, hi));
+                } else {
+                    for (off, f) in factors {
+                        emit_ptr_add_out(
+                            &mut out,
+                            &mut next_internal_label,
+                            *off,
+                            ensure_tape_label,
+                        );
+                        let f_mod = ((f % 256) + 256) % 256;
+                        match f_mod {
+                            0 => {}
+                            1 => out.push(AsmInst::AddMemR13Bl),
+                            255 => out.push(AsmInst::SubMemR13Bl),
+                            _ => {
+                                out.push(AsmInst::ImulEaxEbxImm32(*f));
+                                out.push(AsmInst::AddMemR13Al);
+                            }
+                        }
+                        emit_ptr_add_out(
+                            &mut out,
+                            &mut next_internal_label,
+                            -*off,
+                            ensure_tape_label,
+                        );
+                    }
+                    for off in sets {
+                        emit_ptr_add_out(
+                            &mut out,
+                            &mut next_internal_label,
+                            *off,
+                            ensure_tape_label,
+                        );
+                        out.push(AsmInst::MovMem8Imm8(Reg64::R13, 0));
+                        emit_ptr_add_out(
+                            &mut out,
+                            &mut next_internal_label,
+                            -*off,
+                            ensure_tape_label,
+                        );
+                    }
+                    verified_window = None;
                 }
                 out.push(AsmInst::Pop(Reg64::Rbx));
                 out.push(AsmInst::Label(done_label));
-                verified_window = None;
             }
             LirInst::Scan(dir) => {
                 let step = *dir;
@@ -568,6 +668,9 @@ pub fn compile_lir_to_asm(lir: &LirProgram) -> AsmProgram {
             //
             // Directly maps the LIR `LabelId` onto an `AsmLabel`.
             LirInst::Label(id) => {
+                if loop_heads.contains(id) {
+                    out.push(AsmInst::Align16);
+                }
                 out.push(AsmInst::Label(map_label(*id)));
                 verified_window = None;
             }
@@ -1774,15 +1877,13 @@ mod tests {
     }
 
     #[test]
-    fn linear_mul_factor_one_emits_add_mem_r13_bl_skipping_imul() {
-        // factor==1 must produce a single `add [r13], bl` per column with
-        // no surrounding `MovEaxEbx; ImulEaxEbxImm32`.
+    fn linear_mul_factor_one_emits_add_mem_r13_bl_disp8_skipping_imul() {
         let asm = compile_lir_to_asm(&LirProgram {
             insts: vec![LirInst::LinearMul(vec![(2, 1)])],
         });
         assert!(
-            asm.insts.contains(&AsmInst::AddMemR13Bl),
-            "LinearMul factor=1 must emit AddMemR13Bl"
+            asm.insts.contains(&AsmInst::AddMemR13BlDisp8(2)),
+            "LinearMul factor=1 must emit AddMemR13BlDisp8"
         );
         assert!(
             !asm.insts
@@ -1793,13 +1894,13 @@ mod tests {
     }
 
     #[test]
-    fn linear_mul_factor_minus_one_emits_sub_mem_r13_bl() {
+    fn linear_mul_factor_minus_one_emits_sub_mem_r13_bl_disp8() {
         let asm = compile_lir_to_asm(&LirProgram {
             insts: vec![LirInst::LinearMul(vec![(3, -1)])],
         });
         assert!(
-            asm.insts.contains(&AsmInst::SubMemR13Bl),
-            "LinearMul factor=-1 must emit SubMemR13Bl"
+            asm.insts.contains(&AsmInst::SubMemR13BlDisp8(3)),
+            "LinearMul factor=-1 must emit SubMemR13BlDisp8"
         );
         assert!(
             !asm.insts
@@ -1821,22 +1922,24 @@ mod tests {
             "non-±1 factor must keep the imul path"
         );
         assert!(
-            !asm.insts
-                .iter()
-                .any(|i| matches!(i, AsmInst::AddMemR13Bl | AsmInst::SubMemR13Bl)),
+            !asm.insts.iter().any(|i| matches!(
+                i,
+                AsmInst::AddMemR13Bl
+                    | AsmInst::SubMemR13Bl
+                    | AsmInst::AddMemR13BlDisp8(_)
+                    | AsmInst::SubMemR13BlDisp8(_)
+            )),
             "non-±1 factor must not emit ±bl variants"
         );
     }
 
     #[test]
     fn linear_mul_mixed_columns_pick_per_column() {
-        // Mixed ±1 and non-±1 columns: the body must contain the right
-        // mix of fast-path and imul-path emissions.
         let asm = compile_lir_to_asm(&LirProgram {
             insts: vec![LirInst::LinearMul(vec![(1, 1), (2, -1), (3, 5)])],
         });
-        assert!(asm.insts.contains(&AsmInst::AddMemR13Bl));
-        assert!(asm.insts.contains(&AsmInst::SubMemR13Bl));
+        assert!(asm.insts.contains(&AsmInst::AddMemR13BlDisp8(1)));
+        assert!(asm.insts.contains(&AsmInst::SubMemR13BlDisp8(2)));
         assert!(asm.insts.contains(&AsmInst::ImulEaxEbxImm32(5)));
     }
 

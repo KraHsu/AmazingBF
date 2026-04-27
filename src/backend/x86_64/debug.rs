@@ -142,6 +142,9 @@ fn format_inst_asm(out: &mut String, inst: &AsmInst) {
         AsmInst::Label(label) => {
             writeln!(out, "{}:", label_name(*label)).unwrap();
         }
+        AsmInst::Align16 => {
+            writeln!(out, "    .align  16").unwrap();
+        }
 
         // Data movement.
         AsmInst::MovRegImm64(reg, imm) => {
@@ -525,9 +528,6 @@ fn format_inst_asm(out: &mut String, inst: &AsmInst) {
         AsmInst::MovzxEbxFromMemR13 => {
             writeln!(out, "    movzx   ebx, byte [r13]").unwrap();
         }
-        AsmInst::MovEaxEbx => {
-            writeln!(out, "    mov     eax, ebx").unwrap();
-        }
         AsmInst::ImulEaxEbxImm32(imm) => {
             writeln!(out, "    imul    eax, ebx, {}", imm).unwrap();
         }
@@ -539,6 +539,15 @@ fn format_inst_asm(out: &mut String, inst: &AsmInst) {
         }
         AsmInst::SubMemR13Bl => {
             writeln!(out, "    sub     byte [r13], bl").unwrap();
+        }
+        AsmInst::AddMemR13BlDisp8(d) => {
+            writeln!(out, "    add     byte [r13{:+}], bl", d).unwrap();
+        }
+        AsmInst::SubMemR13BlDisp8(d) => {
+            writeln!(out, "    sub     byte [r13{:+}], bl", d).unwrap();
+        }
+        AsmInst::AddMemR13AlDisp8(d) => {
+            writeln!(out, "    add     byte [r13{:+}], al", d).unwrap();
         }
         AsmInst::MovAlMemR13 => {
             writeln!(out, "    mov     al, byte [r13]").unwrap();

@@ -534,6 +534,75 @@ fn emit_short_jump(buf: &mut CodeBuffer, opcode: u8, label: AsmLabel) {
     buf.emit_rel8_fixup(label);
 }
 
+/// Emit `n` bytes of NOP padding using Intel-recommended multi-byte NOP forms.
+fn emit_nop_sequence(buf: &mut CodeBuffer, mut n: usize) {
+    while n > 0 {
+        match n {
+            1 => {
+                buf.emit_u8(0x90);
+                n -= 1;
+            }
+            2 => {
+                buf.emit_u8(0x66);
+                buf.emit_u8(0x90);
+                n -= 2;
+            }
+            3 => {
+                buf.emit_u8(0x0F);
+                buf.emit_u8(0x1F);
+                buf.emit_u8(0x00);
+                n -= 3;
+            }
+            4 => {
+                buf.emit_u8(0x0F);
+                buf.emit_u8(0x1F);
+                buf.emit_u8(0x40);
+                buf.emit_u8(0x00);
+                n -= 4;
+            }
+            5 => {
+                buf.emit_u8(0x0F);
+                buf.emit_u8(0x1F);
+                buf.emit_u8(0x44);
+                buf.emit_u8(0x00);
+                buf.emit_u8(0x00);
+                n -= 5;
+            }
+            6 => {
+                buf.emit_u8(0x66);
+                buf.emit_u8(0x0F);
+                buf.emit_u8(0x1F);
+                buf.emit_u8(0x44);
+                buf.emit_u8(0x00);
+                buf.emit_u8(0x00);
+                n -= 6;
+            }
+            7 => {
+                buf.emit_u8(0x0F);
+                buf.emit_u8(0x1F);
+                buf.emit_u8(0x80);
+                buf.emit_u8(0x00);
+                buf.emit_u8(0x00);
+                buf.emit_u8(0x00);
+                buf.emit_u8(0x00);
+                n -= 7;
+            }
+            _ => {
+                // 8-byte NOP: 0F 1F 84 00 00 00 00 00
+                buf.emit_u8(0x0F);
+                buf.emit_u8(0x1F);
+                buf.emit_u8(0x84);
+                buf.emit_u8(0x00);
+                buf.emit_u8(0x00);
+                buf.emit_u8(0x00);
+                buf.emit_u8(0x00);
+                buf.emit_u8(0x00);
+                n -= 8;
+            }
+        }
+    }
+}
+
 /// Encode a single `AsmInst` into the code buffer.
 ///
 /// Per-instruction encoding details live in the matching match arm.
@@ -541,8 +610,12 @@ fn encode_inst(buf: &mut CodeBuffer, inst: &AsmInst) {
     match inst {
         // Pseudo-instructions.
         AsmInst::Label(label) => {
-            // A label emits no bytes, it just records the current offset.
             buf.bind_label(*label);
+        }
+
+        AsmInst::Align16 => {
+            let pad = (16 - (buf.pos() % 16)) % 16;
+            emit_nop_sequence(buf, pad);
         }
 
         // mov r64, imm64.
@@ -827,12 +900,6 @@ fn encode_inst(buf: &mut CodeBuffer, inst: &AsmInst) {
             buf.emit_u8(0x00);
         }
 
-        // mov eax, ebx
-        AsmInst::MovEaxEbx => {
-            buf.emit_u8(0x8b);
-            buf.emit_u8(0xc3);
-        }
-
         // imul eax, ebx, imm32
         AsmInst::ImulEaxEbxImm32(imm) => {
             buf.emit_u8(0x69);
@@ -866,6 +933,33 @@ fn encode_inst(buf: &mut CodeBuffer, inst: &AsmInst) {
             buf.emit_u8(0x28);
             buf.emit_u8(0x5D);
             buf.emit_u8(0x00);
+        }
+
+        // add byte [r13+disp8], bl
+        //   REX.B (0x41) + 0x00 + ModRM(mod=01, reg=bl=3, rm=r13 low3=5) + disp8
+        AsmInst::AddMemR13BlDisp8(disp) => {
+            buf.emit_u8(0x41);
+            buf.emit_u8(0x00);
+            buf.emit_u8(0x5D);
+            buf.emit_u8(*disp as u8);
+        }
+
+        // sub byte [r13+disp8], bl
+        //   REX.B (0x41) + 0x28 + ModRM(mod=01, reg=bl=3, rm=r13 low3=5) + disp8
+        AsmInst::SubMemR13BlDisp8(disp) => {
+            buf.emit_u8(0x41);
+            buf.emit_u8(0x28);
+            buf.emit_u8(0x5D);
+            buf.emit_u8(*disp as u8);
+        }
+
+        // add byte [r13+disp8], al
+        //   REX.B (0x41) + 0x00 + ModRM(mod=01, reg=al=0, rm=r13 low3=5) + disp8
+        AsmInst::AddMemR13AlDisp8(disp) => {
+            buf.emit_u8(0x41);
+            buf.emit_u8(0x00);
+            buf.emit_u8(0x45);
+            buf.emit_u8(*disp as u8);
         }
 
         // mov al, byte [r13+0]
@@ -1218,6 +1312,39 @@ mod tests {
     }
 
     #[test]
+    fn add_mem_r13_bl_disp8_encodes_with_signed_displacement() {
+        let program = AsmProgram {
+            insts: vec![AsmInst::AddMemR13BlDisp8(5)],
+        };
+        let encoded = encode_program(&program);
+        assert_eq!(encoded.text, vec![0x41, 0x00, 0x5D, 0x05]);
+        // Negative displacement
+        let program = AsmProgram {
+            insts: vec![AsmInst::AddMemR13BlDisp8(-3)],
+        };
+        let encoded = encode_program(&program);
+        assert_eq!(encoded.text, vec![0x41, 0x00, 0x5D, 0xFD]);
+    }
+
+    #[test]
+    fn sub_mem_r13_bl_disp8_encodes_with_signed_displacement() {
+        let program = AsmProgram {
+            insts: vec![AsmInst::SubMemR13BlDisp8(7)],
+        };
+        let encoded = encode_program(&program);
+        assert_eq!(encoded.text, vec![0x41, 0x28, 0x5D, 0x07]);
+    }
+
+    #[test]
+    fn add_mem_r13_al_disp8_encodes_with_signed_displacement() {
+        let program = AsmProgram {
+            insts: vec![AsmInst::AddMemR13AlDisp8(10)],
+        };
+        let encoded = encode_program(&program);
+        assert_eq!(encoded.text, vec![0x41, 0x00, 0x45, 0x0A]);
+    }
+
+    #[test]
     fn rep_stosb_encodes_to_f3_aa() {
         // rep stosb — REP prefix 0xF3, then STOSB opcode 0xAA.
         let program = AsmProgram {
@@ -1238,5 +1365,34 @@ mod tests {
         };
         let encoded = encode_program(&program);
         assert_eq!(encoded.text, vec![0x48, 0x8D, 0xB5, 0x00, 0xF0, 0xFF, 0xFF]);
+    }
+
+    #[test]
+    fn align16_emits_correct_nop_padding() {
+        // 1-byte instruction (ret) + Align16 should pad to offset 16.
+        let program = AsmProgram {
+            insts: vec![AsmInst::Ret, AsmInst::Align16, AsmInst::Ret],
+        };
+        let encoded = encode_program(&program);
+        // Ret = 1 byte at offset 0. Align16 pads 15 bytes (offsets 1..16).
+        // Second Ret at offset 16.
+        assert_eq!(encoded.text.len(), 17);
+        assert_eq!(encoded.text[0], 0xC3); // ret
+        assert_eq!(encoded.text[16], 0xC3); // ret at aligned offset
+    }
+
+    #[test]
+    fn align16_already_aligned_emits_nothing() {
+        // 16 bytes of NOPs (two 8-byte NOPs) + Align16 should emit 0 padding.
+        let program = AsmProgram {
+            insts: vec![
+                AsmInst::RawBytes(vec![0x90; 16]),
+                AsmInst::Align16,
+                AsmInst::Ret,
+            ],
+        };
+        let encoded = encode_program(&program);
+        assert_eq!(encoded.text.len(), 17); // 16 + 0 padding + 1 ret
+        assert_eq!(encoded.text[16], 0xC3);
     }
 }
