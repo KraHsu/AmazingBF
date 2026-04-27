@@ -12,7 +12,7 @@
 
 ### 1.1 HIR 层（`src/ir/hir.rs`, `src/ir/optimize.rs`）
 
-- HIR 变体：`Move(isize)` / `Add(i32)` / `PutByte` / `GetByte` / `Zero` / `LinearMul(Vec<(isize,i32)>)` / `Loop(Vec<HirInst>)`
+- HIR 变体：`Move(isize)` / `Add(i32)` / `PutByte` / `GetByte` / `Zero` / `LinearMul(Vec<(isize,i32)>)` / `LinearMulWithSets { factors: Vec<(isize,i32)>, sets: Vec<isize> }` / `Loop(Vec<HirInst>)`
 - **O0** `optimize_o0`（`optimize.rs:38-42`）：相邻 `Move/Add` 融合，单次遍历
 - **O1** `optimize_o1`（`optimize.rs:60-68`）：O0 融合 + `try_scan_loop` / `is_byte_clear_loop` / `try_linear_loop`（`optimize.rs:151-197`）+ 基于 A1 `TapeState` 的常量传播（`optimize.rs:219-307`）+ `push_o1` peephole（`optimize.rs:309-329`）+ **B1 DSE**（`src/ir/dse.rs`）串联在管线末端
 - **O2** `try_optimize_o2`（`optimize.rs:74-87`）：对 O1 不动点迭代（含 DSE），4096 上限
@@ -66,17 +66,17 @@
 - **B5 Loop-invariant code motion**：A3 识别被 loop 读但不被改写的 cell；将其 loop-pre 赋值保留在 loop 外，避免反复 reload。BF 上实用性偏弱，但 SSA-化后几乎免费。
 - **B6 小 loop 展开** · **[已实现]**：`src/ir/optimize.rs::try_unroll_known_head` 在 `Loop` 分支的 `try_loop_specialize` 之前检查 `env.value_at_ptr()`——值已知（`CellLattice::Const(v)`）且 `v != 0`、body 通过 `try_linear_loop` 时，按相对 `Move` 形式编译期展开：对每个 `(off, f)` 发 `Move(step); Add((v * f) as i8 as i32)`（零 delta 跳过、指针相对游走），末尾 `Move(-cur); Zero`。替代原先落入 `LinearMul` 的运行期 `*p * factor` 乘法。`v == 0` 继续走 `try_loop_specialize`（由 B2 commit 3 负责整块丢弃）；头格 `Top` / `NonZero` 的老程序依然走 `LinearMul` 无回归。`try_loop_specialize` 的 `Scan` / `is_byte_clear_loop` 路径不受影响——它们的 body 形态 `try_linear_loop` 会拒绝或返回空 factors，B6 自然退回。
   - 文件：`src/ir/optimize.rs`（6 单测：单 offset、多 offset、i8 canonicalisation、未知头、empty body 回归、v==0 pin B2 前行为）
-- **B7 Deep balanced loop（K6 算法的渐进版）** · **[Phase 0 测量已落地，B7-α 设计待实现]**：原 Oizys K6 走 SymPy + Z/256 矩阵特征分解，对 std-only / `forbid(unsafe_code)` / 零运行时依赖的 Rust 工具链不现实。Phase 0 用两个测量模块量化"K6 真正能挽回多少"：`src/ir/loop_stats.rs` 按拒绝原因对 post-O2 `HirInst::Loop` 做**静态普查**，`src/ir/loop_profile.rs` 用小型递归 HIR 解释器做 **per-loop 动态计数**并 dump 最热 B7-α 候选 body。E5 套件结果（`cargo test --release loop_stats::e5_sweep loop_profile::e5_profile -- --ignored --nocapture`）：
+- **B7 Deep balanced loop（K6 算法的渐进版）** · **[B7-α (P1+P2+P3) 已实现]**：原 Oizys K6 走 SymPy + Z/256 矩阵特征分解，对 std-only / `forbid(unsafe_code)` / 零运行时依赖的 Rust 工具链不现实。Phase 0 用两个测量模块量化"K6 真正能挽回多少"：`src/ir/loop_stats.rs` 按拒绝原因对 post-O2 `HirInst::Loop` 做**静态普查**，`src/ir/loop_profile.rs` 用小型递归 HIR 解释器做 **per-loop 动态计数**并 dump 最热 B7-α 候选 body。E5 套件结果（`cargo test --release loop_stats::e5_sweep loop_profile::e5_profile -- --ignored --nocapture`）：
   - 静态：2361 个存活 Loop 中只有 66 个（2.8%）属 B7-α 形态；分布极度不均，mandelbrot.b 与 awib-0.4.b 各 31 个，其余四程序合计 4 个。
   - 动态：hanoi.b 单一 loop（class=`HasInnerZero`，body `Move(1) Zero Move(-1) Add(-1)`）占该程序 95.30% 的迭代；long.b 单一 loop（class=`HasBoth`，body 含一段被后续 Zero 覆盖的 dead inner LinearMul）占 94.17%；mandelbrot.b 的 31 个静态候选实际只占 1.95% 迭代——hot loops 全是 `Unbalanced`，B7 不能帮。
   - **结论**：跑完整 K6（Z/256 矩阵特征分解）对 mandelbrot 也只能挽回 1.95%，ROI 不足；hanoi / long 的 hot pattern 落在一个**不需要跨迭代递推**的简化子集上。把 B7 切成 α/β：α 覆盖这两个 hot loop，β 留作 mandelbrot 跨迭代递推（暂不优先）。
-  - **B7-α 设计（三阶段，每阶段独立可发版）**：
-    - **B7-α-P1**：新增 HIR 变体 `LinearMulWithSets { factors: Vec<(isize,i32)>, sets: Vec<(isize,u8)> }`，语义 `v=*p; *p=0; for (off,f) in factors: cell[ptr+off] += v*f; if v != 0 { for (off,val) in sets: cell[ptr+off] = val; }`；`try_linear_loop` 扩展到接受 body 含 `Zero`（在 ptr ≠ 0 处），头格仍要求 invertible。覆盖 hanoi #559（hanoi 95% 迭代）。3-5 天。
-    - **B7-α-P2**：分析升级为 per-cell 三态机（`Unwritten` / `LinearAdd(coef)` / `Set(val)`）；接受 inner LinearMul 当其 head 状态可证明为 `Set(c)`；后续 Zero 自然把前置 LinearMul 写入降为 dead store。覆盖 long.b #7（long 94% 迭代）。+3-5 天。
-    - **B7-α-P3**：lower 到 LIR 时把 `if v != 0` 编为一条 `cmp/jz` 跳过 sets 段（约 5 字节开销，无新 LIR 变体——`LinearMulWithSets` 本身可作为新 LIR 变体或在 lower 阶段拆成 `LinearMul + ConditionalCellSet*`）。+3-5 天。
-  - 文件：`src/ir/loop_stats.rs`（新，13 单测 + `e5_loop_rejection_census` 忽略测试）、`src/ir/loop_profile.rs`（新，4 单测 + `e5_loop_hotness_profile` 忽略测试）；将来 B7-α 主要修改 `src/ir/hir.rs`、`src/ir/optimize.rs`、`src/interp/`、`src/ir/lower.rs`、`src/backend/`。
+  - **B7-α 设计（三阶段，均已实现）**：
+    - **B7-α-P1** · **[已实现]**：新增 HIR 变体 `LinearMulWithSets { factors: Vec<(isize,i32)>, sets: Vec<isize> }`，语义 `v=*p; *p=0; for (off,f) in factors: cell[ptr+off] += v*f; if v != 0 { for off in sets: cell[ptr+off] = 0; }`；`try_linear_loop_with_sets` 接受 body 含 `Zero`（在 ptr ≠ 0 处），头格仍要求 invertible。覆盖 hanoi #559（hanoi 95% 迭代）。LIR 新增同名变体，后端 `cmp/jz` guard 跳过 sets 段；解释器 handler 同步支持。
+    - **B7-α-P2** · **[已实现]**：`try_linear_loop_advanced` 升级为 per-cell 四态机（`Unwritten` / `LinearAdd(coef)` / `Set(val)` / `Tainted`）；接受 inner `LinearMul` / `LinearMulWithSets` 当其 head 状态可证明为 `Set(c)`（确定性展开）或 `Set(0)`（no-op 跳过）；后续 `Zero` 清除 `Tainted` 标记。无 `Tainted` 残留时提取 factors + sets 复用 P1 的 `LinearMulWithSets` 变体，无需新增 HIR/LIR/backend 代码。覆盖 long.b 的 `HasBoth` 类 hot loop（94% 迭代）。
+    - **B7-α-P3** · **[已实现]**：与 P1 同步落地。lower 到 LIR 时 `LinearMulWithSets` 作为独立 LIR 变体，后端在 factors 段之后发 `cmp byte [r13], 0; jz skip_sets` 跳过 sets 段（约 5 字节开销）。双后端（Linux / Windows）对称实现。
+  - 文件：`src/ir/optimize.rs`（`try_linear_loop_with_sets` + `try_linear_loop_advanced` + 18 B7-α 单测）、`src/ir/hir.rs`、`src/ir/lir.rs`、`src/ir/lower.rs`、`src/interp/bytecode.rs`、`src/interp/handlers.rs`、`src/interp/lower.rs`、`src/backend/codegen.rs`、`src/backend/x86_64/windows.rs`；测量模块 `src/ir/loop_stats.rs`（13 单测）、`src/ir/loop_profile.rs`（4 单测）。
 
-**依赖：B1 / B2 / B3 / B4 / B6 已落地；B5 依赖 A3；B7 依赖 B3 + B4 + A2。**
+**依赖：B1 / B2 / B3 / B4 / B6 / B7-α 已落地；B5 依赖 A3；B7-β 依赖 B3 + B4 + A2。**
 
 ### Phase C — LIR peephole 新层
 
@@ -147,7 +147,7 @@ A1 → A2 → A3 → A4                        （回归衡量）
   │    │    │    │
   │    │    │    └→ B1 (DSE) ✓
   │    │    └→ B2 (zero-loop) ✓, B5 (LICM), B6 (unroll) ✓
-  │    └→ B3 (LinearMul 泛化) ✓, B4 (pointer postponement) ✓, B7 (K6)
+  │    └→ B3 (LinearMul 泛化) ✓, B4 (pointer postponement) ✓, B7-α (K6 简化) ✓
   │         │
   │         └→ C3 (displacement) ✓ → D2 / D4
   │
@@ -157,7 +157,7 @@ C1 (LIR peephole) ✓、D1 (指令选择) ✓、
 D3 (buffered I/O — 解释器 ✓ / Linux 后端 ✓ / Windows 后端 ✓)、
 E1 / E2 (superinstruction + threaded dispatch) ✓、
 E3 (interp LinearMul ±1 快路径) ✓、E4 (tape 倍增) ✓ 均可并行启动。
-已落地：E5、C1、D1、E4、Phase A (A1–A4)、B1、B2、B3、B4、B6、C2、C3、C4、E1、E2、E3、D2 (a/b/c 三项双端对称)、D3 (解释器 + Linux 后端 + Windows 后端)、D5 (分支提示；对齐暂缓)。
+已落地：E5、C1、D1、E4、Phase A (A1–A4)、B1、B2、B3、B4、B6、B7-α (P1+P2+P3)、C2、C3、C4、E1、E2、E3、D2 (a/b/c 三项双端对称)、D3 (解释器 + Linux 后端 + Windows 后端)、D5 (分支提示；对齐暂缓)。
 
 Phase F 全部不在近期依赖图内。
 ```
@@ -172,7 +172,7 @@ Phase F 全部不在近期依赖图内。
 | HIR | `src/ir/optimize.rs` | Phase A / B 主修改点 |
 | HIR | `src/ir/analysis/` | A1–A4 骨架（已落地） |
 | HIR | `src/ir/dse.rs` | B1 DSE（已落地） |
-| HIR | `src/ir/loop_stats.rs`、`src/ir/loop_profile.rs` | B7 Phase 0 测量（已落地，仅 ignored 测试入口） |
+| HIR | `src/ir/loop_stats.rs`、`src/ir/loop_profile.rs` | B7 Phase 0 测量（已落地） |
 | LIR | `src/ir/lir.rs`, `src/ir/lower.rs` | B / C 可能新增 `PtrAddChecked` / `CellAddAt` |
 | LIR | `src/ir/lir_opt.rs`（新） | Phase C 主场 |
 | Backend | `src/backend/codegen.rs`, `src/backend/x86_64/encode.rs`, `src/backend/asm.rs` | Phase D |

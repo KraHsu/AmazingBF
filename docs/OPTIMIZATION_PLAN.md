@@ -12,7 +12,7 @@ This document is the modernization roadmap for the AmazingBF toolchain's compila
 
 ### 1.1 HIR layer (`src/ir/hir.rs`, `src/ir/optimize.rs`)
 
-- HIR variants: `Move(isize)` / `Add(i32)` / `PutByte` / `GetByte` / `Zero` / `LinearMul(Vec<(isize,i32)>)` / `Loop(Vec<HirInst>)`
+- HIR variants: `Move(isize)` / `Add(i32)` / `PutByte` / `GetByte` / `Zero` / `LinearMul(Vec<(isize,i32)>)` / `LinearMulWithSets { factors: Vec<(isize,i32)>, sets: Vec<isize> }` / `Loop(Vec<HirInst>)`
 - **O0** `optimize_o0` (`optimize.rs:38-42`): fuse adjacent `Move/Add`, single pass
 - **O1** `optimize_o1` (`optimize.rs:60-68`): O0 fusion + `try_scan_loop` / `is_byte_clear_loop` / `try_linear_loop` (`optimize.rs:151-197`) + A1-`TapeState`-driven constant propagation (`optimize.rs:219-307`) + `push_o1` peephole (`optimize.rs:309-329`) + **B1 DSE** (`src/ir/dse.rs`) chained at the end of the pipeline
 - **O2** `try_optimize_o2` (`optimize.rs:74-87`): fixed-point iteration of O1 (DSE included), capped at 4096 iterations
@@ -66,17 +66,17 @@ Six phases in dependency order: A analysis infrastructure → B HIR passes → C
 - **B5 Loop-invariant code motion**: A3 can identify cells that are read but not written inside a loop; their pre-loop assignments can be hoisted outside the loop, avoiding repeated reloads. Utility is low on BF, but essentially free after SSA-isation.
 - **B6 Small loop unrolling** · **[landed]**: `src/ir/optimize.rs::try_unroll_known_head` runs in the `Loop` arm before `try_loop_specialize`: when `env.value_at_ptr()` reports a known `CellLattice::Const(v)` with `v != 0` and `try_linear_loop` accepts the body, the loop is unrolled at compile time into a relative-move form — for each `(off, f)` factor emit `Move(step); Add((v * f) as i8 as i32)` (zero deltas skipped; pointer walked relatively), then `Move(-cur); Zero` at the tail. This replaces the `LinearMul` runtime `*p * factor` multiply with a pre-computed `Add`. When `v == 0` B6 returns `None` and `try_loop_specialize` still emits a (redundant) `LinearMul` — dropping that is B2 territory (Commit 3). Head values reported as `Top` / `NonZero` keep the `LinearMul` path (no regression). The `Scan` / `is_byte_clear_loop` branches of `try_loop_specialize` are unaffected because `try_linear_loop` rejects or returns empty factors for those body shapes, so B6 naturally falls through.
   - Files: `src/ir/optimize.rs` (6 unit tests: single offset, multi-offset, i8 canonicalisation, unknown head, empty body regression, `v == 0` pin of pre-B2 behaviour)
-- **B7 Deep balanced loop (graduated K6 plan)** · **[Phase 0 measurement landed; B7-α design pending implementation]**: the original Oizys K6 relies on SymPy + Z/256 matrix eigendecomposition, which doesn't fit a std-only / `forbid(unsafe_code)` / zero-runtime-deps Rust toolchain. Phase 0 quantifies "what could K6 actually recover" via two measurement modules: `src/ir/loop_stats.rs` does a **static census** of post-O2 `HirInst::Loop`s by rejection reason; `src/ir/loop_profile.rs` is a small recursive HIR interpreter doing **per-loop runtime counting** plus body dumps for the hottest B7-α candidates. E5 suite results (`cargo test --release loop_stats::e5_sweep loop_profile::e5_profile -- --ignored --nocapture`):
+- **B7 Deep balanced loop (graduated K6 plan)** · **[B7-α (P1+P2+P3) landed]**: the original Oizys K6 relies on SymPy + Z/256 matrix eigendecomposition, which doesn't fit a std-only / `forbid(unsafe_code)` / zero-runtime-deps Rust toolchain. Phase 0 quantifies "what could K6 actually recover" via two measurement modules: `src/ir/loop_stats.rs` does a **static census** of post-O2 `HirInst::Loop`s by rejection reason; `src/ir/loop_profile.rs` is a small recursive HIR interpreter doing **per-loop runtime counting** plus body dumps for the hottest B7-α candidates. E5 suite results (`cargo test --release loop_stats::e5_sweep loop_profile::e5_profile -- --ignored --nocapture`):
   - Static: of 2361 surviving Loops only 66 (2.8%) have a B7-α-tractable shape; distribution is extremely uneven — mandelbrot.b and awib-0.4.b have 31 each, the other four programs total 4.
   - Dynamic: hanoi.b's single hot loop (class=`HasInnerZero`, body `Move(1) Zero Move(-1) Add(-1)`) accounts for **95.30%** of the program's loop iterations; long.b's single hot loop (class=`HasBoth`, body contains a dead inner LinearMul subsequently overwritten by a `Zero`) accounts for **94.17%**; mandelbrot.b's 31 static candidates only account for **1.95%** at runtime — its hot loops are all `Unbalanced` and B7 cannot help.
   - **Conclusion**: even a full K6 (Z/256 matrix eigendecomposition) can recover at most 1.95% on mandelbrot — ROI is too low. hanoi / long's hot patterns sit in a simplified subset that **does not require cross-iteration recurrence**. Split B7 into α/β: α handles those two hot loops; β is reserved for mandelbrot's cross-iteration recurrence (deprioritised).
-  - **B7-α design (three independently shippable phases)**:
-    - **B7-α-P1**: add HIR variant `LinearMulWithSets { factors: Vec<(isize,i32)>, sets: Vec<(isize,u8)> }` with semantics `v=*p; *p=0; for (off,f) in factors: cell[ptr+off] += v*f; if v != 0 { for (off,val) in sets: cell[ptr+off] = val; }`; extend `try_linear_loop` to accept `Zero` in the body (at ptr ≠ 0), keep the head-cell invertibility requirement. Catches hanoi #559 (95% of hanoi iterations). 3-5 days.
-    - **B7-α-P2**: upgrade the analysis to a per-cell three-state machine (`Unwritten` / `LinearAdd(coef)` / `Set(val)`); accept inner LinearMul whose head cell is provably `Set(c)`; subsequent `Zero` automatically demotes any earlier LinearMul writes to dead stores. Catches long.b #7 (94% of long iterations). +3-5 days.
-    - **B7-α-P3**: lower to LIR by emitting `cmp/jz` to skip the sets section when v == 0 (~5 bytes overhead, no new LIR variant required — `LinearMulWithSets` can either become a new LIR variant or be split into `LinearMul + ConditionalCellSet*` during lowering). +3-5 days.
-  - Files: `src/ir/loop_stats.rs` (new, 13 unit tests + `e5_loop_rejection_census` ignored test), `src/ir/loop_profile.rs` (new, 4 unit tests + `e5_loop_hotness_profile` ignored test); future B7-α work will mainly touch `src/ir/hir.rs`, `src/ir/optimize.rs`, `src/interp/`, `src/ir/lower.rs`, `src/backend/`.
+  - **B7-α design (three phases, all landed)**:
+    - **B7-α-P1** · **[landed]**: added HIR variant `LinearMulWithSets { factors: Vec<(isize,i32)>, sets: Vec<isize> }` with semantics `v=*p; *p=0; for (off,f) in factors: cell[ptr+off] += v*f; if v != 0 { for off in sets: cell[ptr+off] = 0; }`; `try_linear_loop_with_sets` accepts `Zero` in the body (at ptr ≠ 0), keeps the head-cell invertibility requirement. Catches hanoi #559 (95% of hanoi iterations). LIR has a matching variant; backend emits `cmp/jz` guard to skip the sets section; interpreter handler supports it.
+    - **B7-α-P2** · **[landed]**: `try_linear_loop_advanced` upgrades to a per-cell four-state machine (`Unwritten` / `LinearAdd(coef)` / `Set(val)` / `Tainted`); accepts inner `LinearMul` / `LinearMulWithSets` when the head cell is provably `Set(c)` (deterministic expansion) or `Set(0)` (no-op skip); subsequent `Zero` clears `Tainted` marks. When no `Tainted` survives, extracts factors + sets reusing P1's `LinearMulWithSets` variant — no new HIR/LIR/backend code needed. Catches long.b's `HasBoth`-class hot loop (94% of iterations).
+    - **B7-α-P3** · **[landed]**: shipped together with P1. `LinearMulWithSets` is a standalone LIR variant; the backend emits `cmp byte [r13], 0; jz skip_sets` after the factors section (~5 bytes overhead). Both backends (Linux / Windows) implement this symmetrically.
+  - Files: `src/ir/optimize.rs` (`try_linear_loop_with_sets` + `try_linear_loop_advanced` + 18 B7-α unit tests), `src/ir/hir.rs`, `src/ir/lir.rs`, `src/ir/lower.rs`, `src/interp/bytecode.rs`, `src/interp/handlers.rs`, `src/interp/lower.rs`, `src/backend/codegen.rs`, `src/backend/x86_64/windows.rs`; measurement modules `src/ir/loop_stats.rs` (13 unit tests), `src/ir/loop_profile.rs` (4 unit tests).
 
-**Dependencies: B1 / B2 / B3 / B4 / B6 have landed; B5 depends on A3; B7 depends on B3 + B4 + A2.**
+**Dependencies: B1 / B2 / B3 / B4 / B6 / B7-α have landed; B5 depends on A3; B7-β depends on B3 + B4 + A2.**
 
 ### Phase C — New LIR peephole layer
 
@@ -147,7 +147,7 @@ A1 → A2 → A3 → A4                        (regression baseline)
   │    │    │    │
   │    │    │    └→ B1 (DSE) ✓
   │    │    └→ B2 (zero-loop) ✓, B5 (LICM), B6 (unroll) ✓
-  │    └→ B3 (LinearMul generalization) ✓, B4 (pointer postponement) ✓, B7 (K6)
+  │    └→ B3 (LinearMul generalization) ✓, B4 (pointer postponement) ✓, B7-α (K6 simplified) ✓
   │         │
   │         └→ C3 (displacement) ✓ → D2 / D4
   │
@@ -157,7 +157,7 @@ C1 (LIR peephole) ✓, D1 (instruction selection) ✓,
 D3 (buffered I/O — interpreter ✓ / Linux backend ✓ / Windows backend ✓),
 E1 / E2 (super-instructions + threaded dispatch) ✓,
 E3 (interp LinearMul ±1 fast path) ✓, E4 (tape doubling) ✓ can all start in parallel.
-Landed: E5, C1, D1, E4, Phase A (A1–A4), B1, B2, B3, B4, B6, C2, C3, C4, E1, E2, E3, D2 (a/b/c, symmetric on both backends), D3 (interpreter + Linux backend + Windows backend), D5 (branch hints; alignment deferred).
+Landed: E5, C1, D1, E4, Phase A (A1–A4), B1, B2, B3, B4, B6, B7-α (P1+P2+P3), C2, C3, C4, E1, E2, E3, D2 (a/b/c, symmetric on both backends), D3 (interpreter + Linux backend + Windows backend), D5 (branch hints; alignment deferred).
 
 Phase F items are all outside the near-term dependency graph.
 ```
@@ -172,7 +172,7 @@ Phase F items are all outside the near-term dependency graph.
 | HIR | `src/ir/optimize.rs` | Main edit point for Phases A / B |
 | HIR | `src/ir/analysis/` | A1–A4 skeletons (landed) |
 | HIR | `src/ir/dse.rs` | B1 DSE (landed) |
-| HIR | `src/ir/loop_stats.rs`, `src/ir/loop_profile.rs` | B7 Phase 0 measurement (landed; ignored-test entry points only) |
+| HIR | `src/ir/loop_stats.rs`, `src/ir/loop_profile.rs` | B7 Phase 0 measurement (landed) |
 | LIR | `src/ir/lir.rs`, `src/ir/lower.rs` | B / C may add `PtrAddChecked` / `CellAddAt` |
 | LIR | `src/ir/lir_opt.rs` (new) | Main venue for Phase C |
 | Backend | `src/backend/codegen.rs`, `src/backend/x86_64/encode.rs`, `src/backend/asm.rs` | Phase D |

@@ -216,7 +216,7 @@ type LinearMulWithSetsParts = (Vec<(isize, i32)>, Vec<isize>);
 ///
 /// Rejects:
 /// - body containing `Loop` / `PutByte` / `GetByte` / `Scan` / `LinearMul`
-///   (P2 will relax `LinearMul`)
+///   (`try_linear_loop_advanced` handles `LinearMul` / `LinearMulWithSets`)
 /// - unbalanced pointer (`net_ptr != 0`)
 /// - head cell (offset 0) being zeroed
 /// - same offset appearing in both `delta` and `zeroed`
@@ -280,6 +280,203 @@ fn try_linear_loop_with_sets(body: &[HirInst]) -> Option<LinearMulWithSetsParts>
     Some((factors, sets))
 }
 
+/// Per-cell abstract state for the B7-α-P2 body walk.
+///
+/// Tracks the effect of each instruction on a cell relative to the outer
+/// loop's head value. `Tainted` marks cells written by an inner
+/// `LinearMul` / `LinearMulWithSets` whose head was not provably `Set(c)`;
+/// a subsequent `Zero` clears the taint.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum CellEffect {
+    Unwritten,
+    LinearAdd(i32),
+    Set(u8),
+    Tainted,
+}
+
+impl CellEffect {
+    fn apply_add(&mut self, k: i32) {
+        match self {
+            CellEffect::Unwritten => *self = CellEffect::LinearAdd(k),
+            CellEffect::LinearAdd(c) => *c += k,
+            CellEffect::Set(v) => *self = CellEffect::Set((*v as i32 + k).rem_euclid(256) as u8),
+            CellEffect::Tainted => {}
+        }
+    }
+}
+
+/// Like [`try_linear_loop_with_sets`], but also accepts inner `LinearMul` /
+/// `LinearMulWithSets` whose writes are either statically resolvable (head
+/// provably `Set(c)`) or killed by a subsequent `Zero`.
+///
+/// Returns `None` when:
+/// - the body contains no inner `LinearMul` / `LinearMulWithSets` (let the
+///   cheaper `try_linear_loop_with_sets` handle it),
+/// - any `Tainted` cell survives to the end,
+/// - the body contains `Loop` / `PutByte` / `GetByte` / `Scan`,
+/// - the pointer is unbalanced,
+/// - the head cell is clobbered by an inner op,
+/// - the head delta is non-invertible mod 256.
+fn try_linear_loop_advanced(body: &[HirInst]) -> Option<LinearMulWithSetsParts> {
+    let mut ptr: isize = 0;
+    let mut effects: BTreeMap<isize, CellEffect> = BTreeMap::new();
+    let mut has_inner_op = false;
+
+    for inst in body {
+        match inst {
+            HirInst::Move(d) => ptr += *d,
+            HirInst::Add(k) => {
+                effects
+                    .entry(ptr)
+                    .or_insert(CellEffect::Unwritten)
+                    .apply_add(*k);
+            }
+            HirInst::Zero => {
+                effects.insert(ptr, CellEffect::Set(0));
+            }
+            HirInst::LinearMul(factors) => {
+                has_inner_op = true;
+                let head_state = effects.get(&ptr).cloned().unwrap_or(CellEffect::Unwritten);
+                match head_state {
+                    CellEffect::Set(0) => {
+                        // v == 0 → LinearMul is a no-op, head stays Set(0).
+                    }
+                    CellEffect::Set(c) => {
+                        // v == c (nonzero) → deterministic: head cleared,
+                        // each factor target gets c * f added.
+                        effects.insert(ptr, CellEffect::Set(0));
+                        for (off, f) in factors {
+                            let delta = (c as i32).wrapping_mul(*f);
+                            effects
+                                .entry(ptr + off)
+                                .or_insert(CellEffect::Unwritten)
+                                .apply_add(delta);
+                        }
+                    }
+                    _ => {
+                        // Head unknown → head is cleared (LinearMul always
+                        // zeroes head), factor targets are tainted.
+                        effects.insert(ptr, CellEffect::Set(0));
+                        for (off, _) in factors {
+                            let e = effects.entry(ptr + off).or_insert(CellEffect::Unwritten);
+                            *e = CellEffect::Tainted;
+                        }
+                    }
+                }
+            }
+            HirInst::LinearMulWithSets { factors, sets } => {
+                has_inner_op = true;
+                let head_state = effects.get(&ptr).cloned().unwrap_or(CellEffect::Unwritten);
+                match head_state {
+                    CellEffect::Set(0) => {
+                        // v == 0 → entire op is a no-op (v!=0 guard).
+                    }
+                    CellEffect::Set(c) => {
+                        effects.insert(ptr, CellEffect::Set(0));
+                        for (off, f) in factors {
+                            let delta = (c as i32).wrapping_mul(*f);
+                            effects
+                                .entry(ptr + off)
+                                .or_insert(CellEffect::Unwritten)
+                                .apply_add(delta);
+                        }
+                        for off in sets {
+                            effects.insert(ptr + off, CellEffect::Set(0));
+                        }
+                    }
+                    _ => {
+                        // Head unknown → everything tainted (v!=0 guard
+                        // makes even the sets conditional).
+                        effects.insert(ptr, CellEffect::Tainted);
+                        for (off, _) in factors {
+                            let e = effects.entry(ptr + off).or_insert(CellEffect::Unwritten);
+                            *e = CellEffect::Tainted;
+                        }
+                        for off in sets {
+                            let e = effects.entry(ptr + off).or_insert(CellEffect::Unwritten);
+                            *e = CellEffect::Tainted;
+                        }
+                    }
+                }
+            }
+            HirInst::Loop(_) | HirInst::PutByte | HirInst::GetByte | HirInst::Scan(_) => {
+                return None;
+            }
+        }
+    }
+
+    if !has_inner_op {
+        return None;
+    }
+    if ptr != 0 {
+        return None;
+    }
+    // Head cell must not be clobbered by an inner op (Set/Tainted).
+    match effects.get(&0) {
+        Some(CellEffect::Set(_)) | Some(CellEffect::Tainted) => return None,
+        _ => {}
+    }
+    // No tainted cells may survive.
+    if effects.values().any(|e| *e == CellEffect::Tainted) {
+        return None;
+    }
+
+    let d0 = match effects.get(&0) {
+        Some(CellEffect::LinearAdd(d)) => *d,
+        None | Some(CellEffect::Unwritten) => 0,
+        _ => unreachable!(),
+    };
+    let inv = invmod_256(d0)?;
+    let scale = (256 - inv).rem_euclid(256);
+
+    let mut factors: Vec<(isize, i32)> = Vec::new();
+    let mut sets: Vec<isize> = Vec::new();
+    let mut has_set_or_factor = false;
+
+    for (off, eff) in &effects {
+        if *off == 0 {
+            continue;
+        }
+        match eff {
+            CellEffect::LinearAdd(c) => {
+                let scaled = c.wrapping_mul(scale);
+                if scaled.rem_euclid(256) != 0 {
+                    factors.push((*off, scaled));
+                    has_set_or_factor = true;
+                }
+            }
+            CellEffect::Set(0) => {
+                sets.push(*off);
+                has_set_or_factor = true;
+            }
+            CellEffect::Set(_v) => {
+                // Non-zero Set: decompose into Set(0) + LinearAdd(v).
+                // The Set(0) goes into `sets`, the constant `v` is encoded
+                // as a factor with `scale` inverted so the runtime
+                // `v_head * factor` yields the desired constant.
+                //
+                // We need: v_head * factor ≡ v (mod 256) for all v_head.
+                // That's impossible in general — a constant write cannot be
+                // expressed as a head-proportional factor. Reject.
+                //
+                // (A future extension could add a `const_adds` field to
+                // LinearMulWithSets, but that's beyond P2 scope.)
+                return None;
+            }
+            CellEffect::Unwritten => {}
+            CellEffect::Tainted => unreachable!(),
+        }
+    }
+
+    if !has_set_or_factor {
+        return None;
+    }
+
+    factors.sort_by_key(|(o, _)| *o);
+    sets.sort();
+    Some((factors, sets))
+}
+
 fn try_scan_loop(body: &[HirInst]) -> Option<isize> {
     match body {
         [HirInst::Move(d)] if *d == 1 || *d == -1 => Some(*d),
@@ -323,6 +520,9 @@ fn try_unroll_known_head(env: &TapeState, inner: &[HirInst]) -> Option<Vec<HirIn
         return Some(unroll_factors(v, &factors));
     }
     if let Some((factors, sets)) = try_linear_loop_with_sets(inner) {
+        return Some(unroll_factors_with_sets(v, &factors, &sets));
+    }
+    if let Some((factors, sets)) = try_linear_loop_advanced(inner) {
         return Some(unroll_factors_with_sets(v, &factors, &sets));
     }
     None
@@ -394,6 +594,12 @@ fn try_loop_specialize(inner: &[HirInst]) -> Option<HirInst> {
         return Some(HirInst::LinearMul(factors));
     }
     if let Some((factors, sets)) = try_linear_loop_with_sets(inner) {
+        if factors.is_empty() && sets.is_empty() {
+            return Some(HirInst::Zero);
+        }
+        return Some(HirInst::LinearMulWithSets { factors, sets });
+    }
+    if let Some((factors, sets)) = try_linear_loop_advanced(inner) {
         if factors.is_empty() && sets.is_empty() {
             return Some(HirInst::Zero);
         }
@@ -1175,5 +1381,225 @@ mod tests {
         };
         let o = optimize_o1(p);
         assert!(o.insts.is_empty(), "expected empty, got {:?}", o.insts);
+    }
+
+    // ---- B7-α-P2: try_linear_loop_advanced ----
+
+    #[test]
+    fn b7a_p2_inner_lmul_then_zero() {
+        // Inner LinearMul at offset 1 followed by Zero at offset 1.
+        // The Zero kills the taint from LinearMul.
+        // Body: Add(-1) Move(1) LinearMul([(1,3)]) Zero Move(-1)
+        // At offset 1: LinearMul head → Set(0), factor target (2) → Tainted
+        //              Zero at offset 1 → Set(0) (overwrites Set(0), still Set(0))
+        // Wait — the LinearMul is at ptr=1, so its head is cell[1] and its
+        // factor target is cell[1+1]=cell[2]. The Zero at ptr=1 sets cell[1]=0.
+        // cell[2] is still Tainted. We need Zero at offset 2 to clear it.
+        //
+        // Correct pattern: inner LinearMul writes cell[2], then Zero at cell[2].
+        let body = vec![
+            HirInst::Add(-1),
+            HirInst::Move(1),
+            HirInst::LinearMul(vec![(1, 3)]),
+            HirInst::Move(1),
+            HirInst::Zero,
+            HirInst::Move(-2),
+        ];
+        let result = try_linear_loop_advanced(&body);
+        assert!(result.is_some(), "should accept inner LMul + Zero pattern");
+        let (_factors, sets) = result.unwrap();
+        assert!(sets.contains(&1));
+        assert!(sets.contains(&2));
+    }
+
+    #[test]
+    fn b7a_p2_rejects_surviving_taint() {
+        // Inner LinearMul at offset 1 writes to cell[2], but no subsequent
+        // Zero clears cell[2] → Tainted survives → reject.
+        let body = vec![
+            HirInst::Add(-1),
+            HirInst::Move(1),
+            HirInst::LinearMul(vec![(1, 3)]),
+            HirInst::Move(-1),
+        ];
+        let result = try_linear_loop_advanced(&body);
+        assert!(result.is_none(), "should reject surviving taint");
+    }
+
+    #[test]
+    fn b7a_p2_inner_lmul_with_known_head() {
+        // Inner LinearMul at offset 1, but cell[1] is Set(5) before it.
+        // Body: Add(-1) Move(1) Add(5) LinearMul([(1,2)]) Move(-1)
+        // At ptr=1: Add(5) → LinearAdd(5). But wait, LinearMul reads head
+        // and we need Set(c) not LinearAdd(c). LinearAdd means "head_value
+        // dependent" — it's c relative to the outer loop's head, not a
+        // constant. So this should be Tainted.
+        //
+        // Actually: for the inner LinearMul to be deterministic, its head
+        // must be Set(c) — a compile-time constant independent of the outer
+        // loop's head value. LinearAdd(5) means "outer_head * something + 5"
+        // which is NOT a constant. So this correctly taints.
+        let body = vec![
+            HirInst::Add(-1),
+            HirInst::Move(1),
+            HirInst::Add(5),
+            HirInst::LinearMul(vec![(1, 2)]),
+            HirInst::Move(-1),
+        ];
+        let result = try_linear_loop_advanced(&body);
+        assert!(result.is_none(), "LinearAdd head is not Set → taint");
+    }
+
+    #[test]
+    fn b7a_p2_inner_lmul_head_set_then_lmul() {
+        // cell[1] is explicitly zeroed then set to 3, then inner LinearMul.
+        // Body: Add(-1) Move(1) Zero Add(3) LinearMul([(1,2)]) Move(-1)
+        // At ptr=1: Zero → Set(0), Add(3) → Set(3).
+        // LinearMul head is Set(3): deterministic. head → Set(0),
+        // factor target cell[2] gets 3*2=6 added → LinearAdd(6).
+        // Final: cell[0]=LinearAdd(-1), cell[1]=Set(0), cell[2]=LinearAdd(6).
+        // head delta d0=-1, invmod=1, scale=1.
+        // factors: [(2, 6)], sets: [1].
+        let body = vec![
+            HirInst::Add(-1),
+            HirInst::Move(1),
+            HirInst::Zero,
+            HirInst::Add(3),
+            HirInst::LinearMul(vec![(1, 2)]),
+            HirInst::Move(-1),
+        ];
+        let result = try_linear_loop_advanced(&body);
+        assert!(
+            result.is_some(),
+            "Set(3) head for inner LMul should be accepted"
+        );
+        let (factors, sets) = result.unwrap();
+        assert_eq!(sets, vec![1]);
+        assert_eq!(factors, vec![(2, 6)]);
+    }
+
+    #[test]
+    fn b7a_p2_inner_lmul_head_set_zero_noop() {
+        // cell[1] is Set(0) before inner LinearMul → LinearMul is a no-op.
+        // Body: Add(-1) Move(1) Zero LinearMul([(1,2)]) Move(-1)
+        // At ptr=1: Zero → Set(0). LinearMul head is Set(0) → no-op.
+        // Final: cell[0]=LinearAdd(-1), cell[1]=Set(0).
+        let body = vec![
+            HirInst::Add(-1),
+            HirInst::Move(1),
+            HirInst::Zero,
+            HirInst::LinearMul(vec![(1, 2)]),
+            HirInst::Move(-1),
+        ];
+        let result = try_linear_loop_advanced(&body);
+        assert!(result.is_some(), "Set(0) head → LMul no-op → accepted");
+        let (factors, sets) = result.unwrap();
+        assert_eq!(sets, vec![1]);
+        assert!(factors.is_empty());
+    }
+
+    #[test]
+    fn b7a_p2_returns_none_for_no_inner_ops() {
+        // No inner LinearMul/LinearMulWithSets → returns None (let simpler
+        // functions handle it).
+        let body = vec![
+            HirInst::Add(-1),
+            HirInst::Move(1),
+            HirInst::Zero,
+            HirInst::Move(-1),
+        ];
+        assert!(
+            try_linear_loop_advanced(&body).is_none(),
+            "no inner ops → None"
+        );
+    }
+
+    #[test]
+    fn b7a_p2_rejects_head_clobbered_by_inner_lmul() {
+        // Inner LinearMul at offset 0 (head cell) → head clobbered → reject.
+        let body = vec![HirInst::Add(-1), HirInst::LinearMul(vec![(1, 3)])];
+        let result = try_linear_loop_advanced(&body);
+        assert!(result.is_none(), "head clobbered by inner LMul → reject");
+    }
+
+    #[test]
+    fn b7a_p2_inner_lmul_with_sets() {
+        // Inner LinearMulWithSets at offset 1 with head Set(2).
+        // Body: Add(-1) Move(1) Zero Add(2) LinearMulWithSets{factors:[(1,3)],sets:[2]} Move(-1)
+        // At ptr=1: Zero → Set(0), Add(2) → Set(2).
+        // LinearMulWithSets head is Set(2): head → Set(0),
+        // factor target cell[2] gets 2*3=6 → LinearAdd(6),
+        // set target cell[3] → Set(0).
+        let body = vec![
+            HirInst::Add(-1),
+            HirInst::Move(1),
+            HirInst::Zero,
+            HirInst::Add(2),
+            HirInst::LinearMulWithSets {
+                factors: vec![(1, 3)],
+                sets: vec![2],
+            },
+            HirInst::Move(-1),
+        ];
+        let result = try_linear_loop_advanced(&body);
+        assert!(result.is_some(), "inner LMulWithSets with Set head");
+        let (factors, sets) = result.unwrap();
+        assert_eq!(factors, vec![(2, 6)]);
+        assert!(sets.contains(&1));
+        assert!(sets.contains(&3));
+    }
+
+    #[test]
+    fn b7a_p2_optimizer_produces_lmul_with_sets() {
+        // Full pipeline: GetByte [Add(-1) Move(1) LinearMul([(1,3)]) Move(1) Zero Move(-2)]
+        // The inner LinearMul taints cell[2], but Zero at cell[2] clears it.
+        let p = HirProgram {
+            insts: vec![
+                HirInst::GetByte,
+                HirInst::Loop(vec![
+                    HirInst::Add(-1),
+                    HirInst::Move(1),
+                    HirInst::LinearMul(vec![(1, 3)]),
+                    HirInst::Move(1),
+                    HirInst::Zero,
+                    HirInst::Move(-2),
+                ]),
+            ],
+        };
+        let o = optimize_o1(p);
+        assert!(
+            matches!(
+                o.insts.as_slice(),
+                [HirInst::GetByte, HirInst::LinearMulWithSets { .. }]
+            ),
+            "expected [GetByte, LinearMulWithSets], got {:?}",
+            o.insts
+        );
+    }
+
+    #[test]
+    fn b7a_p2_unroll_known_head_with_inner_lmul() {
+        // Known head value + advanced body → unrolled
+        let p = HirProgram {
+            insts: vec![
+                HirInst::Add(3),
+                HirInst::Loop(vec![
+                    HirInst::Add(-1),
+                    HirInst::Move(1),
+                    HirInst::LinearMul(vec![(1, 3)]),
+                    HirInst::Move(1),
+                    HirInst::Zero,
+                    HirInst::Move(-2),
+                ]),
+            ],
+        };
+        let o = optimize_o2(p);
+        assert!(
+            !o.insts
+                .iter()
+                .any(|i| matches!(i, HirInst::Loop(_) | HirInst::LinearMulWithSets { .. })),
+            "expected unrolled output, got {:?}",
+            o.insts
+        );
     }
 }
