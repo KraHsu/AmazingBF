@@ -21,19 +21,31 @@ use crate::ir::hir::HirProgram;
 use crate::runtime::host::HostRuntime;
 use crate::runtime::io::{IoError, RuntimeIo};
 use crate::runtime::tape::Tape;
-#[cfg(target_os = "linux")]
-use std::collections::HashMap;
 use std::sync::Arc;
 
-/// One slot in the tiered-JIT cache for a single hot loop.
+/// State of the tiered-JIT slot for a single loop, keyed by `LoopStart` pc.
 ///
-/// `Failed` is recorded once a loop is rejected by eligibility analysis or
-/// machine-code emission, so the dispatch never retries it. `Ready` carries
-/// the live `JitBuffer` plus the `(min_off, max_off)` reach derived during
-/// eligibility analysis, used to pre-grow the tape before each call.
+/// Stored in a flat `Vec<JitState>` indexed by pc rather than a `HashMap`
+/// so the back-edge fast path can do a single bounds-checked load + tag
+/// compare per iteration. Bench (mandelbrot.b -O3 tiered, 2026-04-28) showed
+/// the prior `HashMap::contains_key` lookup added ~25 s to a 7.8 s run when
+/// every hot loop was `Failed` — a 4× regression vs. plain interpret.
+///
+/// `Failed` is sticky once an eligibility analysis or machine-code emission
+/// rejects the loop, so the back-edge short-circuits without retrying.
+/// `Ready` carries the live `JitBuffer` plus the `(min_off, max_off)` reach
+/// derived during eligibility analysis, used to pre-grow the tape before
+/// each call.
 #[cfg(target_os = "linux")]
-pub(crate) enum JitSlot {
+#[derive(Default)]
+pub(crate) enum JitState {
+    /// Loop has not yet crossed the trip-count threshold.
+    #[default]
+    Cold,
+    /// Eligibility analysis or machine-code emission rejected this loop;
+    /// never retried.
     Failed,
+    /// Loop has compiled successfully; dispatch this on the next back-edge.
     Ready {
         buf: amazingbf_jit::JitBuffer,
         reach: (i32, i32),
@@ -100,9 +112,12 @@ pub(crate) struct Interpreter<I: RuntimeIo, H: HostRuntime> {
     /// triggers compilation + dispatch on hot back-edges.
     #[cfg(target_os = "linux")]
     pub(crate) jit_enabled: bool,
-    /// Per-loop JIT cache, keyed by `LoopStart` pc.
+    /// Per-pc tiered-JIT state, indexed by `LoopStart` pc. Sized to the
+    /// bytecode `ops.len()` in `run()` so non-LoopStart slots stay `Cold`
+    /// (and are never read). Indexed access keeps the back-edge fast path
+    /// to a single load + tag compare per iteration.
     #[cfg(target_os = "linux")]
-    pub(crate) jit_cache: HashMap<u32, JitSlot>,
+    pub(crate) jit_cache: Vec<JitState>,
 }
 
 impl<I: RuntimeIo, H: HostRuntime> Interpreter<I, H> {
@@ -117,7 +132,7 @@ impl<I: RuntimeIo, H: HostRuntime> Interpreter<I, H> {
             #[cfg(target_os = "linux")]
             jit_enabled: false,
             #[cfg(target_os = "linux")]
-            jit_cache: HashMap::new(),
+            jit_cache: Vec::new(),
         }
     }
 
@@ -149,6 +164,14 @@ impl<I: RuntimeIo, H: HostRuntime> Interpreter<I, H> {
         if self.profile.is_some() {
             let threshold = self.profile.as_ref().unwrap().threshold();
             self.profile = Some(LoopProfile::new(bytecode.ops.len(), threshold));
+        }
+        #[cfg(target_os = "linux")]
+        if self.jit_enabled {
+            // Resize-with-default to allocate one `JitState::Cold` per op.
+            // Non-LoopStart slots are never read; we trade a few bytes of
+            // unused state for branch-free indexing in `handle_loop_end`.
+            self.jit_cache.clear();
+            self.jit_cache.resize_with(bytecode.ops.len(), JitState::default);
         }
         let bytecode = Arc::new(bytecode);
         self.program = Some(bytecode.clone());

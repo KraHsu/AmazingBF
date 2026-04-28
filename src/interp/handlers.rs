@@ -237,32 +237,50 @@ fn handle_loop_end<I: RuntimeIo, H: HostRuntime>(
 ) -> Result<usize, RuntimeError> {
     if let InterpOp::LoopEnd { start_pc } = op {
         if interp.tape.current() != 0 {
-            if let Some(ref mut profile) = interp.profile {
-                profile.record_back_edge(*start_pc);
-            }
-
-            // F1b tiered JIT: when the trip count crosses the configured
-            // threshold, attempt to compile the loop body once. On every
-            // subsequent back-edge, dispatch into the cached machine code,
-            // which loops to completion and returns control past `]`.
+            // F1b tiered JIT: dispatch hot loops into compiled machine
+            // code. The fast path is one Vec index + tag compare per
+            // back-edge, so `Failed` loops add no measurable overhead — a
+            // prior HashMap-based cache cost ~25 s on mandelbrot -O3
+            // (4× regression vs. plain interpret) for this exact reason.
+            //
+            // Profile updates are nested inside the `Cold` arm so once a
+            // loop's slot is decided (Failed or Ready) we stop touching
+            // the profile counters too — both decisions are sticky, so
+            // the trip count never feeds another decision. On mandelbrot
+            // -O3 this is the difference between 14.3 s (counters live)
+            // and 8.3 s (interpreter baseline).
             #[cfg(target_os = "linux")]
             if interp.jit_enabled {
-                let crossed = interp
-                    .profile
-                    .as_ref()
-                    .is_some_and(|p| p.trip_count(*start_pc) >= p.threshold());
-                if crossed {
-                    if !interp.jit_cache.contains_key(start_pc) {
-                        compile_jit_slot(interp, *start_pc);
+                let idx = *start_pc as usize;
+                use crate::interp::engine::JitState;
+                match &interp.jit_cache[idx] {
+                    JitState::Failed => {
+                        // Sticky reject: skip without consulting profile.
                     }
-                    if matches!(
-                        interp.jit_cache.get(start_pc),
-                        Some(crate::interp::engine::JitSlot::Ready { .. })
-                    ) {
+                    JitState::Ready { .. } => {
                         dispatch_jit(interp, *start_pc)?;
                         return Ok(pc + 1);
                     }
+                    JitState::Cold => {
+                        if let Some(ref mut profile) = interp.profile {
+                            profile.record_back_edge(*start_pc);
+                            if profile.trip_count(*start_pc) >= profile.threshold() {
+                                compile_jit_slot(interp, *start_pc);
+                                if matches!(interp.jit_cache[idx], JitState::Ready { .. }) {
+                                    dispatch_jit(interp, *start_pc)?;
+                                    return Ok(pc + 1);
+                                }
+                            }
+                        }
+                    }
                 }
+                return Ok(*start_pc as usize + 1);
+            }
+
+            // Non-JIT path: still record trip counts for profile-only
+            // consumers (e.g. the `loop_profile` measurement bench).
+            if let Some(ref mut profile) = interp.profile {
+                profile.record_back_edge(*start_pc);
             }
 
             Ok(*start_pc as usize + 1)
@@ -275,14 +293,14 @@ fn handle_loop_end<I: RuntimeIo, H: HostRuntime>(
 }
 
 /// Compile (or mark Failed) the JIT slot for the loop whose `LoopStart`
-/// lives at `start_pc`. Inserts exactly once per loop — `Failed` is sticky
+/// lives at `start_pc`. Writes exactly once per loop — `Failed` is sticky
 /// so a rejected loop is never retried.
 #[cfg(target_os = "linux")]
 fn compile_jit_slot<I: RuntimeIo, H: HostRuntime>(interp: &mut Interpreter<I, H>, start_pc: u32) {
-    use crate::interp::engine::JitSlot;
+    use crate::interp::engine::JitState;
     use crate::interp::jit_compile::{analyse_eligibility, compile_hot_loop};
 
-    let slot = {
+    let state = {
         let program = interp
             .program
             .as_ref()
@@ -298,13 +316,13 @@ fn compile_jit_slot<I: RuntimeIo, H: HostRuntime>(interp: &mut Interpreter<I, H>
         let body = &program.ops[(start_pc as usize) + 1..end_pc as usize];
         match analyse_eligibility(body) {
             Some(reach) => match compile_hot_loop(body) {
-                Some(buf) => JitSlot::Ready { buf, reach },
-                None => JitSlot::Failed,
+                Some(buf) => JitState::Ready { buf, reach },
+                None => JitState::Failed,
             },
-            None => JitSlot::Failed,
+            None => JitState::Failed,
         }
     };
-    interp.jit_cache.insert(start_pc, slot);
+    interp.jit_cache[start_pc as usize] = state;
 }
 
 /// Run the JIT-compiled body for the loop whose `LoopStart` lives at
@@ -318,10 +336,10 @@ fn dispatch_jit<I: RuntimeIo, H: HostRuntime>(
     interp: &mut Interpreter<I, H>,
     start_pc: u32,
 ) -> Result<(), RuntimeError> {
-    use crate::interp::engine::JitSlot;
+    use crate::interp::engine::JitState;
 
-    let (min_off, max_off) = match interp.jit_cache.get(&start_pc) {
-        Some(JitSlot::Ready { reach, .. }) => *reach,
+    let (min_off, max_off) = match &interp.jit_cache[start_pc as usize] {
+        JitState::Ready { reach, .. } => *reach,
         _ => unreachable!("dispatch_jit invariant: slot must be Ready"),
     };
 
@@ -335,8 +353,8 @@ fn dispatch_jit<I: RuntimeIo, H: HostRuntime>(
     let jit_tape = amazingbf_jit::JitTape::from_slice(&flat)
         .map_err(|e| RuntimeError::Jit(format!("JIT tape mmap failed: {e}")))?;
 
-    let exit_code = match interp.jit_cache.get(&start_pc) {
-        Some(JitSlot::Ready { buf, .. }) => {
+    let exit_code = match &interp.jit_cache[start_pc as usize] {
+        JitState::Ready { buf, .. } => {
             let dp = jit_tape.data_ptr_at(data_off);
             buf.execute_fn(jit_tape.base(), dp, jit_tape.end())
         }
