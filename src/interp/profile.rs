@@ -36,14 +36,13 @@ impl LoopProfile {
 
     /// Returns the trip count for the loop at `start_pc`.
     #[inline]
-    #[allow(dead_code)] // reason: consumed by F1b tiered JIT
     pub(crate) fn trip_count(&self, start_pc: u32) -> u64 {
         self.counts[start_pc as usize]
     }
 
     /// Returns an iterator over `(start_pc, trip_count)` for all loops that
     /// exceeded the hot threshold.
-    #[allow(dead_code)] // reason: consumed by F1b tiered JIT
+    #[allow(dead_code)] // reason: kept as a public surface for measurement-only callers; H3 uses trip_count+threshold inline
     pub(crate) fn hot_loops(&self) -> impl Iterator<Item = (u32, u64)> + '_ {
         self.counts
             .iter()

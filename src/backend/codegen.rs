@@ -664,6 +664,76 @@ pub fn compile_lir_to_jit_asm(lir: &LirProgram) -> AsmProgram {
     AsmProgram { insts: out }
 }
 
+/// Compile a LIR program into a JIT loop body for the F1b tiered JIT.
+///
+/// Same SysV ABI as [`compile_lir_to_jit_asm`] (rdi=tape_base, rsi=data_ptr,
+/// rdx=tape_end → i32) but tailored for hot-loop dispatch rather than
+/// whole-program execution:
+///
+/// - **No output-buffer mmap**: hot loops are filtered by
+///   [`crate::interp::jit_compile::analyse_eligibility`] which rejects any
+///   `PutByte` / `GetByte`, so the 4 KiB write buffer the AOT/H2 path sets
+///   up is never touched. Skipping the mmap avoids leaking 4 KiB on every
+///   single JIT dispatch.
+/// - **No flush call before return**: nothing is buffered, so flushing is
+///   unnecessary.
+/// - **No `flush_output` helper body**: dead code if the body never calls it.
+///
+/// `ensure_tape_contains_r15` is still emitted because `PtrAdd` codegen
+/// references it on the slow path. The interpreter pre-grows the tape to
+/// cover the loop's static reach before dispatching, so the slow path is
+/// never taken in practice — but the label has to resolve.
+pub fn compile_lir_to_jit_loop_asm(lir: &LirProgram) -> AsmProgram {
+    let ensure_tape_label = AsmLabel(INTERNAL_LABEL_ENSURE_TAPE_RAW);
+    let exit_one_label = AsmLabel(INTERNAL_LABEL_EXIT_ONE_RAW);
+    let flush_output_label = AsmLabel(INTERNAL_LABEL_FLUSH_OUTPUT_RAW);
+    let epilogue_label = AsmLabel(INTERNAL_LABEL_JIT_EPILOGUE_RAW);
+
+    let mut labels = LabelAllocator::new(INTERNAL_LABEL_JIT_BASE_RAW, 0);
+
+    let mut out = vec![
+        AsmInst::Push(Reg64::Rbp),
+        AsmInst::Push(Reg64::Rbx),
+        AsmInst::Push(Reg64::R12),
+        AsmInst::Push(Reg64::R13),
+        AsmInst::Push(Reg64::R14),
+        AsmInst::Push(Reg64::R15),
+        AsmInst::MovRegReg(Reg64::R12, Reg64::Rdi),
+        AsmInst::MovRegReg(Reg64::R13, Reg64::Rsi),
+        AsmInst::MovRegReg(Reg64::R14, Reg64::Rdx),
+    ];
+
+    let linux_emitter = LinuxEmitter;
+    emit_lir_body(
+        &mut out,
+        &mut labels,
+        lir,
+        ensure_tape_label,
+        flush_output_label,
+        exit_one_label,
+        &linux_emitter,
+    );
+
+    out.push(AsmInst::MovRegImm64(Reg64::Rax, 0));
+    out.push(AsmInst::Jmp(epilogue_label));
+
+    emit_ensure_tape_contains_r15(&mut out, ensure_tape_label, exit_one_label);
+
+    out.push(AsmInst::Label(exit_one_label));
+    out.push(AsmInst::MovRegImm64(Reg64::Rax, 1));
+
+    out.push(AsmInst::Label(epilogue_label));
+    out.push(AsmInst::Pop(Reg64::R15));
+    out.push(AsmInst::Pop(Reg64::R14));
+    out.push(AsmInst::Pop(Reg64::R13));
+    out.push(AsmInst::Pop(Reg64::R12));
+    out.push(AsmInst::Pop(Reg64::Rbx));
+    out.push(AsmInst::Pop(Reg64::Rbp));
+    out.push(AsmInst::Ret);
+
+    AsmProgram { insts: out }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

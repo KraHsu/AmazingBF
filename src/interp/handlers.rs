@@ -240,6 +240,31 @@ fn handle_loop_end<I: RuntimeIo, H: HostRuntime>(
             if let Some(ref mut profile) = interp.profile {
                 profile.record_back_edge(*start_pc);
             }
+
+            // F1b tiered JIT: when the trip count crosses the configured
+            // threshold, attempt to compile the loop body once. On every
+            // subsequent back-edge, dispatch into the cached machine code,
+            // which loops to completion and returns control past `]`.
+            #[cfg(target_os = "linux")]
+            if interp.jit_enabled {
+                let crossed = interp
+                    .profile
+                    .as_ref()
+                    .is_some_and(|p| p.trip_count(*start_pc) >= p.threshold());
+                if crossed {
+                    if !interp.jit_cache.contains_key(start_pc) {
+                        compile_jit_slot(interp, *start_pc);
+                    }
+                    if matches!(
+                        interp.jit_cache.get(start_pc),
+                        Some(crate::interp::engine::JitSlot::Ready { .. })
+                    ) {
+                        dispatch_jit(interp, *start_pc)?;
+                        return Ok(pc + 1);
+                    }
+                }
+            }
+
             Ok(*start_pc as usize + 1)
         } else {
             Ok(pc + 1)
@@ -247,6 +272,85 @@ fn handle_loop_end<I: RuntimeIo, H: HostRuntime>(
     } else {
         unreachable!("dispatch invariant: handle_loop_end only for LoopEnd")
     }
+}
+
+/// Compile (or mark Failed) the JIT slot for the loop whose `LoopStart`
+/// lives at `start_pc`. Inserts exactly once per loop — `Failed` is sticky
+/// so a rejected loop is never retried.
+#[cfg(target_os = "linux")]
+fn compile_jit_slot<I: RuntimeIo, H: HostRuntime>(interp: &mut Interpreter<I, H>, start_pc: u32) {
+    use crate::interp::engine::JitSlot;
+    use crate::interp::jit_compile::{analyse_eligibility, compile_hot_loop};
+
+    let slot = {
+        let program = interp
+            .program
+            .as_ref()
+            .expect("program is set by Interpreter::run before dispatch")
+            .clone();
+        let end_pc = match &program.ops[start_pc as usize] {
+            InterpOp::LoopStart { end_pc } => *end_pc,
+            other => unreachable!(
+                "LoopEnd.start_pc must point at a LoopStart, found {:?}",
+                other
+            ),
+        };
+        let body = &program.ops[(start_pc as usize) + 1..end_pc as usize];
+        match analyse_eligibility(body) {
+            Some(reach) => match compile_hot_loop(body) {
+                Some(buf) => JitSlot::Ready { buf, reach },
+                None => JitSlot::Failed,
+            },
+            None => JitSlot::Failed,
+        }
+    };
+    interp.jit_cache.insert(start_pc, slot);
+}
+
+/// Run the JIT-compiled body for the loop whose `LoopStart` lives at
+/// `start_pc`. Pre-grows the interpreter tape to cover the body's static
+/// reach, snapshots into a fresh mmap'd JIT tape, calls the function, then
+/// copies the modified tape back. The eligibility contract (balanced loop,
+/// bounded reach) guarantees the JIT exits with `data_ptr` at its entry
+/// position, so the same byte offset can be used to restore.
+#[cfg(target_os = "linux")]
+fn dispatch_jit<I: RuntimeIo, H: HostRuntime>(
+    interp: &mut Interpreter<I, H>,
+    start_pc: u32,
+) -> Result<(), RuntimeError> {
+    use crate::interp::engine::JitSlot;
+
+    let (min_off, max_off) = match interp.jit_cache.get(&start_pc) {
+        Some(JitSlot::Ready { reach, .. }) => *reach,
+        _ => unreachable!("dispatch_jit invariant: slot must be Ready"),
+    };
+
+    // Pre-grow: ensure visited_span covers the loop's per-iteration reach,
+    // so the snapshot below copies every cell the JIT will touch and the
+    // JIT-side ensure_tape never fires during execution.
+    interp.tape.add_at(min_off as isize, 0);
+    interp.tape.add_at(max_off as isize, 0);
+
+    let (flat, data_off) = interp.tape.snapshot_flat(0);
+    let jit_tape = amazingbf_jit::JitTape::from_slice(&flat)
+        .map_err(|e| RuntimeError::Jit(format!("JIT tape mmap failed: {e}")))?;
+
+    let exit_code = match interp.jit_cache.get(&start_pc) {
+        Some(JitSlot::Ready { buf, .. }) => {
+            let dp = jit_tape.data_ptr_at(data_off);
+            buf.execute_fn(jit_tape.base(), dp, jit_tape.end())
+        }
+        _ => unreachable!("dispatch_jit invariant: slot must be Ready"),
+    };
+
+    if exit_code != 0 {
+        return Err(RuntimeError::Jit(format!(
+            "JIT loop returned non-zero exit code {exit_code}"
+        )));
+    }
+
+    interp.tape.restore_from_flat(jit_tape.as_slice(), data_off);
+    Ok(())
 }
 
 /// Build the tag-indexed dispatch table. Called once per `run()`; the

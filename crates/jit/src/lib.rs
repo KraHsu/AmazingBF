@@ -250,6 +250,27 @@ impl JitTape {
         Ok(Self { ptr, len: size })
     }
 
+    /// Allocate a tape large enough to hold `initial.len()` bytes (rounded up
+    /// to the next page) and copy `initial` into the low portion.
+    ///
+    /// Used by the F1b tiered JIT to bridge the interpreter's split tape into
+    /// the contiguous mmap'd buffer the JIT-compiled loop body expects.
+    /// Bytes beyond `initial.len()` are zero (mmap pages start zero-filled).
+    #[allow(unsafe_code)]
+    pub fn from_slice(initial: &[u8]) -> Result<Self, JitError> {
+        let size = round_up_to_page(initial.len().max(1));
+        let ptr = unsafe { mmap_anonymous_rw(size) };
+        if ptr.is_null() {
+            return Err(JitError::MmapFailed(-1));
+        }
+        if !initial.is_empty() {
+            unsafe {
+                core::ptr::copy_nonoverlapping(initial.as_ptr(), ptr, initial.len());
+            }
+        }
+        Ok(Self { ptr, len: size })
+    }
+
     /// Base address of the tape.
     pub fn base(&self) -> *mut u8 {
         self.ptr
@@ -261,10 +282,50 @@ impl JitTape {
         unsafe { self.ptr.add(self.len / 2) }
     }
 
+    /// Pointer at byte offset `offset` within the tape.
+    ///
+    /// Used by the F1b tiered JIT to bridge a precomputed `data_ptr_offset`
+    /// (returned by `Tape::snapshot_flat`) into a `*mut u8` argument for the
+    /// JIT-compiled function without forcing the main crate to drop
+    /// `forbid(unsafe_code)`.
+    #[allow(unsafe_code)]
+    pub fn data_ptr_at(&self, offset: usize) -> *mut u8 {
+        debug_assert!(
+            offset <= self.len,
+            "JitTape::data_ptr_at: offset {} exceeds tape len {}",
+            offset,
+            self.len
+        );
+        unsafe { self.ptr.add(offset) }
+    }
+
     /// End address of the tape (one past the last byte).
     #[allow(unsafe_code)]
     pub fn end(&self) -> *mut u8 {
         unsafe { self.ptr.add(self.len) }
+    }
+
+    /// Total length of the tape in bytes (page-rounded).
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// True when the tape has zero bytes; never the case for `JitTape`s
+    /// produced by [`Self::new`] (they always allocate a full page).
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// View the live tape contents.
+    ///
+    /// Used by the F1b tiered JIT to copy the JIT-modified tape back into the
+    /// interpreter's split-buffer representation after the JIT'd loop body
+    /// returns. Note: if the JIT-generated `ensure_tape` routine reallocated
+    /// the tape via mmap/munmap, this slice is stale; callers must size the
+    /// initial tape large enough that growth never fires.
+    #[allow(unsafe_code)]
+    pub fn as_slice(&self) -> &[u8] {
+        unsafe { core::slice::from_raw_parts(self.ptr, self.len) }
     }
 }
 
@@ -349,6 +410,35 @@ mod tests {
         let buf = JitBuffer::new(code).expect("mmap should succeed");
         let ret = buf.execute_fn(1 as *mut u8, 2 as *mut u8, 3 as *mut u8);
         assert_eq!(ret, 6, "execute_fn should pass args via rdi/rsi/rdx");
+    }
+
+    #[test]
+    fn jit_tape_from_slice_copies_initial_bytes() {
+        let init = b"hello, world";
+        let tape = JitTape::from_slice(init).expect("mmap should succeed");
+        // Page-rounded.
+        assert_eq!(tape.len() % 4096, 0);
+        assert!(tape.len() >= init.len());
+        let view = tape.as_slice();
+        assert_eq!(&view[..init.len()], init);
+        // Trailing bytes are zero (fresh mmap pages).
+        assert!(view[init.len()..].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn jit_tape_from_empty_slice_allocates_one_page() {
+        let tape = JitTape::from_slice(&[]).expect("mmap should succeed");
+        assert_eq!(tape.len(), 4096);
+        assert!(tape.as_slice().iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn jit_tape_as_slice_reflects_full_allocation() {
+        let init = vec![0xAAu8; 100];
+        let tape = JitTape::from_slice(&init).expect("mmap should succeed");
+        let view = tape.as_slice();
+        assert_eq!(view.len(), tape.len());
+        assert_eq!(&view[..100], &init[..]);
     }
 
     /// Raw fork() via syscall — avoids libc dependency.

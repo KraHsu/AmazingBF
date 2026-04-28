@@ -21,6 +21,24 @@ use crate::ir::hir::HirProgram;
 use crate::runtime::host::HostRuntime;
 use crate::runtime::io::{IoError, RuntimeIo};
 use crate::runtime::tape::Tape;
+#[cfg(target_os = "linux")]
+use std::collections::HashMap;
+use std::sync::Arc;
+
+/// One slot in the tiered-JIT cache for a single hot loop.
+///
+/// `Failed` is recorded once a loop is rejected by eligibility analysis or
+/// machine-code emission, so the dispatch never retries it. `Ready` carries
+/// the live `JitBuffer` plus the `(min_off, max_off)` reach derived during
+/// eligibility analysis, used to pre-grow the tape before each call.
+#[cfg(target_os = "linux")]
+pub(crate) enum JitSlot {
+    Failed,
+    Ready {
+        buf: amazingbf_jit::JitBuffer,
+        reach: (i32, i32),
+    },
+}
 
 /// Errors raised by the HIR interpreter at runtime.
 #[derive(Debug)]
@@ -30,6 +48,10 @@ pub enum RuntimeError {
     /// Reserved for future host-call support in the interpreter.
     #[allow(dead_code)] // reason: constructed once host-call lowering lands
     Host(String),
+    /// Tiered-JIT execution returned a non-zero exit code, or a JIT-side
+    /// allocation (mmap of the bridging tape) failed.
+    #[cfg(target_os = "linux")]
+    Jit(String),
 }
 
 impl std::fmt::Display for RuntimeError {
@@ -37,6 +59,8 @@ impl std::fmt::Display for RuntimeError {
         match self {
             RuntimeError::Io(msg) => write!(f, "io error: {msg}"),
             RuntimeError::Host(msg) => write!(f, "host error: {msg}"),
+            #[cfg(target_os = "linux")]
+            RuntimeError::Jit(msg) => write!(f, "jit error: {msg}"),
         }
     }
 }
@@ -68,6 +92,17 @@ pub(crate) struct Interpreter<I: RuntimeIo, H: HostRuntime> {
     pub(crate) host: H,
     /// Optional loop trip-count profiler (F1b foundation).
     pub(crate) profile: Option<LoopProfile>,
+    /// The bytecode currently executing. Stored as an `Arc` so handlers
+    /// can look up loop bodies (e.g. for hot-loop JIT compilation) without
+    /// fighting the `&mut self` borrow on the dispatch loop.
+    pub(crate) program: Option<Arc<InterpProgram>>,
+    /// Whether the F1b tiered JIT is enabled. When true, `handle_loop_end`
+    /// triggers compilation + dispatch on hot back-edges.
+    #[cfg(target_os = "linux")]
+    pub(crate) jit_enabled: bool,
+    /// Per-loop JIT cache, keyed by `LoopStart` pc.
+    #[cfg(target_os = "linux")]
+    pub(crate) jit_cache: HashMap<u32, JitSlot>,
 }
 
 impl<I: RuntimeIo, H: HostRuntime> Interpreter<I, H> {
@@ -78,14 +113,29 @@ impl<I: RuntimeIo, H: HostRuntime> Interpreter<I, H> {
             io,
             host,
             profile: None,
+            program: None,
+            #[cfg(target_os = "linux")]
+            jit_enabled: false,
+            #[cfg(target_os = "linux")]
+            jit_cache: HashMap::new(),
         }
     }
 
     /// Enable loop trip-count profiling with the given hot threshold.
     /// Must be called before `run()`.
-    #[allow(dead_code)] // reason: consumed by F1b tiered JIT
+    #[allow(dead_code)] // reason: still useful for measurement-only runs without JIT
     pub(crate) fn enable_profiling(&mut self, threshold: u64) {
         self.profile = Some(LoopProfile::new(0, threshold));
+    }
+
+    /// Enable the F1b tiered JIT: profile loop trip counts and dispatch
+    /// JIT-compiled machine code for any loop whose count crosses
+    /// `threshold`. Must be called before `run()`. Linux x86_64 only.
+    #[cfg(target_os = "linux")]
+    #[allow(dead_code)] // reason: wired up by `run_tiered` in the surface commit
+    pub(crate) fn enable_tiered_jit(&mut self, threshold: u64) {
+        self.profile = Some(LoopProfile::new(0, threshold));
+        self.jit_enabled = true;
     }
 
     /// Execute a HIR program to completion, reporting the first I/O or host error encountered.
@@ -101,6 +151,8 @@ impl<I: RuntimeIo, H: HostRuntime> Interpreter<I, H> {
             let threshold = self.profile.as_ref().unwrap().threshold();
             self.profile = Some(LoopProfile::new(bytecode.ops.len(), threshold));
         }
+        let bytecode = Arc::new(bytecode);
+        self.program = Some(bytecode.clone());
         let exec_result = self.exec_bytecode(&bytecode);
         let flush_result = self.io.flush();
         exec_result?;
@@ -108,7 +160,7 @@ impl<I: RuntimeIo, H: HostRuntime> Interpreter<I, H> {
     }
 
     /// Returns the loop profile after execution, if profiling was enabled.
-    #[allow(dead_code)] // reason: consumed by F1b tiered JIT
+    #[allow(dead_code)] // reason: surface for measurement consumers (loop_profile bench)
     pub(crate) fn profile(&self) -> Option<&LoopProfile> {
         self.profile.as_ref()
     }
