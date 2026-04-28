@@ -305,6 +305,39 @@ fn bench_elf() {
         eprintln!(
             "    [case {name} Σ means over O0..O3] compile {case_sum_compile_mean:.3} ms | run {case_sum_run_mean:.3} ms"
         );
+
+        // JIT mode: measures combined compile+execute in a single process.
+        let jit_levels: &[(&str, &str)] = &[
+            ("0", "JIT-O0"),
+            ("1", "JIT-O1"),
+            ("2", "JIT-O2"),
+            ("3", "JIT-O3"),
+        ];
+        for (flag, label) in jit_levels {
+            let mut jit_ms_samples = Vec::with_capacity(TRIALS);
+            for _trial in 0..TRIALS {
+                let t = Instant::now();
+                let mut cmd = Command::new(amazingbf);
+                cmd.arg("-q")
+                    .arg(&bf_file)
+                    .arg("-m")
+                    .arg("jit")
+                    .arg("-O")
+                    .arg(flag);
+                let output = common::run_with_optional_input(cmd, &in_file);
+                jit_ms_samples.push(t.elapsed().as_secs_f64() * 1000.0);
+                assert!(
+                    output.status.success(),
+                    "{label} {name} jit failed:\n{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            let (j_mean, j_min, j_max) = mean_min_max(&jit_ms_samples);
+            eprintln!(
+                "{:<8} jit_ms mean/min/max: {:>6.3} / {:>6.3} / {:>6.3}",
+                label, j_mean, j_min, j_max,
+            );
+        }
     }
 
     eprintln!();

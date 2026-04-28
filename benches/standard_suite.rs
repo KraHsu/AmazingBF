@@ -2,11 +2,13 @@
 //!
 //! Each `BenchCase` pairs a BF program under `benches/bf/` with an optional
 //! stdin fixture under `benches/inputs/`. Per case, the harness registers
-//! two kinds of measurements:
+//! three kinds of measurements:
 //!
 //! - `interp/O<N>`: time one full run of `AmazingBF -O<N> -m interpret`.
 //! - `exec/O<N>`: time one exec of the native-compiled binary (produced
 //!   once during setup, out of the measurement loop).
+//! - `jit/O<N>` (Linux x86_64 only): time one full run of `AmazingBF -O<N> -m jit`,
+//!   measuring combined JIT compilation + execution.
 //!
 //! The per-program `interpret_levels` / `compile_levels` arrays trim the
 //! matrix to combinations that finish in a tractable wall-clock time. `O0`
@@ -42,6 +44,8 @@ struct BenchCase {
     interpret_levels: &'static [&'static str],
     /// Optimization levels to register under compile-then-exec mode.
     compile_levels: &'static [&'static str],
+    /// Optimization levels to register under JIT mode (Linux x86_64 only).
+    jit_levels: &'static [&'static str],
     /// Criterion sample count; lower for slow benches.
     sample_size: usize,
     /// Total wall time allocated per bench unit, in seconds.
@@ -57,6 +61,7 @@ const CASES: &[BenchCase] = &[
         stdin: None,
         interpret_levels: &["1", "2", "3"],
         compile_levels: &["0", "1", "2", "3"],
+        jit_levels: &["0", "1", "2", "3"],
         sample_size: 10,
         measurement_time_s: 30,
     },
@@ -66,6 +71,7 @@ const CASES: &[BenchCase] = &[
         stdin: Some("inputs/dbfi.stdin"),
         interpret_levels: &["0", "1", "2", "3"],
         compile_levels: &["0", "1", "2", "3"],
+        jit_levels: &["0", "1", "2", "3"],
         sample_size: 15,
         measurement_time_s: 20,
     },
@@ -75,6 +81,7 @@ const CASES: &[BenchCase] = &[
         stdin: Some("inputs/factor.stdin"),
         interpret_levels: &["3"],
         compile_levels: &["0", "1", "2", "3"],
+        jit_levels: &["0", "1", "2", "3"],
         sample_size: 10,
         measurement_time_s: 30,
     },
@@ -84,6 +91,7 @@ const CASES: &[BenchCase] = &[
         stdin: None,
         interpret_levels: &["3"],
         compile_levels: &["1", "2", "3"],
+        jit_levels: &["1", "2", "3"],
         sample_size: 10,
         measurement_time_s: 60,
     },
@@ -93,6 +101,7 @@ const CASES: &[BenchCase] = &[
         stdin: None,
         interpret_levels: &[],
         compile_levels: &["2", "3"],
+        jit_levels: &["2", "3"],
         sample_size: 10,
         measurement_time_s: 60,
     },
@@ -196,6 +205,26 @@ fn run_compiled(elf: &Path, case: &BenchCase, stdin_bytes: Option<&[u8]>) {
     );
 }
 
+#[cfg(target_os = "linux")]
+fn run_jit(case: &BenchCase, level: &str, stdin_bytes: Option<&[u8]>) {
+    let mut cmd = Command::new(AMAZINGBF_BIN);
+    cmd.arg(source_path(case))
+        .arg(format!("-O{}", level))
+        .arg("-m")
+        .arg("jit")
+        .arg("-q")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let status = spawn_and_feed(cmd, stdin_bytes);
+    assert!(
+        status.success(),
+        "jit of {} O{} failed: {:?}",
+        case.name,
+        level,
+        status
+    );
+}
+
 fn bench_all(c: &mut Criterion) {
     for case in CASES {
         let mut group = c.benchmark_group(case.name);
@@ -223,6 +252,17 @@ fn bench_all(c: &mut Criterion) {
                 level,
                 |b, _lvl| {
                     b.iter(|| run_compiled(&elf, case, stdin_bytes.as_deref()));
+                },
+            );
+        }
+
+        #[cfg(target_os = "linux")]
+        for level in case.jit_levels {
+            group.bench_with_input(
+                BenchmarkId::new("jit", format!("O{}", level)),
+                level,
+                |b, lvl| {
+                    b.iter(|| run_jit(case, lvl, stdin_bytes.as_deref()));
                 },
             );
         }
