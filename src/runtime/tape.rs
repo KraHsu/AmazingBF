@@ -203,6 +203,61 @@ impl Tape {
         self.ptr += delta;
         self.ensure_range(self.ptr);
     }
+
+    /// Snapshot the tape into a contiguous flat buffer suitable for JIT
+    /// execution. Returns `(flat_buf, data_ptr_offset)` where
+    /// `data_ptr_offset` is the byte offset of the current cell within
+    /// `flat_buf`.
+    ///
+    /// The flat buffer covers `[ptr_min, ptr_max]` inclusive, zero-padded
+    /// to at least `min_size` bytes and page-aligned for mmap compatibility.
+    #[cfg(target_os = "linux")]
+    #[allow(dead_code)] // reason: consumed by F1b tiered JIT
+    pub(crate) fn snapshot_flat(&self, min_size: usize) -> (Vec<u8>, usize) {
+        let lo = self.stats.ptr_min;
+        let hi = self.stats.ptr_max;
+        let span = (hi - lo) as usize + 1;
+        let size = span.max(min_size).next_multiple_of(4096);
+        let mut flat = vec![0u8; size];
+
+        let right_start = (-lo) as usize;
+        let right_copy = self.right.len().min(size - right_start);
+        flat[right_start..right_start + right_copy].copy_from_slice(&self.right[..right_copy]);
+
+        for (i, &val) in self.left.iter().enumerate() {
+            let idx = (-lo) as usize - (i + 1);
+            if idx < size {
+                flat[idx] = val;
+            }
+        }
+
+        let data_ptr_offset = (self.ptr - lo) as usize;
+        (flat, data_ptr_offset)
+    }
+
+    /// Restore tape contents from a flat buffer produced by JIT execution.
+    /// `flat` covers the same range as the last `snapshot_flat` call;
+    /// `data_ptr_offset` is the JIT's final data pointer position within
+    /// the flat buffer.
+    #[cfg(target_os = "linux")]
+    #[allow(dead_code)] // reason: consumed by F1b tiered JIT
+    pub(crate) fn restore_from_flat(&mut self, flat: &[u8], data_ptr_offset: usize) {
+        let lo = self.stats.ptr_min;
+
+        let right_start = (-lo) as usize;
+        let right_copy = self.right.len().min(flat.len() - right_start);
+        self.right[..right_copy].copy_from_slice(&flat[right_start..right_start + right_copy]);
+
+        for (i, val) in self.left.iter_mut().enumerate() {
+            let idx = (-lo) as usize - (i + 1);
+            if idx < flat.len() {
+                *val = flat[idx];
+            }
+        }
+
+        self.ptr = lo + data_ptr_offset as isize;
+        self.ensure_range(self.ptr);
+    }
 }
 
 #[cfg(test)]
