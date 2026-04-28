@@ -1680,9 +1680,10 @@ mod tests {
     #[test]
     fn jit_asm_normal_exit_returns_zero() {
         let asm = compile_lir_to_jit_asm(&LirProgram { insts: vec![] });
-        let has_mov_rax_0_then_jmp = asm.insts.windows(2).any(|w| {
-            matches!(w, [AsmInst::MovRegImm64(Reg64::Rax, 0), AsmInst::Jmp(_)])
-        });
+        let has_mov_rax_0_then_jmp = asm
+            .insts
+            .windows(2)
+            .any(|w| matches!(w, [AsmInst::MovRegImm64(Reg64::Rax, 0), AsmInst::Jmp(_)]));
         assert!(
             has_mov_rax_0_then_jmp,
             "JIT normal exit must set rax=0 then jump to epilogue"

@@ -165,13 +165,14 @@
 
 - **H1 整程序 JIT** · **[已实现]**：`-m jit` 模式（Linux x86_64 only）。`src/driver/run.rs::run_jit` 复用 `compile_linux_asm` → `relax_jumps` → `encode_program` 产出完整 x86_64 机器码，`amazingbf_jit::JitBuffer::new`（`crates/jit/src/lib.rs`）通过 raw syscall 做 `mmap(RW)` → `copy` → `mprotect(RX)`（W^X 翻转），`execute()` 以 `transmute` 跳入。JIT crate 使用 `#![deny(unsafe_code)]` + 针对性 `#[allow]` 豁免 mmap/mprotect/munmap/transmute 四处。当前生成的代码以 `syscall(SYS_exit, 0)` 终止，宿主进程随之退出——这意味着 JIT 执行后无法返回控制权给调用方（H2 解决此问题）。
   - 文件：`crates/jit/Cargo.toml`、`crates/jit/src/lib.rs`（3 单测含 fork+waitpid 验证）、`src/driver/run.rs`、`src/driver/config.rs`（`RunMode::Jit`）、`src/error.rs`（`Error::Jit`）、`src/cli.rs`（`-m jit` 帮助文本）、`tests/jit_pipeline.rs`（6 集成测试：5 case + 1 全 opt-level 交叉）
-- **H2 ret-based JIT 执行** · **[待实现]**：将 JIT 生成的代码从 `exit(0)` 终止改为 `ret` 返回，使宿主进程在 JIT 执行后可继续运行。这是 F1b tiered JIT 和 JIT 基准测试的前置条件。方案：
-  - 生成函数序言（保存 callee-saved r12–r15, rbx, rbp）+ 从 SysV ABI 参数接收 tape 状态（rdi=tape_base, rsi=data_ptr, rdx=tape_end）
-  - 将 `exit(0)` 替换为函数尾声（恢复寄存器 + `ret`）；`exit(1)` 替换为 `mov eax, 1; ret`
-  - 更新 `JitBuffer::execute` 签名以传入 tape 指针并返回退出码
-  - 在 `codegen_common.rs` 新增 `JitPlatformEmitter` 或在现有 Linux emitter 上加 `jit_mode` 参数
+- **H2 ret-based JIT 执行** · **[已实现]**：JIT 生成的代码现在使用 `ret` 返回而非 `exit(0)` 终止，使宿主进程在 JIT 执行后可继续运行。实现：
+  - `codegen.rs` 中的 `compile_lir_to_jit_asm()` 生成 SysV ABI 函数：序言保存 callee-saved 寄存器（rbp, rbx, r12–r15），从参数接收 tape 状态（rdi=tape_base, rsi=data_ptr, rdx=tape_end），尾声恢复寄存器 + `ret`，eax=0（成功）或 eax=1（错误）。
+  - `crates/jit/src/lib.rs` 中的 `JitBuffer::execute_fn(tape_base, data_ptr, tape_end) -> i32` 以类型化函数指针调用 JIT 代码。
+  - JIT crate 中的 `JitTape` 结构体封装 mmap 分配并提供安全的 `base()`/`data_ptr()`/`end()` 访问器，保持主 crate `#![forbid(unsafe_code)]` 合规。
+  - `run.rs` 中的 `run_jit()` 分配 `JitTape`，传给 `execute_fn`，检查返回码。O3 特殊情况（trivial exit、precomputed stdout）仍使用 H1 的 `execute()` 路径。
+  - 文件：`crates/jit/src/lib.rs`（`execute_fn`、`JitTape`、2 新单测）、`src/backend/codegen.rs`（`compile_lir_to_jit_asm`）、`src/driver/run.rs`（`run_jit` 重写）
 
-**依赖：H1 已落地；H2 解锁 F1b（tiered JIT）和 JIT 基准测试接入 E5。**
+**依赖：H1 已落地；H2 已落地。H2 解锁 F1b（tiered JIT）和 JIT 基准测试接入 E5。**
 
 ---
 
@@ -194,11 +195,11 @@ C1 (LIR peephole) ✓、D1 (指令选择) ✓、
 D3 (buffered I/O — 解释器 ✓ / Linux 后端 ✓ / Windows 后端 ✓)、
 E1 / E2 (superinstruction + threaded dispatch) ✓、
 E3 (interp LinearMul ±1 快路径) ✓、E4 (tape 倍增) ✓ 均可并行启动。
-已落地：E5、C1、D1、E4、Phase A (A1–A4)、B1、B2、B3、B4、B5、B6、B7-α (P1+P2+P3)、C2、C3、C4、E1、E2、E3、D2 (a/b/c/d 四项双端对称)、D3 (解释器 + Linux 后端 + Windows 后端)、D4 (冗余 mov 消除)、D5 (分支提示 + loop 头 16B 对齐)、G1 (后端重构)、H1 (整程序 JIT)。
+已落地：E5、C1、D1、E4、Phase A (A1–A4)、B1、B2、B3、B4、B5、B6、B7-α (P1+P2+P3)、C2、C3、C4、E1、E2、E3、D2 (a/b/c/d 四项双端对称)、D3 (解释器 + Linux 后端 + Windows 后端)、D4 (冗余 mov 消除)、D5 (分支提示 + loop 头 16B 对齐)、G1 (后端重构)、H1 (整程序 JIT)、H2 (ret-based JIT)。
 已调查搁置：B7-β（ROI <2%，需完整 K6 算法）。
 
 Phase H / F 依赖链：
-H1 (已落地) ──→ H2 (ret-based JIT) ──→ F1b (tiered JIT)
+H1 (已落地) ──→ H2 (已落地) ──→ F1b (tiered JIT)
                       │
                       └──→ JIT 基准测试接入 E5
 

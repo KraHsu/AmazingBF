@@ -180,12 +180,7 @@ impl JitBuffer {
     /// returned pointers (via the out-params baked into the generated code)
     /// may differ from the inputs.
     #[allow(unsafe_code)]
-    pub fn execute_fn(
-        &self,
-        tape_base: *mut u8,
-        data_ptr: *mut u8,
-        tape_end: *mut u8,
-    ) -> i32 {
+    pub fn execute_fn(&self, tape_base: *mut u8, data_ptr: *mut u8, tape_end: *mut u8) -> i32 {
         let f: extern "C" fn(*mut u8, *mut u8, *mut u8) -> i32 =
             unsafe { core::mem::transmute(self.ptr) };
         f(tape_base, data_ptr, tape_end)
