@@ -568,6 +568,102 @@ fn emit_exit_one(out: &mut Vec<AsmInst>, label: AsmLabel) {
     out.push(AsmInst::Syscall);
 }
 
+// ---------------------------------------------------------------------------
+// H2: ret-based JIT codegen
+// ---------------------------------------------------------------------------
+
+/// Internal label: JIT epilogue (restore callee-saved regs + ret).
+const INTERNAL_LABEL_JIT_EPILOGUE_RAW: u32 = u32::MAX - 4;
+
+/// Lowest reserved internal-label ID for JIT mode (inclusive).
+const INTERNAL_LABEL_JIT_RESERVED_MIN_RAW: u32 = INTERNAL_LABEL_JIT_EPILOGUE_RAW;
+
+/// Starting point for transient internal labels in JIT mode.
+const INTERNAL_LABEL_JIT_BASE_RAW: u32 = INTERNAL_LABEL_JIT_RESERVED_MIN_RAW - 1;
+
+/// Compile a LIR program into x86_64 assembly for JIT execution (H2).
+///
+/// The generated code is a SysV ABI function:
+/// ```text
+/// int32_t bf_main(uint8_t *tape_base, uint8_t *data_ptr, uint8_t *tape_end)
+/// ```
+///
+/// Layout:
+/// ```text
+/// [prologue]         ← save callee-saved regs, load args into r12/r13/r14
+/// [output buf init]  ← mmap 4 KiB output buffer
+/// [translated BF]    ← main loop
+/// [epilogue(0)]      ← flush, restore regs, return 0
+/// [ensure_tape]      ← emit_ensure_tape_contains_r15
+/// [flush_output]     ← emit_flush_output
+/// [epilogue(1)]      ← restore regs, return 1 (OOM / syscall failure)
+/// ```
+pub fn compile_lir_to_jit_asm(lir: &LirProgram) -> AsmProgram {
+    let ensure_tape_label = AsmLabel(INTERNAL_LABEL_ENSURE_TAPE_RAW);
+    let exit_one_label = AsmLabel(INTERNAL_LABEL_EXIT_ONE_RAW);
+    let flush_output_label = AsmLabel(INTERNAL_LABEL_FLUSH_OUTPUT_RAW);
+    let epilogue_label = AsmLabel(INTERNAL_LABEL_JIT_EPILOGUE_RAW);
+
+    let mut labels = LabelAllocator::new(INTERNAL_LABEL_JIT_BASE_RAW, 0);
+
+    // 1. Function prologue: save callee-saved registers.
+    //    SysV ABI callee-saved: rbx, rbp, r12-r15.
+    // 2. Load tape state from SysV ABI arguments.
+    //    rdi = tape_base, rsi = data_ptr, rdx = tape_end
+    let mut out = vec![
+        AsmInst::Push(Reg64::Rbp),
+        AsmInst::Push(Reg64::Rbx),
+        AsmInst::Push(Reg64::R12),
+        AsmInst::Push(Reg64::R13),
+        AsmInst::Push(Reg64::R14),
+        AsmInst::Push(Reg64::R15),
+        AsmInst::MovRegReg(Reg64::R12, Reg64::Rdi), // tape_base
+        AsmInst::MovRegReg(Reg64::R13, Reg64::Rsi), // data_ptr
+        AsmInst::MovRegReg(Reg64::R14, Reg64::Rdx), // tape_end
+    ];
+
+    // 3. Allocate the 4 KiB output buffer (same as AOT path).
+    emit_init_output_buffer(&mut out, exit_one_label);
+
+    // 4. Translate LIR instructions.
+    let linux_emitter = LinuxEmitter;
+    emit_lir_body(
+        &mut out,
+        &mut labels,
+        lir,
+        ensure_tape_label,
+        flush_output_label,
+        exit_one_label,
+        &linux_emitter,
+    );
+
+    // 5. Normal termination: flush output, return 0.
+    out.push(AsmInst::Call(flush_output_label));
+    out.push(AsmInst::MovRegImm64(Reg64::Rax, 0));
+    out.push(AsmInst::Jmp(epilogue_label));
+
+    // 6. Helper routines.
+    emit_ensure_tape_contains_r15(&mut out, ensure_tape_label, exit_one_label);
+    emit_flush_output(&mut out, flush_output_label);
+
+    // 7. Error path: return 1 (replaces exit(1) syscall).
+    out.push(AsmInst::Label(exit_one_label));
+    out.push(AsmInst::MovRegImm64(Reg64::Rax, 1));
+    // Fall through to epilogue.
+
+    // 8. Epilogue: restore callee-saved registers and return.
+    out.push(AsmInst::Label(epilogue_label));
+    out.push(AsmInst::Pop(Reg64::R15));
+    out.push(AsmInst::Pop(Reg64::R14));
+    out.push(AsmInst::Pop(Reg64::R13));
+    out.push(AsmInst::Pop(Reg64::R12));
+    out.push(AsmInst::Pop(Reg64::Rbx));
+    out.push(AsmInst::Pop(Reg64::Rbp));
+    out.push(AsmInst::Ret);
+
+    AsmProgram { insts: out }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1527,6 +1623,69 @@ mod tests {
         assert!(
             seeds_rcx_with_hint,
             "pipeline must promote Scan(+1) after PtrAddChecked([-2, 3]) to a `rcx=3; cld; repne scasb` SIMD scan"
+        );
+    }
+
+    // --- H2 JIT codegen tests ---
+
+    #[test]
+    fn jit_asm_starts_with_callee_saved_pushes() {
+        let asm = compile_lir_to_jit_asm(&LirProgram { insts: vec![] });
+        assert_eq!(asm.insts[0], AsmInst::Push(Reg64::Rbp));
+        assert_eq!(asm.insts[1], AsmInst::Push(Reg64::Rbx));
+        assert_eq!(asm.insts[2], AsmInst::Push(Reg64::R12));
+        assert_eq!(asm.insts[3], AsmInst::Push(Reg64::R13));
+        assert_eq!(asm.insts[4], AsmInst::Push(Reg64::R14));
+        assert_eq!(asm.insts[5], AsmInst::Push(Reg64::R15));
+    }
+
+    #[test]
+    fn jit_asm_loads_tape_from_sysv_args() {
+        let asm = compile_lir_to_jit_asm(&LirProgram { insts: vec![] });
+        assert_eq!(asm.insts[6], AsmInst::MovRegReg(Reg64::R12, Reg64::Rdi));
+        assert_eq!(asm.insts[7], AsmInst::MovRegReg(Reg64::R13, Reg64::Rsi));
+        assert_eq!(asm.insts[8], AsmInst::MovRegReg(Reg64::R14, Reg64::Rdx));
+    }
+
+    #[test]
+    fn jit_asm_ends_with_epilogue_and_ret() {
+        let asm = compile_lir_to_jit_asm(&LirProgram { insts: vec![] });
+        let n = asm.insts.len();
+        assert_eq!(asm.insts[n - 1], AsmInst::Ret);
+        assert_eq!(asm.insts[n - 2], AsmInst::Pop(Reg64::Rbp));
+        assert_eq!(asm.insts[n - 3], AsmInst::Pop(Reg64::Rbx));
+        assert_eq!(asm.insts[n - 4], AsmInst::Pop(Reg64::R12));
+        assert_eq!(asm.insts[n - 5], AsmInst::Pop(Reg64::R13));
+        assert_eq!(asm.insts[n - 6], AsmInst::Pop(Reg64::R14));
+        assert_eq!(asm.insts[n - 7], AsmInst::Pop(Reg64::R15));
+    }
+
+    #[test]
+    fn jit_asm_has_no_exit_syscall() {
+        let asm = compile_lir_to_jit_asm(&LirProgram {
+            insts: vec![LirInst::CellAdd(1)],
+        });
+        let has_exit_syscall = asm.insts.windows(3).any(|w| {
+            matches!(
+                w,
+                [AsmInst::MovRegImm64(Reg64::Rax, 60), _, AsmInst::Syscall]
+            )
+        });
+        assert!(
+            !has_exit_syscall,
+            "JIT codegen must not emit exit(0) or exit(1) syscalls"
+        );
+    }
+
+    #[test]
+    fn jit_asm_normal_exit_returns_zero() {
+        let asm = compile_lir_to_jit_asm(&LirProgram { insts: vec![] });
+        let has_mov_rax_0_then_jmp = asm.insts.windows(2).any(|w| {
+            matches!(w, [AsmInst::MovRegImm64(Reg64::Rax, 0), AsmInst::Jmp(_)])
+        });
+        assert!(
+            has_mov_rax_0_then_jmp,
+            "JIT normal exit must set rax=0 then jump to epilogue"
         );
     }
 }

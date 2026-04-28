@@ -156,7 +156,7 @@ impl JitBuffer {
         Ok(Self { ptr, len })
     }
 
-    /// Jump into the compiled machine code.
+    /// Jump into the compiled machine code (H1 legacy entry point).
     ///
     /// The generated code is expected to handle its own I/O and exit via
     /// `syscall(SYS_exit, 0)`. In that case this function never returns.
@@ -166,6 +166,29 @@ impl JitBuffer {
         let f: extern "C" fn() = unsafe { core::mem::transmute(self.ptr) };
         f();
         Ok(())
+    }
+
+    /// Call the JIT code as a SysV ABI function that receives tape state
+    /// and returns an exit code (H2 ret-based entry point).
+    ///
+    /// The generated code must follow the convention:
+    /// - `rdi` = tape_base, `rsi` = data_ptr, `rdx` = tape_end
+    /// - Returns 0 on success, 1 on error (OOM / syscall failure).
+    ///
+    /// The caller retains ownership of the tape memory; the JIT code may
+    /// reallocate it via mmap/munmap (the tape-growth routine), so the
+    /// returned pointers (via the out-params baked into the generated code)
+    /// may differ from the inputs.
+    #[allow(unsafe_code)]
+    pub fn execute_fn(
+        &self,
+        tape_base: *mut u8,
+        data_ptr: *mut u8,
+        tape_end: *mut u8,
+    ) -> i32 {
+        let f: extern "C" fn(*mut u8, *mut u8, *mut u8) -> i32 =
+            unsafe { core::mem::transmute(self.ptr) };
+        f(tape_base, data_ptr, tape_end)
     }
 }
 
@@ -182,6 +205,82 @@ impl Drop for JitBuffer {
 // process-private and not shared across threads.
 #[allow(unsafe_code)]
 unsafe impl Send for JitBuffer {}
+
+/// Allocate a zero-initialised anonymous RW mapping of `size` bytes.
+///
+/// Returns a non-null pointer on success, or null on failure.
+/// The caller is responsible for eventually `munmap`-ing the region.
+///
+/// # Safety
+/// `size` must be > 0. The returned pointer is valid for `size` bytes.
+#[allow(unsafe_code)]
+pub unsafe fn mmap_anonymous_rw(size: usize) -> *mut u8 {
+    let ret = unsafe {
+        raw_syscall6(
+            SYS_MMAP,
+            0,
+            size as i64,
+            PROT_READ | PROT_WRITE,
+            MAP_PRIVATE | MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    };
+    if ret < 0 {
+        core::ptr::null_mut()
+    } else {
+        ret as *mut u8
+    }
+}
+
+/// A zero-initialised RW memory region for use as a BF tape in JIT mode.
+///
+/// The data pointer starts in the middle of the tape so that both `<` and `>`
+/// have room before triggering growth. The JIT-generated code may reallocate
+/// the tape via its own mmap/munmap (the `ensure_tape` routine), so the
+/// original pointers may become stale after execution.
+pub struct JitTape {
+    ptr: *mut u8,
+    len: usize,
+}
+
+impl JitTape {
+    /// Allocate a new tape of `size` bytes via mmap.
+    #[allow(unsafe_code)]
+    pub fn new(size: usize) -> Result<Self, JitError> {
+        let ptr = unsafe { mmap_anonymous_rw(size) };
+        if ptr.is_null() {
+            return Err(JitError::MmapFailed(-1));
+        }
+        Ok(Self { ptr, len: size })
+    }
+
+    /// Base address of the tape.
+    pub fn base(&self) -> *mut u8 {
+        self.ptr
+    }
+
+    /// Initial data pointer (middle of the tape).
+    #[allow(unsafe_code)]
+    pub fn data_ptr(&self) -> *mut u8 {
+        unsafe { self.ptr.add(self.len / 2) }
+    }
+
+    /// End address of the tape (one past the last byte).
+    #[allow(unsafe_code)]
+    pub fn end(&self) -> *mut u8 {
+        unsafe { self.ptr.add(self.len) }
+    }
+}
+
+impl Drop for JitTape {
+    #[allow(unsafe_code)]
+    fn drop(&mut self) {
+        unsafe {
+            raw_syscall6(SYS_MUNMAP, self.ptr as i64, self.len as i64, 0, 0, 0, 0);
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -223,6 +322,38 @@ mod tests {
         // Parent: wait for child
         let status = unsafe { libc_waitpid(pid) };
         assert_eq!(status, 0, "child should exit with code 0");
+    }
+
+    #[test]
+    fn execute_fn_returns_value() {
+        // x86_64: mov eax, 42; ret
+        // A minimal function that returns 42 via the SysV ABI.
+        let code: &[u8] = &[
+            0xB8, 0x2A, 0x00, 0x00, 0x00, // mov eax, 42
+            0xC3, // ret
+        ];
+        let buf = JitBuffer::new(code).expect("mmap should succeed");
+        let ret = buf.execute_fn(
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        );
+        assert_eq!(ret, 42, "execute_fn should return the value from eax");
+    }
+
+    #[test]
+    fn execute_fn_receives_args() {
+        // x86_64: mov rax, rdi; add rax, rsi; add rax, rdx; ret
+        // Returns the sum of the three pointer arguments (as integers).
+        let code: &[u8] = &[
+            0x48, 0x89, 0xF8, // mov rax, rdi
+            0x48, 0x01, 0xF0, // add rax, rsi
+            0x48, 0x01, 0xD0, // add rax, rdx
+            0xC3, // ret
+        ];
+        let buf = JitBuffer::new(code).expect("mmap should succeed");
+        let ret = buf.execute_fn(1 as *mut u8, 2 as *mut u8, 3 as *mut u8);
+        assert_eq!(ret, 6, "execute_fn should pass args via rdi/rsi/rdx");
     }
 
     /// Raw fork() via syscall — avoids libc dependency.

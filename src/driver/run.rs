@@ -7,7 +7,8 @@
 use crate::Result;
 use crate::backend::asm::AsmProgram;
 use crate::backend::codegen::{
-    compile_lir_to_asm, compile_precomputed_stdout_asm, compile_trivial_exit_asm,
+    compile_lir_to_asm, compile_lir_to_jit_asm, compile_precomputed_stdout_asm,
+    compile_trivial_exit_asm,
 };
 use crate::backend::x86_64::debug;
 use crate::backend::x86_64::relax::relax_jumps;
@@ -206,16 +207,68 @@ fn build_optimized_lir(hir: &HirProgram, opt_level: OptLevel) -> LirProgram {
 
 #[cfg(target_os = "linux")]
 fn run_jit(config: &DriverConfig, hir: &HirProgram) -> Result<()> {
-    let asm = relax_jumps(compile_linux_asm(hir, config.opt_level)?);
-    let encoded = crate::backend::x86_64::encode::encode_program(&asm);
+    use crate::backend::x86_64::encode::encode_program;
+
+    // O3 special cases still use the H1 exit-based path (no tape needed).
+    if config.opt_level == OptLevel::O3 {
+        if !hir.has_put_byte() {
+            log_info("jit -O3: no output ops; emitting trivial exit(0)");
+            let asm = relax_jumps(compile_trivial_exit_asm());
+            let encoded = encode_program(&asm);
+            let buf = amazingbf_jit::JitBuffer::new(&encoded.text)
+                .map_err(|e| crate::error::Error::Jit(e.to_string()))?;
+            buf.execute()
+                .map_err(|e| crate::error::Error::Jit(e.to_string()))?;
+            return Ok(());
+        }
+        if !hir.has_get_byte() {
+            log_info("jit -O3: no input; folding stdout to precomputed write+exit");
+            let io = BufferOutputIo::default();
+            let mut interp = Interpreter::new(DEFAULT_INTERPRETER_TAPE_LEN, io, NullHost::new());
+            interp.run(hir)?;
+            let asm = relax_jumps(compile_precomputed_stdout_asm(&interp.io.bytes));
+            let encoded = encode_program(&asm);
+            let buf = amazingbf_jit::JitBuffer::new(&encoded.text)
+                .map_err(|e| crate::error::Error::Jit(e.to_string()))?;
+            buf.execute()
+                .map_err(|e| crate::error::Error::Jit(e.to_string()))?;
+            return Ok(());
+        }
+    }
+
+    // H2 ret-based JIT: compile to a callable function, allocate a tape,
+    // call the function, and inspect the return code.
+    let lir = build_optimized_lir(hir, config.opt_level);
+    log_debug(format!("jit: lowered lir (lir_insts={})", lir.len()));
+    let asm = relax_jumps(compile_lir_to_jit_asm(&lir));
+    let encoded = encode_program(&asm);
     log_debug(format!(
         "jit: encoded x86_64 machine code (text_bytes={})",
         encoded.text.len()
     ));
+
     let buf = amazingbf_jit::JitBuffer::new(&encoded.text)
         .map_err(|e| crate::error::Error::Jit(e.to_string()))?;
-    log_info("jit: executing compiled code");
-    buf.execute()
+
+    // Allocate the initial tape via mmap (same size as the AOT backend).
+    const JIT_INITIAL_TAPE: usize = 4096;
+    let tape = amazingbf_jit::JitTape::new(JIT_INITIAL_TAPE)
         .map_err(|e| crate::error::Error::Jit(e.to_string()))?;
+
+    log_info("jit: executing compiled code (H2 ret-based)");
+    let exit_code = buf.execute_fn(tape.base(), tape.data_ptr(), tape.end());
+
+    // The JIT code may have reallocated the tape via its own mmap/munmap,
+    // so we must not drop the original JitTape (it may already be freed).
+    // Leak it — the OS reclaims all mappings on process exit.
+    std::mem::forget(tape);
+
+    if exit_code != 0 {
+        return Err(crate::error::Error::Jit(format!(
+            "JIT code returned error (exit_code={exit_code})"
+        )));
+    }
+
+    log_info("jit: execution completed successfully");
     Ok(())
 }

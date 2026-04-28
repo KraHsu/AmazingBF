@@ -166,13 +166,14 @@ Goal: add `src/ir/lir_opt.rs` after `src/ir/lower.rs` to provide a no-analysis p
 
 - **H1 Whole-program JIT** · **[landed]**: `-m jit` mode (Linux x86_64 only). `src/driver/run.rs::run_jit` reuses `compile_linux_asm` → `relax_jumps` → `encode_program` to produce complete x86_64 machine code; `amazingbf_jit::JitBuffer::new` (`crates/jit/src/lib.rs`) performs `mmap(RW)` → `copy` → `mprotect(RX)` (W^X flip) via raw syscalls; `execute()` jumps in via `transmute`. The JIT crate uses `#![deny(unsafe_code)]` with targeted `#[allow]` exemptions for mmap/mprotect/munmap/transmute. The generated code currently terminates via `syscall(SYS_exit, 0)`, so the host process exits — control cannot return to the caller (H2 addresses this).
   - Files: `crates/jit/Cargo.toml`, `crates/jit/src/lib.rs` (3 unit tests with fork+waitpid verification), `src/driver/run.rs`, `src/driver/config.rs` (`RunMode::Jit`), `src/error.rs` (`Error::Jit`), `src/cli.rs` (`-m jit` help text), `tests/jit_pipeline.rs` (6 integration tests: 5 cases + 1 all-opt-level cross)
-- **H2 ret-based JIT execution** · **[pending]**: change the JIT-generated code from `exit(0)` termination to `ret`-based return, allowing the host process to continue after JIT execution. This is the prerequisite for F1b tiered JIT and JIT benchmarking. Approach:
-  - Generate a function prologue (save callee-saved r12–r15, rbx, rbp) + receive tape state from SysV ABI arguments (rdi=tape_base, rsi=data_ptr, rdx=tape_end)
-  - Replace `exit(0)` with a function epilogue (restore registers + `ret`); replace `exit(1)` with `mov eax, 1; ret`
-  - Update `JitBuffer::execute` signature to accept tape pointers and return an exit code
-  - Add `JitPlatformEmitter` to `codegen_common.rs` or add a `jit_mode` parameter to the existing Linux emitter
+- **H2 ret-based JIT execution** · **[landed]**: the JIT-generated code now uses `ret`-based return instead of `exit(0)` termination, allowing the host process to continue after JIT execution. Implementation:
+  - `compile_lir_to_jit_asm()` in `codegen.rs` generates a SysV ABI function: prologue saves callee-saved registers (rbp, rbx, r12–r15), receives tape state from arguments (rdi=tape_base, rsi=data_ptr, rdx=tape_end), and the epilogue restores registers + `ret` with eax=0 (success) or eax=1 (error).
+  - `JitBuffer::execute_fn(tape_base, data_ptr, tape_end) -> i32` in `crates/jit/src/lib.rs` calls the JIT code as a typed function pointer.
+  - `JitTape` struct in the JIT crate encapsulates mmap allocation and provides safe `base()`/`data_ptr()`/`end()` accessors, keeping the main crate `#![forbid(unsafe_code)]`-clean.
+  - `run_jit()` in `run.rs` allocates a `JitTape`, passes it to `execute_fn`, and checks the return code. O3 special cases (trivial exit, precomputed stdout) still use the H1 `execute()` path.
+  - Files: `crates/jit/src/lib.rs` (`execute_fn`, `JitTape`, 2 new unit tests), `src/backend/codegen.rs` (`compile_lir_to_jit_asm`), `src/driver/run.rs` (`run_jit` rewrite)
 
-**Dependencies: H1 landed; H2 unblocks F1b (tiered JIT) and JIT benchmark integration with E5.**
+**Dependencies: H1 landed; H2 landed. H2 unblocks F1b (tiered JIT) and JIT benchmark integration with E5.**
 
 ---
 
@@ -195,11 +196,11 @@ C1 (LIR peephole) ✓, D1 (instruction selection) ✓,
 D3 (buffered I/O — interpreter ✓ / Linux backend ✓ / Windows backend ✓),
 E1 / E2 (super-instructions + threaded dispatch) ✓,
 E3 (interp LinearMul ±1 fast path) ✓, E4 (tape doubling) ✓ can all start in parallel.
-Landed: E5, C1, D1, E4, Phase A (A1–A4), B1, B2, B3, B4, B5, B6, B7-α (P1+P2+P3), C2, C3, C4, E1, E2, E3, D2 (a/b/c/d, symmetric on both backends), D3 (interpreter + Linux backend + Windows backend), D4 (redundant mov elimination), D5 (branch hints + loop-head 16B alignment), G1 (backend refactoring), H1 (whole-program JIT).
+Landed: E5, C1, D1, E4, Phase A (A1–A4), B1, B2, B3, B4, B5, B6, B7-α (P1+P2+P3), C2, C3, C4, E1, E2, E3, D2 (a/b/c/d, symmetric on both backends), D3 (interpreter + Linux backend + Windows backend), D4 (redundant mov elimination), D5 (branch hints + loop-head 16B alignment), G1 (backend refactoring), H1 (whole-program JIT), H2 (ret-based JIT).
 Investigated and deferred: B7-β (ROI <2%, requires full K6 algorithm).
 
 Phase H / F dependency chain:
-H1 (landed) ──→ H2 (ret-based JIT) ──→ F1b (tiered JIT)
+H1 (landed) ──→ H2 (landed) ──→ F1b (tiered JIT)
                       │
                       └──→ JIT benchmark integration with E5
 
