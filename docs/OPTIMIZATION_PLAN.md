@@ -138,15 +138,41 @@ Goal: add `src/ir/lir_opt.rs` after `src/ir/lower.rs` to provide a no-analysis p
 
 **Dependencies: E5 has none, first to land; E1 → E2; E3 has none; E4 and D3's I/O rework can share a milestone.**
 
-### Phase F — Long-term goals (outside the near-term dependency graph)
+### Phase F — Long-term goals
 
-- **F1 Tiered JIT**: the interpreter collects loop trip counts, and hot regions switch to backend-generated machine code. Two implementation paths:
-  - Hand-rolled (reusing the existing `src/backend/x86_64/encode.rs`): self-contained, but `mmap(PROT_EXEC)` necessarily breaks `#![forbid(unsafe_code)]` — the exemption scope needs to be explicitly agreed on.
-  - [Cranelift](https://cranelift.dev/) as the JIT backend: a mature codegen framework, used by several BF-JIT case studies (e.g. [Rodrigodd's Part 3](https://rodrigodd.github.io/2022/11/26/bf_compiler-part3.html)), but breaks the "zero runtime dependencies" promise; the tradeoff mirrors F4 LLVM.
-- **F2 ARM64 backend**: Linux aarch64 + macOS arm64. Register conventions need to be redesigned (`x12/x13/x14/x15` remapping), and the encode layer rewritten from scratch.
-- **F3 macOS Mach-O x86_64 backend**: smaller workload than ELF, but the syscall numbers change, and `LC_SEGMENT_64` / `LC_MAIN` file-format code must be added.
-- **F4 LLVM backend (optional)**: the cost is breaking the "zero runtime dependencies" promise; exists behind a toggleable feature flag.
+- **F1 JIT execution**:
+  - **F1a Whole-program JIT** → see H1 (landed).
+  - **F1b Tiered JIT (interpreter-driven hot-spot compilation)**: the interpreter collects loop trip counts, and hot regions switch to backend-generated machine code. Depends on H2 (ret-based JIT) landing first. Two implementation paths:
+    - Hand-rolled (reusing the existing `src/backend/x86_64/encode.rs` + `crates/jit`): self-contained; H1 has already proven the mmap/mprotect path viable.
+    - [Cranelift](https://cranelift.dev/) as the JIT backend: a mature codegen framework, used by several BF-JIT case studies (e.g. [Rodrigodd's Part 3](https://rodrigodd.github.io/2022/11/26/bf_compiler-part3.html)), but breaks the "zero runtime dependencies" promise; the tradeoff mirrors F4 LLVM.
+- **F2 ARM64 backend**: Linux aarch64. Register conventions need to be redesigned (suggested `x19–x24` callee-saved mapping), and the encode layer rewritten from scratch. G1's `PlatformEmitter` trait and `emit_lir_body` can reuse the control flow, but a parallel `AArch64AsmInst` enum is needed.
+- **F4 LLVM backend (optional)**: the cost is breaking the "zero runtime dependencies" promise; exists behind a toggleable feature flag. `src/llvm/` directory is reserved; `feat/llvm` branch exists. If pursued, LIR is the best input layer — already linearized with explicit labels/jumps, mapping naturally to LLVM basic blocks.
 - **F5 Incremental compilation cache**: cache HIR / LIR / obj for a fixed `.bf` source keyed by content hash. Only worth it if E5 shows compile time is a significant fraction of total time.
+
+### Phase G — Backend refactoring (landed)
+
+> Goal: eliminate code duplication between the Linux / Windows backends, lowering the cost of adding new backends (F2 ARM64).
+
+- **G1 Extract shared codegen logic** ✓: created `src/backend/codegen_common.rs`, containing:
+  - `LabelAllocator`: unified internal label allocator (replacing Linux's `fresh_internal_label(&mut u32)` and Windows's `LabelAllocator::new()`).
+  - 6 utility functions: `map_label`, `mem8_add_at_r13`, `mem8_set_at_r13`, `emit_add_reg_isize`, `emit_ptr_add_out`, `emit_ptr_add_checked_out`.
+  - `PlatformEmitter` trait: abstracts `emit_put_byte` / `emit_get_byte` / `needs_rsp_alignment()` (the three ABI-specific hooks).
+  - `emit_lir_body()`: complete LIR→AsmInst translation loop covering all ABI-neutral match arms (PtrAdd, PtrAddChecked, CellAdd, CellSet, CellAddAt, CellSetAt, ZeroRun, LinearMul, LinearMulWithSets, Scan, ScanWithHint, Label, JumpIfZero, JumpIfNonZero), delegating PutByte/GetByte to `PlatformEmitter` callbacks and parameterizing LinearMul's Win64 RSP alignment via `needs_rsp_alignment`.
+  - Effect: `codegen.rs` 2120→1532 lines (−588), `windows.rs` 1655→1221 lines (−434), `codegen_common.rs` 516 lines, net −506 lines.
+
+### Phase H — JIT evolution (partially landed)
+
+> Goal: evolve from AOT-only to JIT execution, ultimately enabling interpreter-driven hot-spot compilation.
+
+- **H1 Whole-program JIT** · **[landed]**: `-m jit` mode (Linux x86_64 only). `src/driver/run.rs::run_jit` reuses `compile_linux_asm` → `relax_jumps` → `encode_program` to produce complete x86_64 machine code; `amazingbf_jit::JitBuffer::new` (`crates/jit/src/lib.rs`) performs `mmap(RW)` → `copy` → `mprotect(RX)` (W^X flip) via raw syscalls; `execute()` jumps in via `transmute`. The JIT crate uses `#![deny(unsafe_code)]` with targeted `#[allow]` exemptions for mmap/mprotect/munmap/transmute. The generated code currently terminates via `syscall(SYS_exit, 0)`, so the host process exits — control cannot return to the caller (H2 addresses this).
+  - Files: `crates/jit/Cargo.toml`, `crates/jit/src/lib.rs` (3 unit tests with fork+waitpid verification), `src/driver/run.rs`, `src/driver/config.rs` (`RunMode::Jit`), `src/error.rs` (`Error::Jit`), `src/cli.rs` (`-m jit` help text), `tests/jit_pipeline.rs` (6 integration tests: 5 cases + 1 all-opt-level cross)
+- **H2 ret-based JIT execution** · **[pending]**: change the JIT-generated code from `exit(0)` termination to `ret`-based return, allowing the host process to continue after JIT execution. This is the prerequisite for F1b tiered JIT and JIT benchmarking. Approach:
+  - Generate a function prologue (save callee-saved r12–r15, rbx, rbp) + receive tape state from SysV ABI arguments (rdi=tape_base, rsi=data_ptr, rdx=tape_end)
+  - Replace `exit(0)` with a function epilogue (restore registers + `ret`); replace `exit(1)` with `mov eax, 1; ret`
+  - Update `JitBuffer::execute` signature to accept tape pointers and return an exit code
+  - Add `JitPlatformEmitter` to `codegen_common.rs` or add a `jit_mode` parameter to the existing Linux emitter
+
+**Dependencies: H1 landed; H2 unblocks F1b (tiered JIT) and JIT benchmark integration with E5.**
 
 ---
 
@@ -158,21 +184,26 @@ E5 (bench)  ──────────────────────�
 A1 → A2 → A3 → A4                        (regression baseline)
   │    │    │    │
   │    │    │    └→ B1 (DSE) ✓
-  │    │    └→ B2 (zero-loop) ✓, B5 (LICM), B6 (unroll) ✓
+  │    │    └→ B2 (zero-loop) ✓, B5 (LICM) ✓, B6 (unroll) ✓
   │    └→ B3 (LinearMul generalization) ✓, B4 (pointer postponement) ✓, B7-α (K6 simplified) ✓
   │         │
-  │         └→ C3 (displacement) ✓ → D2 / D4
+  │         └→ C3 (displacement) ✓ → D2 ✓ / D4 ✓
   │
-  └→ C2 (bounds batching) ✓ → C4 (scan hint) ✓, D2 (SIMD)
+  └→ C2 (bounds batching) ✓ → C4 (scan hint) ✓, D2 (SIMD) ✓
 
 C1 (LIR peephole) ✓, D1 (instruction selection) ✓,
 D3 (buffered I/O — interpreter ✓ / Linux backend ✓ / Windows backend ✓),
 E1 / E2 (super-instructions + threaded dispatch) ✓,
 E3 (interp LinearMul ±1 fast path) ✓, E4 (tape doubling) ✓ can all start in parallel.
-Landed: E5, C1, D1, E4, Phase A (A1–A4), B1, B2, B3, B4, B5, B6, B7-α (P1+P2+P3), C2, C3, C4, E1, E2, E3, D2 (a/b/c/d, symmetric on both backends), D3 (interpreter + Linux backend + Windows backend), D4 (redundant mov elimination), D5 (branch hints + loop-head 16B alignment).
+Landed: E5, C1, D1, E4, Phase A (A1–A4), B1, B2, B3, B4, B5, B6, B7-α (P1+P2+P3), C2, C3, C4, E1, E2, E3, D2 (a/b/c/d, symmetric on both backends), D3 (interpreter + Linux backend + Windows backend), D4 (redundant mov elimination), D5 (branch hints + loop-head 16B alignment), G1 (backend refactoring), H1 (whole-program JIT).
 Investigated and deferred: B7-β (ROI <2%, requires full K6 algorithm).
 
-Phase F items are all outside the near-term dependency graph.
+Phase H / F dependency chain:
+H1 (landed) ──→ H2 (ret-based JIT) ──→ F1b (tiered JIT)
+                      │
+                      └──→ JIT benchmark integration with E5
+
+F2 (ARM64), F4 (LLVM), F5 (incremental cache) are outside the near-term dependency graph.
 ```
 
 ---
@@ -188,11 +219,12 @@ Phase F items are all outside the near-term dependency graph.
 | HIR | `src/ir/loop_stats.rs`, `src/ir/loop_profile.rs` | B7 Phase 0 measurement (landed) |
 | LIR | `src/ir/lir.rs`, `src/ir/lower.rs` | B / C may add `PtrAddChecked` / `CellAddAt` |
 | LIR | `src/ir/lir_opt.rs` (new) | Main venue for Phase C |
-| Backend | `src/backend/codegen.rs`, `src/backend/x86_64/encode.rs`, `src/backend/asm.rs` | Phase D |
-| Backend | `src/backend/x86_64/elf.rs`, `src/backend/x86_64/windows.rs` | D3 buffered I/O |
-| Runtime | `src/interp/engine.rs`, `src/runtime/{tape,io,host}.rs` | Phase E |
+| Backend | `src/backend/codegen.rs`, `src/backend/codegen_common.rs`, `src/backend/x86_64/encode.rs`, `src/backend/asm.rs` | Phase D / G1 / H2 |
+| Backend | `src/backend/x86_64/elf.rs`, `src/backend/x86_64/windows.rs` | D3 buffered I/O / G1 |
+| JIT | `crates/jit/src/lib.rs` | H1 (landed) / H2 |
+| Runtime | `src/interp/engine.rs`, `src/runtime/{tape,io,host}.rs` | Phase E / F1b |
 | Bench | `benches/` (new) | E5 |
-| Tests | `tests/cases_pipeline.rs`, `tests/compile_artifacts.rs` | Regression after each phase |
+| Tests | `tests/cases_pipeline.rs`, `tests/compile_artifacts.rs`, `tests/jit_pipeline.rs` | Regression after each phase |
 
 ---
 
@@ -210,8 +242,8 @@ Phase F items are all outside the near-term dependency graph.
 
 - Do not adjust the semantics of the existing O0–O3 CLI flags (no changes to `src/cli.rs` / `src/driver/config.rs`); new optimizations fit into the existing levels.
 - No third-party runtime dependencies (stay `std`-only).
-- Do not break `#![forbid(unsafe_code)]`; Phase F1 JIT's exemption scope is discussed separately and is not part of the near-term roadmap.
-- Both language editions (`docs/OPTIMIZATION_PLAN.md` and `docs/OPTIMIZATION_PLAN_CN.md`) must be updated in lockstep.
+- Do not break the main crate's `#![forbid(unsafe_code)]`; the JIT crate (`crates/jit`) uses `#![deny(unsafe_code)]` with targeted `#[allow]` exemptions for mmap/mprotect/munmap/transmute — this boundary was established in H1. Phase F1b's tiered JIT will follow the same isolation pattern.
+- Both language editions (`docs/OPTIMIZATION_PLAN.md` and `docs/OPTIMIZATION_PLAN_CN.md`) are updated in lockstep.
 
 ---
 
@@ -243,3 +275,13 @@ The key techniques in this roadmap are not novel; the following is the industry 
 - awib-0.4.b: from [matslina/awib](https://github.com/matslina/awib), used as a self-benchmark input.
 
 These programs recur across the existing literature, so using them makes this toolchain's optimization effects directly comparable against bfc / awib / Oizys / Tritium, rather than having to build an incommensurable in-house benchmark set.
+
+---
+
+## 8. Related Subsystems (outside the optimization roadmap scope)
+
+The following subsystems benefit from the optimization pipeline documented above, but their own development is not tracked in this document. Listed here for awareness only.
+
+- **BFS (Brainf Script) compiler**: `src/bfsc/` (lexer → parser → typeck → codegen), `bfsc` binary entry point. Compiles high-level `.bfs` source to Brainfuck; optionally `-c` to go straight through `driver::run` and produce a native executable. Integration tests in `tests/cases_bfs/`.
+- **Tauri GUI**: `src/gui.rs` + `src/runtime/gui_io.rs`, feature-gated (`gui`), `bf-gui` binary entry point. Runs the BF interpreter inside a Tauri window with screen-buffer output and keyboard input. Example programs in `examples/gui_*.bfs`.
+- **JIT crate**: `crates/jit/` (workspace member `amazingbf-jit`), provides `JitBuffer` (mmap/mprotect/munmap + execute). Consumed by H1 whole-program JIT; H2 / F1b will extend its API.

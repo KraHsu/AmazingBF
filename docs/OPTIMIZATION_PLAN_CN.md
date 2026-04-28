@@ -137,19 +137,20 @@
 
 **依赖：E5 无依赖，最先；E1 → E2；E3 无依赖；E4 与 D3 的 I/O 改造可放同一个里程碑。**
 
-### Phase F — 长期目标（不进入近期依赖图）
+### Phase F — 长期目标
 
-- **F1 Tiered JIT**：解释器采集 loop trip count，热点处走 backend 生成的机器码。两条实现路径：
-  - 自写（沿用现有 `src/backend/x86_64/encode.rs`）：代码闭环，但 `mmap(PROT_EXEC)` 必须打破 `#![forbid(unsafe_code)]`，需明确豁免范围。
-  - [Cranelift](https://cranelift.dev/) 作为 JIT 后端：成熟的 codegen 框架，已被多个 BF JIT 案例（如 [Rodrigodd 的 Part 3](https://rodrigodd.github.io/2022/11/26/bf_compiler-part3.html)）使用，但破坏 “零运行时依赖” 承诺；与 F4 LLVM 的抉择类似。
-- **F2 ARM64 后端**：Linux aarch64 + macOS arm64。寄存器约定需重设（`x12/x13/x14/x15` 映射），encode 层完全新写。
-- **F3 macOS Mach-O x86_64 后端**：相对 ELF 工作量小，但 syscall 号变化，需增加 `LC_SEGMENT_64` / `LC_MAIN` 的文件格式代码。
-- **F4 LLVM 后端（可选）**：代价是破坏“零运行时依赖”承诺；作为可开关的 feature flag 存在。
+- **F1 JIT 执行**：
+  - **F1a 整程序 JIT** → 见 H1（已实现）。
+  - **F1b Tiered JIT（解释器驱动热点编译）**：解释器采集 loop trip count，热点处走 backend 生成的机器码。依赖 H2（ret-based JIT）落地后方可启动。两条实现路径：
+    - 自写（沿用现有 `src/backend/x86_64/encode.rs` + `crates/jit`）：代码闭环，H1 已证明 mmap/mprotect 路径可行。
+    - [Cranelift](https://cranelift.dev/) 作为 JIT 后端：成熟的 codegen 框架，已被多个 BF JIT 案例（如 [Rodrigodd 的 Part 3](https://rodrigodd.github.io/2022/11/26/bf_compiler-part3.html)）使用，但破坏 “零运行时依赖” 承诺；与 F4 LLVM 的抉择类似。
+- **F2 ARM64 后端**：Linux aarch64。寄存器约定需重设（建议 `x19–x24` callee-saved 映射），encode 层完全新写。G1 的 `PlatformEmitter` trait 和 `emit_lir_body` 可复用控制流，但需并行的 `AArch64AsmInst` 枚举。
+- **F4 LLVM 后端（可选）**：代价是破坏”零运行时依赖”承诺；作为可开关的 feature flag 存在。`src/llvm/` 目录已预留，`feat/llvm` 分支存在。若实施，LIR 是最佳输入层——已线性化、含显式 label/jump，自然映射到 LLVM basic block。
 - **F5 增量编译缓存**：对固定 `.bf` 源缓存 HIR / LIR / obj，结合内容哈希。只有当 E5 表明编译时长占比明显时才值得。
 
 ### Phase G — 后端重构（已落地）
 
-> 目标：消除 Linux / Windows 后端之间的代码重复，为后续新增后端（F2 ARM64、F3 macOS）降低成本。
+> 目标：消除 Linux / Windows 后端之间的代码重复，为后续新增后端（F2 ARM64）降低成本。
 
 - **G1 提取共享 codegen 逻辑** ✓：新建 `src/backend/codegen_common.rs`，包含：
   - `LabelAllocator`：统一的内部标签分配器（替代 Linux 的 `fresh_internal_label(&mut u32)` 和 Windows 的 `LabelAllocator::new()`）。
@@ -157,6 +158,20 @@
   - `PlatformEmitter` trait：抽象 `emit_put_byte` / `emit_get_byte` / `needs_rsp_alignment()` 三个 ABI 差异点。
   - `emit_lir_body()`：完整的 LIR→AsmInst 翻译循环，覆盖所有 ABI 无关的 match arm（PtrAdd、PtrAddChecked、CellAdd、CellSet、CellAddAt、CellSetAt、ZeroRun、LinearMul、LinearMulWithSets、Scan、ScanWithHint、Label、JumpIfZero、JumpIfNonZero），通过 `PlatformEmitter` 回调处理 PutByte/GetByte，通过 `needs_rsp_alignment` 参数化 LinearMul 的 Win64 RSP 对齐。
   - 效果：`codegen.rs` 2120→1532 行（-588），`windows.rs` 1655→1221 行（-434），`codegen_common.rs` 516 行，净减 506 行。
+
+### Phase H — JIT 演进（已部分落地）
+
+> 目标：从 AOT-only 演进到 JIT 执行，最终实现解释器驱动的热点编译。
+
+- **H1 整程序 JIT** · **[已实现]**：`-m jit` 模式（Linux x86_64 only）。`src/driver/run.rs::run_jit` 复用 `compile_linux_asm` → `relax_jumps` → `encode_program` 产出完整 x86_64 机器码，`amazingbf_jit::JitBuffer::new`（`crates/jit/src/lib.rs`）通过 raw syscall 做 `mmap(RW)` → `copy` → `mprotect(RX)`（W^X 翻转），`execute()` 以 `transmute` 跳入。JIT crate 使用 `#![deny(unsafe_code)]` + 针对性 `#[allow]` 豁免 mmap/mprotect/munmap/transmute 四处。当前生成的代码以 `syscall(SYS_exit, 0)` 终止，宿主进程随之退出——这意味着 JIT 执行后无法返回控制权给调用方（H2 解决此问题）。
+  - 文件：`crates/jit/Cargo.toml`、`crates/jit/src/lib.rs`（3 单测含 fork+waitpid 验证）、`src/driver/run.rs`、`src/driver/config.rs`（`RunMode::Jit`）、`src/error.rs`（`Error::Jit`）、`src/cli.rs`（`-m jit` 帮助文本）、`tests/jit_pipeline.rs`（6 集成测试：5 case + 1 全 opt-level 交叉）
+- **H2 ret-based JIT 执行** · **[待实现]**：将 JIT 生成的代码从 `exit(0)` 终止改为 `ret` 返回，使宿主进程在 JIT 执行后可继续运行。这是 F1b tiered JIT 和 JIT 基准测试的前置条件。方案：
+  - 生成函数序言（保存 callee-saved r12–r15, rbx, rbp）+ 从 SysV ABI 参数接收 tape 状态（rdi=tape_base, rsi=data_ptr, rdx=tape_end）
+  - 将 `exit(0)` 替换为函数尾声（恢复寄存器 + `ret`）；`exit(1)` 替换为 `mov eax, 1; ret`
+  - 更新 `JitBuffer::execute` 签名以传入 tape 指针并返回退出码
+  - 在 `codegen_common.rs` 新增 `JitPlatformEmitter` 或在现有 Linux emitter 上加 `jit_mode` 参数
+
+**依赖：H1 已落地；H2 解锁 F1b（tiered JIT）和 JIT 基准测试接入 E5。**
 
 ---
 
@@ -168,21 +183,26 @@ E5 (bench)  ──────────────────────�
 A1 → A2 → A3 → A4                        （回归衡量）
   │    │    │    │
   │    │    │    └→ B1 (DSE) ✓
-  │    │    └→ B2 (zero-loop) ✓, B5 (LICM), B6 (unroll) ✓
+  │    │    └→ B2 (zero-loop) ✓, B5 (LICM) ✓, B6 (unroll) ✓
   │    └→ B3 (LinearMul 泛化) ✓, B4 (pointer postponement) ✓, B7-α (K6 简化) ✓
   │         │
-  │         └→ C3 (displacement) ✓ → D2 / D4
+  │         └→ C3 (displacement) ✓ → D2 ✓ / D4 ✓
   │
-  └→ C2 (bounds batching) ✓ → C4 (scan hint) ✓、D2 (SIMD)
+  └→ C2 (bounds batching) ✓ → C4 (scan hint) ✓、D2 (SIMD) ✓
 
 C1 (LIR peephole) ✓、D1 (指令选择) ✓、
 D3 (buffered I/O — 解释器 ✓ / Linux 后端 ✓ / Windows 后端 ✓)、
 E1 / E2 (superinstruction + threaded dispatch) ✓、
 E3 (interp LinearMul ±1 快路径) ✓、E4 (tape 倍增) ✓ 均可并行启动。
-已落地：E5、C1、D1、E4、Phase A (A1–A4)、B1、B2、B3、B4、B5、B6、B7-α (P1+P2+P3)、C2、C3、C4、E1、E2、E3、D2 (a/b/c/d 四项双端对称)、D3 (解释器 + Linux 后端 + Windows 后端)、D4 (冗余 mov 消除)、D5 (分支提示 + loop 头 16B 对齐)、G1 (后端重构)。
+已落地：E5、C1、D1、E4、Phase A (A1–A4)、B1、B2、B3、B4、B5、B6、B7-α (P1+P2+P3)、C2、C3、C4、E1、E2、E3、D2 (a/b/c/d 四项双端对称)、D3 (解释器 + Linux 后端 + Windows 后端)、D4 (冗余 mov 消除)、D5 (分支提示 + loop 头 16B 对齐)、G1 (后端重构)、H1 (整程序 JIT)。
 已调查搁置：B7-β（ROI <2%，需完整 K6 算法）。
 
-Phase F 全部不在近期依赖图内。
+Phase H / F 依赖链：
+H1 (已落地) ──→ H2 (ret-based JIT) ──→ F1b (tiered JIT)
+                      │
+                      └──→ JIT 基准测试接入 E5
+
+F2 (ARM64)、F4 (LLVM)、F5 (增量缓存) 不在近期依赖图内。
 ```
 
 ---
@@ -198,11 +218,12 @@ Phase F 全部不在近期依赖图内。
 | HIR | `src/ir/loop_stats.rs`、`src/ir/loop_profile.rs` | B7 Phase 0 测量（已落地） |
 | LIR | `src/ir/lir.rs`, `src/ir/lower.rs` | B / C 可能新增 `PtrAddChecked` / `CellAddAt` |
 | LIR | `src/ir/lir_opt.rs`（新） | Phase C 主场 |
-| Backend | `src/backend/codegen.rs`, `src/backend/codegen_common.rs`, `src/backend/x86_64/encode.rs`, `src/backend/asm.rs` | Phase D / G1 |
+| Backend | `src/backend/codegen.rs`, `src/backend/codegen_common.rs`, `src/backend/x86_64/encode.rs`, `src/backend/asm.rs` | Phase D / G1 / H2 |
 | Backend | `src/backend/x86_64/elf.rs`, `src/backend/x86_64/windows.rs` | D3 buffered I/O / G1 |
-| Runtime | `src/interp/engine.rs`, `src/runtime/{tape,io,host}.rs` | Phase E |
+| JIT | `crates/jit/src/lib.rs` | H1（已落地）/ H2 |
+| Runtime | `src/interp/engine.rs`, `src/runtime/{tape,io,host}.rs` | Phase E / F1b |
 | Bench | `benches/`（新） | E5 |
-| Tests | `tests/cases_pipeline.rs`, `tests/compile_artifacts.rs` | 每阶段新增 pass 后回归 |
+| Tests | `tests/cases_pipeline.rs`, `tests/compile_artifacts.rs`, `tests/jit_pipeline.rs` | 每阶段新增 pass 后回归 |
 
 ---
 
@@ -220,8 +241,8 @@ Phase F 全部不在近期依赖图内。
 
 - 不调整现有 O0–O3 CLI flag 的语义（不改动 `src/cli.rs` / `src/driver/config.rs`）；新的优化按既有层级归属。
 - 不引入第三方 runtime 依赖（保持 `std`-only）。
-- 不破坏 `#![forbid(unsafe_code)]`；Phase F1 的 JIT 会单独讨论豁免范围，不属于本路线图近期部分。
-- 本次不翻译英文版 `docs/OPTIMIZATION_PLAN.md`；在真正实施某个 TODO 时再按 `CLAUDE.md` 双语规则补齐。
+- 不破坏主 crate 的 `#![forbid(unsafe_code)]`；JIT crate（`crates/jit`）使用 `#![deny(unsafe_code)]` + 针对性 `#[allow]` 豁免 mmap/mprotect/munmap/transmute 四处，已在 H1 中确立边界。Phase F1b 的 tiered JIT 沿用此隔离模式。
+- 英文版 `docs/OPTIMIZATION_PLAN.md` 与本文件同步更新。
 
 ---
 
@@ -253,3 +274,13 @@ Phase F 全部不在近期依赖图内。
 - awib-0.4.b：[matslina/awib](https://github.com/matslina/awib) 自身作为 benchmark 输入。
 
 这些程序在既有文献中反复出现，使用它们意味着本工具链的优化效果可以直接与 bfc / awib / Oizys / Tritium 横向比较，不必自建一套无从对标的 benchmark。
+
+---
+
+## 8. 相关子系统（不属于优化路线图范围）
+
+以下子系统受益于本路线图的优化管线，但其自身的开发不在本文档的 TODO 范围内，仅作存在性记录。
+
+- **BFS (Brainf Script) 编译器**：`src/bfsc/`（lexer → parser → typeck → codegen），`bfsc` 二进制入口。将高级语言 `.bfs` 源码编译为 Brainfuck，可选 `-c` 直接走 `driver::run` 产出原生可执行文件。集成测试 `tests/cases_bfs/`。
+- **Tauri GUI**：`src/gui.rs` + `src/runtime/gui_io.rs`，feature-gated（`gui`），`bf-gui` 二进制入口。在 Tauri 窗口中运行 BF 解释器，支持屏幕缓冲区输出和按键输入。示例程序 `examples/gui_*.bfs`。
+- **JIT crate**：`crates/jit/`（workspace 成员 `amazingbf-jit`），提供 `JitBuffer`（mmap/mprotect/munmap + execute）。被 H1 整程序 JIT 消费，后续 H2 / F1b 将扩展其 API。
