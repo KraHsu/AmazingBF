@@ -204,6 +204,17 @@ impl Tape {
         self.ensure_range(self.ptr);
     }
 
+    /// Minimum byte capacity (page-rounded) a flat buffer needs to hold
+    /// the tape's currently visited span. Used by the tiered-JIT
+    /// persistent-scratch path to size its mmap'd buffer.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn flat_required_bytes(&self) -> usize {
+        let lo = self.stats.ptr_min;
+        let hi = self.stats.ptr_max;
+        let span = (hi - lo) as usize + 1;
+        span.next_multiple_of(4096)
+    }
+
     /// Snapshot the tape into a contiguous flat buffer suitable for JIT
     /// execution. Returns `(flat_buf, data_ptr_offset)` where
     /// `data_ptr_offset` is the byte offset of the current cell within
@@ -212,26 +223,47 @@ impl Tape {
     /// The flat buffer covers `[ptr_min, ptr_max]` inclusive, zero-padded
     /// to at least `min_size` bytes and page-aligned for mmap compatibility.
     #[cfg(target_os = "linux")]
+    #[allow(dead_code)] // reason: kept as the simpler one-shot API; the tiered JIT now uses snapshot_flat_into
     pub(crate) fn snapshot_flat(&self, min_size: usize) -> (Vec<u8>, usize) {
         let lo = self.stats.ptr_min;
         let hi = self.stats.ptr_max;
         let span = (hi - lo) as usize + 1;
         let size = span.max(min_size).next_multiple_of(4096);
         let mut flat = vec![0u8; size];
+        let data_ptr_offset = self.snapshot_flat_into(&mut flat);
+        (flat, data_ptr_offset)
+    }
+
+    /// Snapshot the tape into a caller-provided flat buffer, returning the
+    /// byte offset of the current cell within `flat`.
+    ///
+    /// The buffer must be at least [`Self::flat_required_bytes`] long; the
+    /// region from byte `0` up to `right_start + right.len()` is zeroed
+    /// then overwritten with the live cells, and the trailing region (if
+    /// any) is zeroed too. Used by the tiered-JIT persistent-scratch path
+    /// to avoid the `Vec<u8>` allocation that `snapshot_flat` does on every
+    /// dispatch.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn snapshot_flat_into(&self, flat: &mut [u8]) -> usize {
+        let lo = self.stats.ptr_min;
+
+        // Caller may reuse a buffer larger than what's needed; zero it.
+        for byte in flat.iter_mut() {
+            *byte = 0;
+        }
 
         let right_start = (-lo) as usize;
-        let right_copy = self.right.len().min(size - right_start);
+        let right_copy = self.right.len().min(flat.len() - right_start);
         flat[right_start..right_start + right_copy].copy_from_slice(&self.right[..right_copy]);
 
         for (i, &val) in self.left.iter().enumerate() {
             let idx = (-lo) as usize - (i + 1);
-            if idx < size {
+            if idx < flat.len() {
                 flat[idx] = val;
             }
         }
 
-        let data_ptr_offset = (self.ptr - lo) as usize;
-        (flat, data_ptr_offset)
+        (self.ptr - lo) as usize
     }
 
     /// Restore tape contents from a flat buffer produced by JIT execution.

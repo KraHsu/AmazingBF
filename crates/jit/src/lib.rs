@@ -327,6 +327,17 @@ impl JitTape {
     pub fn as_slice(&self) -> &[u8] {
         unsafe { core::slice::from_raw_parts(self.ptr, self.len) }
     }
+
+    /// Mutable view of the live tape contents.
+    ///
+    /// Used by the F1b tiered JIT's persistent-scratch path to memcpy the
+    /// interpreter's split tape directly into the JIT buffer without
+    /// allocating an intermediate `Vec`. Same staleness caveat as
+    /// [`Self::as_slice`] if the JIT-side `ensure_tape` ever fires.
+    #[allow(unsafe_code)]
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        unsafe { core::slice::from_raw_parts_mut(self.ptr, self.len) }
+    }
 }
 
 impl Drop for JitTape {

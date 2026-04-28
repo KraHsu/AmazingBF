@@ -118,6 +118,14 @@ pub(crate) struct Interpreter<I: RuntimeIo, H: HostRuntime> {
     /// to a single load + tag compare per iteration.
     #[cfg(target_os = "linux")]
     pub(crate) jit_cache: Vec<JitState>,
+    /// Persistent scratch buffer for the tiered-JIT bridging tape. Reused
+    /// across dispatches and grown monotonically as the visited span
+    /// expands, eliminating the per-dispatch mmap that the v1 path paid
+    /// (~10 µs each on Linux x86_64). The interpreter still memcpys the
+    /// split tape into this buffer per dispatch — that's the cost P3
+    /// targets next via a fully mmap-backed `Tape`.
+    #[cfg(target_os = "linux")]
+    pub(crate) jit_scratch: Option<amazingbf_jit::JitTape>,
 }
 
 impl<I: RuntimeIo, H: HostRuntime> Interpreter<I, H> {
@@ -133,6 +141,8 @@ impl<I: RuntimeIo, H: HostRuntime> Interpreter<I, H> {
             jit_enabled: false,
             #[cfg(target_os = "linux")]
             jit_cache: Vec::new(),
+            #[cfg(target_os = "linux")]
+            jit_scratch: None,
         }
     }
 

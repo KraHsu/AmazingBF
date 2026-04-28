@@ -327,10 +327,16 @@ fn compile_jit_slot<I: RuntimeIo, H: HostRuntime>(interp: &mut Interpreter<I, H>
 
 /// Run the JIT-compiled body for the loop whose `LoopStart` lives at
 /// `start_pc`. Pre-grows the interpreter tape to cover the body's static
-/// reach, snapshots into a fresh mmap'd JIT tape, calls the function, then
-/// copies the modified tape back. The eligibility contract (balanced loop,
-/// bounded reach) guarantees the JIT exits with `data_ptr` at its entry
-/// position, so the same byte offset can be used to restore.
+/// reach, memcpys into the interpreter's persistent JIT-scratch buffer
+/// (allocated/grown lazily, never mmap'd per call), calls the function,
+/// then copies the modified tape back.
+///
+/// The eligibility contract (balanced loop, bounded reach) guarantees the
+/// JIT exits with `data_ptr` at its entry position, so the same byte
+/// offset can be used to restore. The persistent scratch is what
+/// distinguishes this from the v1 path: each dispatch on long.b -O3 now
+/// pays one memcpy in + one memcpy out + a function call, instead of
+/// also paying a 4 KiB mmap + 4 KiB munmap pair.
 #[cfg(target_os = "linux")]
 fn dispatch_jit<I: RuntimeIo, H: HostRuntime>(
     interp: &mut Interpreter<I, H>,
@@ -349,14 +355,30 @@ fn dispatch_jit<I: RuntimeIo, H: HostRuntime>(
     interp.tape.add_at(min_off as isize, 0);
     interp.tape.add_at(max_off as isize, 0);
 
-    let (flat, data_off) = interp.tape.snapshot_flat(0);
-    let jit_tape = amazingbf_jit::JitTape::from_slice(&flat)
-        .map_err(|e| RuntimeError::Jit(format!("JIT tape mmap failed: {e}")))?;
+    // Lazy-allocate / grow the persistent scratch buffer. JitTape's mmap
+    // size is page-rounded inside `JitTape::new`, so we feed it the
+    // tape's required-byte count (already 4 KiB-aligned).
+    let required = interp.tape.flat_required_bytes();
+    let needs_alloc = match interp.jit_scratch.as_ref() {
+        None => true,
+        Some(t) => t.len() < required,
+    };
+    if needs_alloc {
+        let new_tape = amazingbf_jit::JitTape::new(required.max(4096))
+            .map_err(|e| RuntimeError::Jit(format!("JIT scratch mmap failed: {e}")))?;
+        interp.jit_scratch = Some(new_tape);
+    }
+
+    let scratch = interp
+        .jit_scratch
+        .as_mut()
+        .expect("jit_scratch is Some after the lazy-allocate above");
+    let data_off = interp.tape.snapshot_flat_into(scratch.as_mut_slice());
 
     let exit_code = match &interp.jit_cache[start_pc as usize] {
         JitState::Ready { buf, .. } => {
-            let dp = jit_tape.data_ptr_at(data_off);
-            buf.execute_fn(jit_tape.base(), dp, jit_tape.end())
+            let dp = scratch.data_ptr_at(data_off);
+            buf.execute_fn(scratch.base(), dp, scratch.end())
         }
         _ => unreachable!("dispatch_jit invariant: slot must be Ready"),
     };
@@ -367,7 +389,7 @@ fn dispatch_jit<I: RuntimeIo, H: HostRuntime>(
         )));
     }
 
-    interp.tape.restore_from_flat(jit_tape.as_slice(), data_off);
+    interp.tape.restore_from_flat(scratch.as_slice(), data_off);
     Ok(())
 }
 
