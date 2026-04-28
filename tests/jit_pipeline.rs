@@ -135,6 +135,21 @@ fn jit_case_5() {
 }
 
 #[test]
+fn jit_case_6() {
+    run_jit_case(6);
+}
+
+#[test]
+fn jit_case_7() {
+    run_jit_case(7);
+}
+
+#[test]
+fn jit_case_8() {
+    run_jit_case(8);
+}
+
+#[test]
 fn jit_all_opt_levels_case_1() {
     run_jit_opt_levels(1);
 }
