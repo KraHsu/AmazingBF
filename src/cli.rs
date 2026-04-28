@@ -176,6 +176,8 @@ struct PartialCore {
     mode: RunMode,
     target: CompileTarget,
     interp_debug: bool,
+    #[cfg(target_os = "linux")]
+    jit_threshold: Option<u64>,
 }
 
 fn is_positional(arg: &OsStr) -> bool {
@@ -252,6 +254,8 @@ fn finish_from_partial(
                 .unwrap_or_else(|| PathBuf::from(target.default_output_name())),
             interp_debug,
             opt_level: core.opt_level,
+            #[cfg(target_os = "linux")]
+            jit_threshold: core.jit_threshold,
         },
         log_level: if core.quiet { 0 } else { core.verbose + 1 },
     })
@@ -438,6 +442,25 @@ fn parse_long(
             core.interp_debug = value != Some("false");
             Ok(())
         }
+        #[cfg(target_os = "linux")]
+        "jit-threshold" if matches!(flavor, Flavor::Full) => {
+            let raw = if let Some(v) = value {
+                v
+            } else {
+                take_value(i, args, "--jit-threshold")?
+                    .to_str()
+                    .ok_or_else(|| CliError::Usage {
+                        message: "错误: `--jit-threshold` 参数须为有效 UTF-8".to_string(),
+                        quiet,
+                    })?
+            };
+            let n = raw.parse::<u64>().map_err(|_| CliError::Usage {
+                message: format!("错误: 无效的 `--jit-threshold` 值 `{raw}`（须为非负整数）"),
+                quiet,
+            })?;
+            core.jit_threshold = Some(n);
+            Ok(())
+        }
         _ => Err(CliError::Usage {
             message: format!("错误: 未知选项 `--{name}`"),
             quiet,
@@ -462,6 +485,8 @@ fn parse_args(flavor: Flavor) -> std::result::Result<AppConfig, CliError> {
         mode: RunMode::Interpret,
         target: CompileTarget::build_default(),
         interp_debug: false,
+        #[cfg(target_os = "linux")]
+        jit_threshold: None,
     };
 
     let mut i = 0usize;
@@ -572,7 +597,7 @@ pub(crate) fn print_help(kind: BinKind) {
             eprintln!(
                 "用法:\n  {title} [选项] <FILE>\n\n\
                  参数:\n  <FILE>  Brainfuck 源文件路径；`-` 表示从标准输入读取\n\n\
-                 选项:\n  -h, --help              显示帮助\n  -V, --version           显示版本\n  -v, --verbose           提高日志详细度（可重复，最多 -vvv）\n  -q, --quiet             静默日志\n  -o, --output <PATH>     编译输出路径（compile 模式）\n  -O, --opt-level <0-3>   优化级别（默认 3）\n  -m, --mode <MODE>       运行模式: dump | interpret | compile | jit（默认 interpret）\n      --target <T>        编译目标: x86_64-linux | x86_64-windows\n      --interp-debug      解释模式下输出 tape 统计\n"
+                 选项:\n  -h, --help              显示帮助\n  -V, --version           显示版本\n  -v, --verbose           提高日志详细度（可重复，最多 -vvv）\n  -q, --quiet             静默日志\n  -o, --output <PATH>     编译输出路径（compile 模式）\n  -O, --opt-level <0-3>   优化级别（默认 3）\n  -m, --mode <MODE>       运行模式: dump | interpret | compile | jit | tiered（默认 interpret）\n      --target <T>        编译目标: x86_64-linux | x86_64-windows\n      --interp-debug      解释模式下输出 tape 统计\n      --jit-threshold <N> tiered 模式下热点循环触发 JIT 的迭代次数阈值（默认 10000，仅 Linux）\n"
             );
             eprintln!("{AFTER_LONG_HELP}");
         }

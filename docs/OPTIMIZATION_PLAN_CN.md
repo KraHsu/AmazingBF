@@ -141,9 +141,7 @@
 
 - **F1 JIT 执行**：
   - **F1a 整程序 JIT** → 见 H1（已实现）。
-  - **F1b Tiered JIT（解释器驱动热点编译）**：解释器采集 loop trip count，热点处走 backend 生成的机器码。依赖 H2（ret-based JIT）落地后方可启动。两条实现路径：
-    - 自写（沿用现有 `src/backend/x86_64/encode.rs` + `crates/jit`）：代码闭环，H1 已证明 mmap/mprotect 路径可行。
-    - [Cranelift](https://cranelift.dev/) 作为 JIT 后端：成熟的 codegen 框架，已被多个 BF JIT 案例（如 [Rodrigodd 的 Part 3](https://rodrigodd.github.io/2022/11/26/bf_compiler-part3.html)）使用，但破坏 “零运行时依赖” 承诺；与 F4 LLVM 的抉择类似。
+  - **F1b Tiered JIT（解释器驱动热点编译）** → 见 H3（P0 / P1 / P2 已实现，Linux x86_64 only）。后续路径仍可走自写或 [Cranelift](https://cranelift.dev/)（Cranelift 破坏"零运行时依赖"承诺，与 F4 LLVM 的抉择类似）。
 - **F2 ARM64 后端**：Linux aarch64。寄存器约定需重设（建议 `x19–x24` callee-saved 映射），encode 层完全新写。G1 的 `PlatformEmitter` trait 和 `emit_lir_body` 可复用控制流，但需并行的 `AArch64AsmInst` 枚举。
 - **F4 LLVM 后端（可选）**：代价是破坏”零运行时依赖”承诺；作为可开关的 feature flag 存在。`src/llvm/` 目录已预留，`feat/llvm` 分支存在。若实施，LIR 是最佳输入层——已线性化、含显式 label/jump，自然映射到 LLVM basic block。
 - **F5 增量编译缓存**：对固定 `.bf` 源缓存 HIR / LIR / obj，结合内容哈希。只有当 E5 表明编译时长占比明显时才值得。
@@ -171,8 +169,21 @@
   - JIT crate 中的 `JitTape` 结构体封装 mmap 分配并提供安全的 `base()`/`data_ptr()`/`end()` 访问器，保持主 crate `#![forbid(unsafe_code)]` 合规。
   - `run.rs` 中的 `run_jit()` 分配 `JitTape`，传给 `execute_fn`，检查返回码。O3 特殊情况（trivial exit、precomputed stdout）仍使用 H1 的 `execute()` 路径。
   - 文件：`crates/jit/src/lib.rs`（`execute_fn`、`JitTape`、2 新单测）、`src/backend/codegen.rs`（`compile_lir_to_jit_asm`）、`src/driver/run.rs`（`run_jit` 重写）
+- **H3 Tiered JIT（解释器驱动的热点编译）** · **[P0 + P1 + P2 已实现，Linux x86_64 only]**：
+  - **H3-P0 Trip-count profiling** · **[已实现]**：`src/interp/profile.rs` 的 `LoopProfile`（`Vec<u64>` 按 `LoopStart` pc 索引）+ `Interpreter::enable_profiling`（仅在显式开启时分配，关闭时零开销）；`handle_loop_end` 的 back-edge 路径上调用 `record_back_edge`。
+  - **H3-P1 编译管线 + tape 桥接** · **[已实现]**：`src/interp/jit_compile.rs::compile_hot_loop(body)` 把 `InterpOp` 切片 lower 成 LIR（含递归处理嵌套 loop 结构），过 `relax_jumps` + `encode_program` + `JitBuffer::new`；`src/runtime/tape.rs::snapshot_flat / restore_from_flat` 在 split tape ↔ 平铺缓冲区之间桥接；`crates/jit/src/lib.rs::JitTape::from_slice / as_slice / data_ptr_at` 给主 crate 提供 mmap 化的桥接缓冲。
+  - **H3-P2 Inline OSR + 端到端集成** · **[已实现]**：
+    - 候选筛选 `analyse_eligibility(body) -> Option<(min_off, max_off)>`：要求 balanced（cumulative ptr delta = 0）+ bounded reach（所有 Move/MoveAdd/ZeroMove 与 LinearMul* factor/sets 偏移有界）+ 顶层无嵌套 loop / Scan / I/O。覆盖 hanoi.b 的 `Move(1) Zero Move(-1) Add(-1)`（95.30% 迭代）与 long.b 的 `LinearMulWithSets` 形态（94.17% 迭代）；mandelbrot 的 `Unbalanced` hot loop 直接拒收（与 B7-β 调查结论一致）。
+    - 触发：`handle_loop_end` 的 back-edge 路径上检测 `trip_count >= threshold`，跨阈值时调用 `compile_jit_slot` 完成 `analyse_eligibility` + `compile_hot_loop` 一次性写入 `Interpreter::jit_cache`（`HashMap<u32, JitSlot>`，`JitSlot::Failed` 永不重试）；本次及后续 back-edge 直接走 `dispatch_jit`：预扩 tape 覆盖 `(min_off, max_off)` → `snapshot_flat` → `JitTape::from_slice` → `execute_fn` → `restore_from_flat`，然后跳过 `]` 跳到 loop 后。balanced 性质保证退出时 `data_ptr_offset` 不变，restore 直接复用入口偏移。
+    - JIT codegen 专用形式 `compile_lir_to_jit_loop_asm`：与 H2 的 `compile_lir_to_jit_asm` 同 ABI，但跳过 `emit_init_output_buffer`（hot loop 由 eligibility 保证无 I/O）和 `flush_output` helper，避免每次 dispatch 泄漏 4 KiB 输出缓冲。
+    - CLI：新增 `RunMode::Tiered` + `--jit-threshold N`（默认 10000）；`-m tiered` 走 `run_tiered`，仅 Linux 暴露。
+    - 文件：`src/interp/profile.rs`、`src/interp/jit_compile.rs`（含 `analyse_eligibility` + 9 单测）、`src/interp/engine.rs`（`JitSlot` / `program: Arc<InterpProgram>` / `enable_tiered_jit`）、`src/interp/handlers.rs`（`compile_jit_slot` + `dispatch_jit`）、`src/runtime/tape.rs`、`src/backend/codegen.rs`（`compile_lir_to_jit_loop_asm`）、`src/driver/{config,run}.rs`、`src/cli.rs`、`crates/jit/src/lib.rs`（`from_slice` / `as_slice` / `data_ptr_at` + 3 单测）、`tests/tiered_jit_pipeline.rs`（9 集成测试覆盖 8 case + 高阈值回退）、`benches/standard_suite.rs` / `benches/compile_levels.rs` 增 `tiered` 列。
+    - **v1 已知限制（明确推迟）**：
+      - 每次 dispatch 都会 mmap + memcpy 一次平铺 buffer，对于 hot loop 内迭代次数较少但调用频繁的场景（如 hanoi.b -O0），桥接成本可能压过 JIT 加速。-O3 默认路径（hanoi/long 的 hot pattern 已被 B7-α 折叠为单条 `LinearMul*`）不受影响。后续可改为持久化共享 tape（P3 候选）。
+      - 不支持 unbalanced loop（需要 ABI 出参返回最终 `data_ptr_offset`）、JIT 期间 tape 增长（v1 靠预扩规避）、顶层嵌套 loop（P3 可放宽到允许 LinearMul* 之外的特定形态）。
+      - 仅 Linux x86_64；Windows 沿用 P0/P1 的 `#[cfg]` 门控。
 
-**依赖：H1 已落地；H2 已落地。H2 解锁 F1b（tiered JIT）和 JIT 基准测试接入 E5。**
+**依赖：H1、H2、H3 (P0+P1+P2) 已落地。F1b（tiered JIT）的 v1 经 H3 完成；JIT 基准测试已接入 E5。后续 H3-P3（持久化共享 tape / 跨调用 buffer 复用）作为性能优化候选。**
 
 ---
 
@@ -195,13 +206,13 @@ C1 (LIR peephole) ✓、D1 (指令选择) ✓、
 D3 (buffered I/O — 解释器 ✓ / Linux 后端 ✓ / Windows 后端 ✓)、
 E1 / E2 (superinstruction + threaded dispatch) ✓、
 E3 (interp LinearMul ±1 快路径) ✓、E4 (tape 倍增) ✓ 均可并行启动。
-已落地：E5、C1、D1、E4、Phase A (A1–A4)、B1、B2、B3、B4、B5、B6、B7-α (P1+P2+P3)、C2、C3、C4、E1、E2、E3、D2 (a/b/c/d 四项双端对称)、D3 (解释器 + Linux 后端 + Windows 后端)、D4 (冗余 mov 消除)、D5 (分支提示 + loop 头 16B 对齐)、G1 (后端重构)、H1 (整程序 JIT)、H2 (ret-based JIT)。
+已落地：E5、C1、D1、E4、Phase A (A1–A4)、B1、B2、B3、B4、B5、B6、B7-α (P1+P2+P3)、C2、C3、C4、E1、E2、E3、D2 (a/b/c/d 四项双端对称)、D3 (解释器 + Linux 后端 + Windows 后端)、D4 (冗余 mov 消除)、D5 (分支提示 + loop 头 16B 对齐)、G1 (后端重构)、H1 (整程序 JIT)、H2 (ret-based JIT)、H3-P0 / H3-P1 / H3-P2 (tiered JIT v1: balanced + bounded reach + 顶层无嵌套，Linux x86_64)。
 已调查搁置：B7-β（ROI <2%，需完整 K6 算法）。
 
 Phase H / F 依赖链：
-H1 (已落地) ──→ H2 (已落地) ──→ F1b (tiered JIT)
-                      │
-                      └──→ JIT 基准测试接入 E5
+H1 (已落地) ──→ H2 (已落地) ──→ H3-P0 / P1 / P2 (已落地)
+                      │                      │
+                      └──→ JIT 基准接入 E5    └──→ H3-P3 (持久化共享 tape，性能优化)
 
 F2 (ARM64)、F4 (LLVM)、F5 (增量缓存) 不在近期依赖图内。
 ```

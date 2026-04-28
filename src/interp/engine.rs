@@ -132,7 +132,6 @@ impl<I: RuntimeIo, H: HostRuntime> Interpreter<I, H> {
     /// JIT-compiled machine code for any loop whose count crosses
     /// `threshold`. Must be called before `run()`. Linux x86_64 only.
     #[cfg(target_os = "linux")]
-    #[allow(dead_code)] // reason: wired up by `run_tiered` in the surface commit
     pub(crate) fn enable_tiered_jit(&mut self, threshold: u64) {
         self.profile = Some(LoopProfile::new(0, threshold));
         self.jit_enabled = true;

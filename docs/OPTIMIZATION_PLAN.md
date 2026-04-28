@@ -142,9 +142,7 @@ Goal: add `src/ir/lir_opt.rs` after `src/ir/lower.rs` to provide a no-analysis p
 
 - **F1 JIT execution**:
   - **F1a Whole-program JIT** → see H1 (landed).
-  - **F1b Tiered JIT (interpreter-driven hot-spot compilation)**: the interpreter collects loop trip counts, and hot regions switch to backend-generated machine code. Depends on H2 (ret-based JIT) landing first. Two implementation paths:
-    - Hand-rolled (reusing the existing `src/backend/x86_64/encode.rs` + `crates/jit`): self-contained; H1 has already proven the mmap/mprotect path viable.
-    - [Cranelift](https://cranelift.dev/) as the JIT backend: a mature codegen framework, used by several BF-JIT case studies (e.g. [Rodrigodd's Part 3](https://rodrigodd.github.io/2022/11/26/bf_compiler-part3.html)), but breaks the "zero runtime dependencies" promise; the tradeoff mirrors F4 LLVM.
+  - **F1b Tiered JIT (interpreter-driven hot-spot compilation)** → see H3 (P0 / P1 / P2 landed, Linux x86_64 only). Future iterations may still pursue hand-rolled or [Cranelift](https://cranelift.dev/) (Cranelift breaks the "zero runtime dependencies" promise; the tradeoff mirrors F4 LLVM).
 - **F2 ARM64 backend**: Linux aarch64. Register conventions need to be redesigned (suggested `x19–x24` callee-saved mapping), and the encode layer rewritten from scratch. G1's `PlatformEmitter` trait and `emit_lir_body` can reuse the control flow, but a parallel `AArch64AsmInst` enum is needed.
 - **F4 LLVM backend (optional)**: the cost is breaking the "zero runtime dependencies" promise; exists behind a toggleable feature flag. `src/llvm/` directory is reserved; `feat/llvm` branch exists. If pursued, LIR is the best input layer — already linearized with explicit labels/jumps, mapping naturally to LLVM basic blocks.
 - **F5 Incremental compilation cache**: cache HIR / LIR / obj for a fixed `.bf` source keyed by content hash. Only worth it if E5 shows compile time is a significant fraction of total time.
@@ -172,8 +170,21 @@ Goal: add `src/ir/lir_opt.rs` after `src/ir/lower.rs` to provide a no-analysis p
   - `JitTape` struct in the JIT crate encapsulates mmap allocation and provides safe `base()`/`data_ptr()`/`end()` accessors, keeping the main crate `#![forbid(unsafe_code)]`-clean.
   - `run_jit()` in `run.rs` allocates a `JitTape`, passes it to `execute_fn`, and checks the return code. O3 special cases (trivial exit, precomputed stdout) still use the H1 `execute()` path.
   - Files: `crates/jit/src/lib.rs` (`execute_fn`, `JitTape`, 2 new unit tests), `src/backend/codegen.rs` (`compile_lir_to_jit_asm`), `src/driver/run.rs` (`run_jit` rewrite)
+- **H3 Tiered JIT (interpreter-driven hot-spot compilation)** · **[P0 + P1 + P2 landed, Linux x86_64 only]**:
+  - **H3-P0 Trip-count profiling** · **[landed]**: `LoopProfile` in `src/interp/profile.rs` (a `Vec<u64>` indexed by `LoopStart` pc) and `Interpreter::enable_profiling` (allocates only when explicitly enabled, zero overhead otherwise); `handle_loop_end`'s back-edge path calls `record_back_edge`.
+  - **H3-P1 Compilation pipeline + tape bridging** · **[landed]**: `src/interp/jit_compile.rs::compile_hot_loop(body)` lowers an `InterpOp` slice to LIR (recursing through nested loop structures), then runs `relax_jumps` + `encode_program` + `JitBuffer::new`; `src/runtime/tape.rs::snapshot_flat / restore_from_flat` bridge between the split tape and a flat buffer; `crates/jit/src/lib.rs::JitTape::from_slice / as_slice / data_ptr_at` give the main crate an mmap'd bridging buffer.
+  - **H3-P2 Inline OSR + end-to-end integration** · **[landed]**:
+    - Candidate filter `analyse_eligibility(body) -> Option<(min_off, max_off)>` requires balanced (cumulative ptr delta = 0) + bounded reach (every Move/MoveAdd/ZeroMove plus LinearMul* factor/sets offsets stay within a finite window) + no top-level nested loop / Scan / I/O. Covers hanoi.b's `Move(1) Zero Move(-1) Add(-1)` (95.30% of iterations) and long.b's `LinearMulWithSets` shape (94.17% of iterations); mandelbrot's `Unbalanced` hot loops are rejected outright (consistent with the B7-β investigation).
+    - Trigger: `handle_loop_end`'s back-edge path checks `trip_count >= threshold` and on first crossing calls `compile_jit_slot` to run `analyse_eligibility` + `compile_hot_loop` exactly once and write the result into `Interpreter::jit_cache` (`HashMap<u32, JitSlot>`; `JitSlot::Failed` is sticky, never retried). The same back-edge and every subsequent one go through `dispatch_jit`: pre-grow the tape to cover `(min_off, max_off)`, `snapshot_flat`, `JitTape::from_slice`, `execute_fn`, `restore_from_flat`, then jump past `]`. The balanced contract guarantees the JIT exits with the same `data_ptr_offset`, so restore can reuse the entry offset.
+    - Tiered-specific JIT codegen `compile_lir_to_jit_loop_asm` shares H2's ABI but skips `emit_init_output_buffer` (eligibility guarantees no I/O in hot loops) and `flush_output`, avoiding a 4 KiB output-buffer leak per dispatch.
+    - CLI: new `RunMode::Tiered` + `--jit-threshold N` (default 10000); `-m tiered` runs `run_tiered`, exposed only on Linux.
+    - Files: `src/interp/profile.rs`, `src/interp/jit_compile.rs` (`analyse_eligibility` + 9 unit tests), `src/interp/engine.rs` (`JitSlot` / `program: Arc<InterpProgram>` / `enable_tiered_jit`), `src/interp/handlers.rs` (`compile_jit_slot` + `dispatch_jit`), `src/runtime/tape.rs`, `src/backend/codegen.rs` (`compile_lir_to_jit_loop_asm`), `src/driver/{config,run}.rs`, `src/cli.rs`, `crates/jit/src/lib.rs` (`from_slice` / `as_slice` / `data_ptr_at` + 3 unit tests), `tests/tiered_jit_pipeline.rs` (9 integration tests covering 8 cases + a high-threshold no-JIT regression check), `benches/standard_suite.rs` / `benches/compile_levels.rs` add a `tiered` column.
+    - **Known v1 limitations (deliberately deferred)**:
+      - Each dispatch performs an mmap + memcpy of a fresh flat buffer. For hot loops with few inner iterations but high entry rate (e.g. hanoi.b at -O0), bridging cost can outweigh JIT speedup. The default -O3 path is unaffected (B7-α already folds hanoi/long's hot patterns into a single `LinearMul*`). A persistent shared scratch tape is the natural P3 fix.
+      - Unbalanced loops (would require an ABI out-param to return the final `data_ptr_offset`), JIT-side tape growth (sidestepped via pre-grow in v1), and top-level nested loops are all rejected. P3 may relax the nesting restriction for specific shapes.
+      - Linux x86_64 only; Windows continues to be `#[cfg]`-gated as in P0/P1.
 
-**Dependencies: H1 landed; H2 landed. H2 unblocks F1b (tiered JIT) and JIT benchmark integration with E5.**
+**Dependencies: H1, H2, and H3 (P0+P1+P2) landed. The F1b (tiered JIT) v1 is delivered by H3; JIT benchmarks are integrated into E5. H3-P3 (persistent shared tape / cross-call buffer reuse) remains a performance-tuning candidate.**
 
 ---
 
@@ -196,13 +207,13 @@ C1 (LIR peephole) ✓, D1 (instruction selection) ✓,
 D3 (buffered I/O — interpreter ✓ / Linux backend ✓ / Windows backend ✓),
 E1 / E2 (super-instructions + threaded dispatch) ✓,
 E3 (interp LinearMul ±1 fast path) ✓, E4 (tape doubling) ✓ can all start in parallel.
-Landed: E5, C1, D1, E4, Phase A (A1–A4), B1, B2, B3, B4, B5, B6, B7-α (P1+P2+P3), C2, C3, C4, E1, E2, E3, D2 (a/b/c/d, symmetric on both backends), D3 (interpreter + Linux backend + Windows backend), D4 (redundant mov elimination), D5 (branch hints + loop-head 16B alignment), G1 (backend refactoring), H1 (whole-program JIT), H2 (ret-based JIT).
+Landed: E5, C1, D1, E4, Phase A (A1–A4), B1, B2, B3, B4, B5, B6, B7-α (P1+P2+P3), C2, C3, C4, E1, E2, E3, D2 (a/b/c/d, symmetric on both backends), D3 (interpreter + Linux backend + Windows backend), D4 (redundant mov elimination), D5 (branch hints + loop-head 16B alignment), G1 (backend refactoring), H1 (whole-program JIT), H2 (ret-based JIT), H3-P0 / H3-P1 / H3-P2 (tiered JIT v1: balanced + bounded reach + no top-level nesting, Linux x86_64).
 Investigated and deferred: B7-β (ROI <2%, requires full K6 algorithm).
 
 Phase H / F dependency chain:
-H1 (landed) ──→ H2 (landed) ──→ F1b (tiered JIT)
-                      │
-                      └──→ JIT benchmark integration with E5
+H1 (landed) ──→ H2 (landed) ──→ H3-P0 / P1 / P2 (landed)
+                      │                      │
+                      └──→ JIT benchmark E5   └──→ H3-P3 (persistent shared tape, perf tuning)
 
 F2 (ARM64), F4 (LLVM), F5 (incremental cache) are outside the near-term dependency graph.
 ```

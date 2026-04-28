@@ -11,6 +11,13 @@ use std::path::PathBuf;
 /// Default Brainfuck tape length used by the interpreter when no override is set.
 pub(crate) const DEFAULT_INTERPRETER_TAPE_LEN: usize = 30_000;
 
+/// Default hot-loop trip-count threshold for `-m tiered` when `--jit-threshold`
+/// is not supplied. Set high enough that micro-loops in program startup stay in
+/// the interpreter, but low enough that genuinely hot loops cross within the
+/// first few milliseconds of work (hanoi.b / long.b's hot loops fire 10⁸+ times).
+#[cfg(target_os = "linux")]
+pub(crate) const DEFAULT_JIT_THRESHOLD: u64 = 10_000;
+
 /// Normalised compile-time configuration consumed by `driver::run`.
 #[derive(Debug, Clone)]
 pub(crate) struct DriverConfig {
@@ -26,6 +33,10 @@ pub(crate) struct DriverConfig {
     pub(crate) interp_debug: bool,
     /// `-O` tier: HIR uses `optimize_o0` / `optimize_o1` / `optimize_o2`; `-O3` additionally enables whole-program `compile` folds.
     pub(crate) opt_level: OptLevel,
+    /// Hot-loop trip-count threshold for `RunMode::Tiered`. Ignored in
+    /// other modes. `None` keeps the built-in default (`DEFAULT_JIT_THRESHOLD`).
+    #[cfg(target_os = "linux")]
+    pub(crate) jit_threshold: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,6 +50,11 @@ pub(crate) enum RunMode {
     /// JIT-compile and execute in-process (Linux x86_64 only).
     #[cfg(target_os = "linux")]
     Jit,
+    /// Tiered JIT: interpret with hot-loop profiling, then dispatch JIT-compiled
+    /// machine code for any loop whose trip count crosses the threshold (Linux
+    /// x86_64 only).
+    #[cfg(target_os = "linux")]
+    Tiered,
 }
 
 impl RunMode {
@@ -50,6 +66,8 @@ impl RunMode {
             "compile" => Some(Self::Compile),
             #[cfg(target_os = "linux")]
             "jit" => Some(Self::Jit),
+            #[cfg(target_os = "linux")]
+            "tiered" => Some(Self::Tiered),
             _ => None,
         }
     }
@@ -62,6 +80,8 @@ impl RunMode {
             Self::Compile => "compile",
             #[cfg(target_os = "linux")]
             Self::Jit => "jit",
+            #[cfg(target_os = "linux")]
+            Self::Tiered => "tiered",
         }
     }
 }

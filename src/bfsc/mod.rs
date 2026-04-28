@@ -212,6 +212,8 @@ fn run_compile_mode(bf: String, args: &ParsedArgs) -> Result<(), BfscError> {
         output,
         interp_debug: false,
         opt_level: args.opt_level,
+        #[cfg(target_os = "linux")]
+        jit_threshold: None,
     };
 
     crate::driver::run::run(config).map_err(|e| BfscError::Compile(e.to_string()))

@@ -338,6 +338,35 @@ fn bench_elf() {
                 label, j_mean, j_min, j_max,
             );
         }
+
+        // Tiered JIT mode (F1b-P2): interpreter with hot-loop dispatch.
+        let tiered_levels: &[(&str, &str)] =
+            &[("1", "TIER-O1"), ("2", "TIER-O2"), ("3", "TIER-O3")];
+        for (flag, label) in tiered_levels {
+            let mut t_ms_samples = Vec::with_capacity(TRIALS);
+            for _trial in 0..TRIALS {
+                let t = Instant::now();
+                let mut cmd = Command::new(amazingbf);
+                cmd.arg("-q")
+                    .arg(&bf_file)
+                    .arg("-m")
+                    .arg("tiered")
+                    .arg("-O")
+                    .arg(flag);
+                let output = common::run_with_optional_input(cmd, &in_file);
+                t_ms_samples.push(t.elapsed().as_secs_f64() * 1000.0);
+                assert!(
+                    output.status.success(),
+                    "{label} {name} tiered failed:\n{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            let (mean, min, max) = mean_min_max(&t_ms_samples);
+            eprintln!(
+                "{:<8} tier_ms mean/min/max: {:>6.3} / {:>6.3} / {:>6.3}",
+                label, mean, min, max,
+            );
+        }
     }
 
     eprintln!();

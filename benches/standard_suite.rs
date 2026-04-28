@@ -9,6 +9,9 @@
 //!   once during setup, out of the measurement loop).
 //! - `jit/O<N>` (Linux x86_64 only): time one full run of `AmazingBF -O<N> -m jit`,
 //!   measuring combined JIT compilation + execution.
+//! - `tiered/O<N>` (Linux x86_64 only): time one full run of
+//!   `AmazingBF -O<N> -m tiered`, measuring the F1b tiered JIT (interpret +
+//!   hot-loop dispatch). Default `--jit-threshold` (10000) is used.
 //!
 //! The per-program `interpret_levels` / `compile_levels` arrays trim the
 //! matrix to combinations that finish in a tractable wall-clock time. `O0`
@@ -46,6 +49,8 @@ struct BenchCase {
     compile_levels: &'static [&'static str],
     /// Optimization levels to register under JIT mode (Linux x86_64 only).
     jit_levels: &'static [&'static str],
+    /// Optimization levels to register under tiered JIT mode (Linux x86_64 only).
+    tiered_levels: &'static [&'static str],
     /// Criterion sample count; lower for slow benches.
     sample_size: usize,
     /// Total wall time allocated per bench unit, in seconds.
@@ -62,6 +67,7 @@ const CASES: &[BenchCase] = &[
         interpret_levels: &["1", "2", "3"],
         compile_levels: &["0", "1", "2", "3"],
         jit_levels: &["0", "1", "2", "3"],
+        tiered_levels: &["1", "2", "3"],
         sample_size: 10,
         measurement_time_s: 30,
     },
@@ -72,6 +78,7 @@ const CASES: &[BenchCase] = &[
         interpret_levels: &["0", "1", "2", "3"],
         compile_levels: &["0", "1", "2", "3"],
         jit_levels: &["0", "1", "2", "3"],
+        tiered_levels: &["1", "2", "3"],
         sample_size: 15,
         measurement_time_s: 20,
     },
@@ -82,6 +89,7 @@ const CASES: &[BenchCase] = &[
         interpret_levels: &["3"],
         compile_levels: &["0", "1", "2", "3"],
         jit_levels: &["0", "1", "2", "3"],
+        tiered_levels: &["1", "2", "3"],
         sample_size: 10,
         measurement_time_s: 30,
     },
@@ -92,6 +100,7 @@ const CASES: &[BenchCase] = &[
         interpret_levels: &["3"],
         compile_levels: &["1", "2", "3"],
         jit_levels: &["1", "2", "3"],
+        tiered_levels: &["3"],
         sample_size: 10,
         measurement_time_s: 60,
     },
@@ -102,6 +111,7 @@ const CASES: &[BenchCase] = &[
         interpret_levels: &[],
         compile_levels: &["2", "3"],
         jit_levels: &["2", "3"],
+        tiered_levels: &["2", "3"],
         sample_size: 10,
         measurement_time_s: 60,
     },
@@ -225,6 +235,26 @@ fn run_jit(case: &BenchCase, level: &str, stdin_bytes: Option<&[u8]>) {
     );
 }
 
+#[cfg(target_os = "linux")]
+fn run_tiered(case: &BenchCase, level: &str, stdin_bytes: Option<&[u8]>) {
+    let mut cmd = Command::new(AMAZINGBF_BIN);
+    cmd.arg(source_path(case))
+        .arg(format!("-O{}", level))
+        .arg("-m")
+        .arg("tiered")
+        .arg("-q")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let status = spawn_and_feed(cmd, stdin_bytes);
+    assert!(
+        status.success(),
+        "tiered of {} O{} failed: {:?}",
+        case.name,
+        level,
+        status
+    );
+}
+
 fn bench_all(c: &mut Criterion) {
     for case in CASES {
         let mut group = c.benchmark_group(case.name);
@@ -263,6 +293,17 @@ fn bench_all(c: &mut Criterion) {
                 level,
                 |b, lvl| {
                     b.iter(|| run_jit(case, lvl, stdin_bytes.as_deref()));
+                },
+            );
+        }
+
+        #[cfg(target_os = "linux")]
+        for level in case.tiered_levels {
+            group.bench_with_input(
+                BenchmarkId::new("tiered", format!("O{}", level)),
+                level,
+                |b, lvl| {
+                    b.iter(|| run_tiered(case, lvl, stdin_bytes.as_deref()));
                 },
             );
         }

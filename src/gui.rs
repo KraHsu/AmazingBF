@@ -90,6 +90,8 @@ pub(crate) fn run() -> crate::Result<()> {
         output: Default::default(),
         interp_debug: false,
         opt_level: parse_opt_level(&args),
+        #[cfg(target_os = "linux")]
+        jit_threshold: None,
     };
 
     let frontend = build_frontend(&config)?;

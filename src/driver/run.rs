@@ -21,6 +21,8 @@ use crate::driver::artifacts::{
     ASM_LISTING_EXT, HEX_LISTING_EXT, artifact_path, compile_executable_output_path,
     write_artifact, write_executable,
 };
+#[cfg(target_os = "linux")]
+use crate::driver::config::DEFAULT_JIT_THRESHOLD;
 use crate::driver::config::{
     CompileTarget, DEFAULT_INTERPRETER_TAPE_LEN, DriverConfig, OptLevel, RunMode,
 };
@@ -54,6 +56,8 @@ pub(crate) fn run(config: DriverConfig) -> Result<()> {
         RunMode::Dump => run_dump(&frontend.hir, config.opt_level),
         #[cfg(target_os = "linux")]
         RunMode::Jit => run_jit(&config, &frontend.hir)?,
+        #[cfg(target_os = "linux")]
+        RunMode::Tiered => run_tiered(&config, &frontend.hir)?,
     }
 
     log_info("pipeline finished");
@@ -203,6 +207,42 @@ fn build_optimized_lir(hir: &HirProgram, opt_level: OptLevel) -> LirProgram {
     } else {
         promote_scan_hints(optimize_lir(postpone_pointer_adds(lowered)))
     }
+}
+
+#[cfg(target_os = "linux")]
+fn run_tiered(config: &DriverConfig, hir: &HirProgram) -> Result<()> {
+    let threshold = config.jit_threshold.unwrap_or(DEFAULT_JIT_THRESHOLD);
+    let mut interp = Interpreter::new(
+        DEFAULT_INTERPRETER_TAPE_LEN,
+        BufferedStdIo::new(),
+        NullHost::new(),
+    );
+    interp.enable_tiered_jit(threshold);
+    interp.run(hir)?;
+    log_info(format!(
+        "tiered interpreter finished (hir_insts={} jit_threshold={})",
+        hir.insts.len(),
+        threshold,
+    ));
+
+    if config.interp_debug {
+        let s = interp.tape.stats();
+        eprintln!(
+            "[interp-debug] tape initial_cells={} final_cells={} visited_span={} \
+             right_grew_bytes={} ptr_min={} ptr_max={} \
+             move_left_units={} move_right_units={}",
+            s.initial_len,
+            s.final_len,
+            s.visited_span(),
+            s.right_grew_bytes,
+            s.ptr_min,
+            s.ptr_max,
+            s.move_left_units,
+            s.move_right_units,
+        );
+    }
+
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
