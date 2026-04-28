@@ -237,6 +237,9 @@ fn handle_loop_end<I: RuntimeIo, H: HostRuntime>(
 ) -> Result<usize, RuntimeError> {
     if let InterpOp::LoopEnd { start_pc } = op {
         if interp.tape.current() != 0 {
+            if let Some(ref mut profile) = interp.profile {
+                profile.record_back_edge(*start_pc);
+            }
             Ok(*start_pc as usize + 1)
         } else {
             Ok(pc + 1)

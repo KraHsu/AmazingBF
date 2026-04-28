@@ -16,6 +16,7 @@
 use crate::interp::bytecode::InterpProgram;
 use crate::interp::handlers::dispatch_table;
 use crate::interp::lower::lower_hir_to_bytecode;
+use crate::interp::profile::LoopProfile;
 use crate::ir::hir::HirProgram;
 use crate::runtime::host::HostRuntime;
 use crate::runtime::io::{IoError, RuntimeIo};
@@ -65,6 +66,8 @@ pub(crate) struct Interpreter<I: RuntimeIo, H: HostRuntime> {
     /// Host-call runtime; unused until host-call lowering reaches the interpreter.
     #[allow(dead_code)] // reason: used once host-call lowering reaches the interpreter
     pub(crate) host: H,
+    /// Optional loop trip-count profiler (F1b foundation).
+    pub(crate) profile: Option<LoopProfile>,
 }
 
 impl<I: RuntimeIo, H: HostRuntime> Interpreter<I, H> {
@@ -74,7 +77,15 @@ impl<I: RuntimeIo, H: HostRuntime> Interpreter<I, H> {
             tape: Tape::new(tape_len),
             io,
             host,
+            profile: None,
         }
+    }
+
+    /// Enable loop trip-count profiling with the given hot threshold.
+    /// Must be called before `run()`.
+    #[allow(dead_code)] // reason: consumed by F1b tiered JIT
+    pub(crate) fn enable_profiling(&mut self, threshold: u64) {
+        self.profile = Some(LoopProfile::new(0, threshold));
     }
 
     /// Execute a HIR program to completion, reporting the first I/O or host error encountered.
@@ -86,10 +97,20 @@ impl<I: RuntimeIo, H: HostRuntime> Interpreter<I, H> {
     /// an exec error wins over a flush error.
     pub(crate) fn run(&mut self, program: &HirProgram) -> Result<(), RuntimeError> {
         let bytecode = lower_hir_to_bytecode(program);
+        if self.profile.is_some() {
+            let threshold = self.profile.as_ref().unwrap().threshold();
+            self.profile = Some(LoopProfile::new(bytecode.ops.len(), threshold));
+        }
         let exec_result = self.exec_bytecode(&bytecode);
         let flush_result = self.io.flush();
         exec_result?;
         flush_result.map_err(RuntimeError::from)
+    }
+
+    /// Returns the loop profile after execution, if profiling was enabled.
+    #[allow(dead_code)] // reason: consumed by F1b tiered JIT
+    pub(crate) fn profile(&self) -> Option<&LoopProfile> {
+        self.profile.as_ref()
     }
 
     fn exec_bytecode(&mut self, program: &InterpProgram) -> Result<(), RuntimeError> {
