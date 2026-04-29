@@ -179,11 +179,46 @@
     - CLI：新增 `RunMode::Tiered` + `--jit-threshold N`（默认 10000）；`-m tiered` 走 `run_tiered`，仅 Linux 暴露。
     - 文件：`src/interp/profile.rs`、`src/interp/jit_compile.rs`（含 `analyse_eligibility` + 9 单测）、`src/interp/engine.rs`（`JitSlot` / `program: Arc<InterpProgram>` / `enable_tiered_jit`）、`src/interp/handlers.rs`（`compile_jit_slot` + `dispatch_jit`）、`src/runtime/tape.rs`、`src/backend/codegen.rs`（`compile_lir_to_jit_loop_asm`）、`src/driver/{config,run}.rs`、`src/cli.rs`、`crates/jit/src/lib.rs`（`from_slice` / `as_slice` / `data_ptr_at` + 3 单测）、`tests/tiered_jit_pipeline.rs`（9 集成测试覆盖 8 case + 高阈值回退）、`benches/standard_suite.rs` / `benches/compile_levels.rs` 增 `tiered` 列。
     - **v1 已知限制（明确推迟）**：
-      - 每次 dispatch 都会 mmap + memcpy 一次平铺 buffer，对于 hot loop 内迭代次数较少但调用频繁的场景（如 hanoi.b -O0），桥接成本可能压过 JIT 加速。-O3 默认路径（hanoi/long 的 hot pattern 已被 B7-α 折叠为单条 `LinearMul*`）不受影响。后续可改为持久化共享 tape（P3 候选）。
       - 不支持 unbalanced loop（需要 ABI 出参返回最终 `data_ptr_offset`）、JIT 期间 tape 增长（v1 靠预扩规避）、顶层嵌套 loop（P3 可放宽到允许 LinearMul* 之外的特定形态）。
       - 仅 Linux x86_64；Windows 沿用 P0/P1 的 `#[cfg]` 门控。
+  - **H3-P2 Step 2A — Vec<JitState> + Failed 短路** · **[已实现]**：首轮 bench 数据暴露两个退化（mandelbrot.b -O3 4.2× 慢于 interpret，long.b -O3 1.5× 慢）。问题在于 `HashMap<u32, JitSlot>::contains_key` 在每次回边都跑。修复：换成 `Vec<JitState>` 按 `LoopStart` pc 直接索引，`Failed` 槽 short-circuit；`record_back_edge` 挪进 `Cold` 分支（一旦决定就不再更新计数器）。结果：mandelbrot 32.8 s → 14.1 s（4.2× → 1.6×），long 216 ms → 149 ms（追平 interpret）。
+  - **H3-P2 Step 2B — 持久化 JIT scratch buffer** · **[已实现]**：每次 dispatch 仍要 mmap 一块新 `JitTape` + memcpy in/out，~10 µs/次 syscall 开销。修复：`Interpreter::jit_scratch: Option<JitTape>` 跨 dispatch 复用、按需扩容；新增 `JitTape::as_mut_slice` + `Tape::snapshot_flat_into` 让 dispatch 路径上零中间 `Vec` 分配。结果：mandelbrot 14.1 s → 11.0 s（1.6× → 1.3×），long 149 → 152 ms（噪声范围）。
+    - 文件：`src/interp/engine.rs`（`JitState`、`jit_scratch`）、`src/interp/handlers.rs`（dispatch 重写、`Failed` 短路）、`src/runtime/tape.rs`（`snapshot_flat_into` / `flat_required_bytes`）、`crates/jit/src/lib.rs`（`as_mut_slice`）
 
-**依赖：H1、H2、H3 (P0+P1+P2) 已落地。F1b（tiered JIT）的 v1 经 H3 完成；JIT 基准测试已接入 E5。后续 H3-P3（持久化共享 tape / 跨调用 buffer 复用）作为性能优化候选。**
+  - **H3 v2 整体 baseline（matslina suite，2026-04-29，commit 105a0da）**：
+    | Workload | mode | O0 | O1 | O2 | O3 |
+    |---|---|---|---|---|---|
+    | long | interp | n/a | 150 | 150 | 150 ms |
+    |  | exec | 1.38 s | 15.8 | 15.0 | **273 µs** |
+    |  | jit | 1.80 s | 15.4 | 16.3 | 153 ms |
+    |  | tiered | n/a | 152 | 152 | 153 ms |
+    | dbfi | interp | 21.4 s | 11.4 | 11.4 | 11.4 s |
+    |  | exec | 1.92 s | 1.85 | 1.85 | **1.85 s** |
+    |  | jit | 1.95 s | 1.73 | 1.73 | 1.73 s |
+    |  | tiered | n/a | 12.10 | 12.10 | 12.10 s |
+    | factor | interp | n/a | n/a | n/a | 1.72 s |
+    |  | exec | 385 | 110.7 | 110.6 | **110.9 ms** |
+    |  | jit | 390 | 111.3 | 111.9 | 112.0 ms |
+    |  | tiered | n/a | 1.77 | 1.78 | 1.77 s |
+    | mandelbrot | interp | n/a | n/a | n/a | 8.56 s |
+    |  | exec | n/a | 812 | 813 | **270 µs** |
+    |  | jit | n/a | 742 | 743 | 8.76 s |
+    |  | tiered | n/a | n/a | n/a | 10.97 s |
+    | hanoi | exec | n/a | n/a | 5.81 ms | **330 µs** |
+    |  | jit | n/a | n/a | 31.4 | 55.8 ms |
+    |  | tiered | n/a | n/a | 56.1 | 55.8 ms |
+
+  - **H3 ROI 评估 — tiered v2 在五个 workload 上零正向收益，相对 interpret 区间 +1% (long-O3) 到 +28% (mandelbrot-O3)**。原因：
+    - **eligibility 通过的工作负载（long / hanoi / dbfi / factor）**：B7-α 已把 hot loop 折叠为单条 `LinearMulWithSets`，interpreter 的 tagged-dispatch + 原生 handler 已经把每次外迭代压到 ~50 ns。JIT'd 一条 `LinearMulWithSets` 只把这个降到 ~30 ns，per-dispatch 桥接（memcpy + 函数调用）的固定成本就抵消了所有收益。
+    - **eligibility 拒收的工作负载（mandelbrot）**：所有 hot loop 都是 Unbalanced，根本不进 JIT。剩下的 ~28% 退化是 `interp.jit_enabled` 检查 + `jit_cache[idx]` 读 + tag match 的浮动开销，乘以 ~10⁹ 次回边。
+    - **`-m jit` -O3 在 mandelbrot/long 上很慢的原因**：O3 fold 路径会先用解释器跑一遍计算 stdout、再编译 trivial write+exit，所以 jit/O3 的 wall-clock ≈ interpret 时间。`-m compile -O3` 把这一步移出测量循环，所以才有 270 µs 量级。
+  - **H3-P3 (持久化 mmap-Tape 后端，原计划主性能轴) 暂停**：bench 数据下，即使把 dispatch 桥接成本降到零，per-iteration JIT vs interpreter 的差距太小（30 ns vs 50 ns）。matslina suite 上 P3 的最大可能收益约 30%（150 → 100 ms 量级），完成的工程量与 ROI 不成比例。
+  - **下一步候选（按 ROI 排序）**：
+    1. **H3 eligibility 放宽（顶层 `Scan(±1)` + Unbalanced loop）**：mandelbrot 的 hot loops 全是 Unbalanced，加上 ABI 出参回填 `data_ptr_offset` 后能进 JIT。potential reach：mandelbrot interpret 8.56 s → exec 812 ms（即 -O1 native），即 ~10× win 是上限。预计实际能拿到 3-5×（~2-3 s），因为外层 BF 程序结构限制了 JIT 复用率。**最大概率的实质性 win 来源**。
+    2. **F2 ARM64 后端**：纯扩展，不依赖现状 ROI。`PlatformEmitter` trait 可复用，`AsmInst` 需重写。
+    3. **F5 增量编译缓存**：bench 看不出编译时间是瓶颈，ROI 弱。
+
+**依赖：H1、H2、H3 (P0+P1+P2 + Step 2A/2B) 已落地。tiered JIT 的实测 baseline 显示 v2 与 interpret 平 parity，下一步真实收益要靠 eligibility 放宽。**
 
 ---
 

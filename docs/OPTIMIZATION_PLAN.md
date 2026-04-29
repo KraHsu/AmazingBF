@@ -180,11 +180,46 @@ Goal: add `src/ir/lir_opt.rs` after `src/ir/lower.rs` to provide a no-analysis p
     - CLI: new `RunMode::Tiered` + `--jit-threshold N` (default 10000); `-m tiered` runs `run_tiered`, exposed only on Linux.
     - Files: `src/interp/profile.rs`, `src/interp/jit_compile.rs` (`analyse_eligibility` + 9 unit tests), `src/interp/engine.rs` (`JitSlot` / `program: Arc<InterpProgram>` / `enable_tiered_jit`), `src/interp/handlers.rs` (`compile_jit_slot` + `dispatch_jit`), `src/runtime/tape.rs`, `src/backend/codegen.rs` (`compile_lir_to_jit_loop_asm`), `src/driver/{config,run}.rs`, `src/cli.rs`, `crates/jit/src/lib.rs` (`from_slice` / `as_slice` / `data_ptr_at` + 3 unit tests), `tests/tiered_jit_pipeline.rs` (9 integration tests covering 8 cases + a high-threshold no-JIT regression check), `benches/standard_suite.rs` / `benches/compile_levels.rs` add a `tiered` column.
     - **Known v1 limitations (deliberately deferred)**:
-      - Each dispatch performs an mmap + memcpy of a fresh flat buffer. For hot loops with few inner iterations but high entry rate (e.g. hanoi.b at -O0), bridging cost can outweigh JIT speedup. The default -O3 path is unaffected (B7-α already folds hanoi/long's hot patterns into a single `LinearMul*`). A persistent shared scratch tape is the natural P3 fix.
       - Unbalanced loops (would require an ABI out-param to return the final `data_ptr_offset`), JIT-side tape growth (sidestepped via pre-grow in v1), and top-level nested loops are all rejected. P3 may relax the nesting restriction for specific shapes.
       - Linux x86_64 only; Windows continues to be `#[cfg]`-gated as in P0/P1.
+  - **H3-P2 Step 2A — `Vec<JitState>` + Failed short-circuit** · **[landed]**: the first round of bench numbers exposed two regressions (mandelbrot.b -O3 at 4.2× slower than interpret, long.b -O3 at 1.5× slower) caused by `HashMap<u32, JitSlot>::contains_key` running on every back-edge. Fix: replace the HashMap with `Vec<JitState>` indexed directly by `LoopStart` pc; short-circuit `Failed` slots; move `record_back_edge` into the `Cold` arm so once a slot is decided the trip-counter stops mutating. Result: mandelbrot 32.8 s → 14.1 s (4.2× → 1.6×), long 216 ms → 149 ms (parity with interpret).
+  - **H3-P2 Step 2B — Persistent JIT scratch buffer** · **[landed]**: each dispatch still mmap'd a fresh `JitTape` + memcpy in/out, paying ~10 µs of syscall overhead per call. Fix: `Interpreter::jit_scratch: Option<JitTape>` reused across dispatches and grown lazily; new `JitTape::as_mut_slice` + `Tape::snapshot_flat_into` let the dispatch path memcpy directly with no intermediate `Vec`. Result: mandelbrot 14.1 s → 11.0 s (1.6× → 1.3×), long stays at parity (149 → 152 ms within noise).
+    - Files: `src/interp/engine.rs` (`JitState`, `jit_scratch`), `src/interp/handlers.rs` (dispatch rewrite, `Failed` short-circuit), `src/runtime/tape.rs` (`snapshot_flat_into` / `flat_required_bytes`), `crates/jit/src/lib.rs` (`as_mut_slice`)
 
-**Dependencies: H1, H2, and H3 (P0+P1+P2) landed. The F1b (tiered JIT) v1 is delivered by H3; JIT benchmarks are integrated into E5. H3-P3 (persistent shared tape / cross-call buffer reuse) remains a performance-tuning candidate.**
+  - **H3 v2 baseline (matslina suite, 2026-04-29, commit 105a0da)**:
+    | Workload | mode | O0 | O1 | O2 | O3 |
+    |---|---|---|---|---|---|
+    | long | interp | n/a | 150 | 150 | 150 ms |
+    |  | exec | 1.38 s | 15.8 | 15.0 | **273 µs** |
+    |  | jit | 1.80 s | 15.4 | 16.3 | 153 ms |
+    |  | tiered | n/a | 152 | 152 | 153 ms |
+    | dbfi | interp | 21.4 s | 11.4 | 11.4 | 11.4 s |
+    |  | exec | 1.92 s | 1.85 | 1.85 | **1.85 s** |
+    |  | jit | 1.95 s | 1.73 | 1.73 | 1.73 s |
+    |  | tiered | n/a | 12.10 | 12.10 | 12.10 s |
+    | factor | interp | n/a | n/a | n/a | 1.72 s |
+    |  | exec | 385 | 110.7 | 110.6 | **110.9 ms** |
+    |  | jit | 390 | 111.3 | 111.9 | 112.0 ms |
+    |  | tiered | n/a | 1.77 | 1.78 | 1.77 s |
+    | mandelbrot | interp | n/a | n/a | n/a | 8.56 s |
+    |  | exec | n/a | 812 | 813 | **270 µs** |
+    |  | jit | n/a | 742 | 743 | 8.76 s |
+    |  | tiered | n/a | n/a | n/a | 10.97 s |
+    | hanoi | exec | n/a | n/a | 5.81 ms | **330 µs** |
+    |  | jit | n/a | n/a | 31.4 | 55.8 ms |
+    |  | tiered | n/a | n/a | 56.1 | 55.8 ms |
+
+  - **H3 ROI assessment — tiered v2 yields no positive value across all five workloads, ranging from +1% (long-O3) to +28% (mandelbrot-O3) regression vs. plain interpret.** Why:
+    - **Workloads where eligibility passes (long / hanoi / dbfi / factor)**: B7-α has already folded the hot loop into a single `LinearMulWithSets`; the interpreter's tagged-dispatch + native handler runs each outer iteration in ~50 ns. JIT'ing that single op only drops it to ~30 ns, and the per-dispatch bridging fixed cost (memcpy + function call) eats the savings.
+    - **Workloads where eligibility fails (mandelbrot)**: every hot loop is `Unbalanced`, so nothing JITs. The remaining ~28% regression is `interp.jit_enabled` check + `jit_cache[idx]` read + tag match, multiplied by ~10⁹ back-edges.
+    - **`-m jit` -O3 being slow on mandelbrot/long**: the O3 fold path runs the interpreter offline first to compute stdout, then emits a trivial write+exit ELF. So jit/O3's wall-clock ≈ interpret time. `-m compile -O3` moves that step out of the measurement loop, which is why exec/O3 reports microseconds.
+  - **H3-P3 (persistent mmap-Tape backend, originally the "main perf axis") deferred**: under this baseline, even zero-cost dispatch bridging would only narrow the per-iteration JIT vs. interpreter gap from 30 ns vs. 50 ns. The matslina-suite ceiling for P3 is ~30% (150 ms → ~100 ms range), out of proportion to the engineering cost.
+  - **Next-step candidates (ROI-ordered)**:
+    1. **H3 eligibility relaxation (top-level `Scan(±1)` + Unbalanced loops)**: mandelbrot's hot loops are all Unbalanced; adding an ABI out-param to return the final `data_ptr_offset` lets them JIT. Reach: mandelbrot interpret 8.56 s → exec 812 ms (i.e. -O1 native), so the upper bound is ~10×; realistic gain is 3–5× (~2-3 s) given outer-loop reuse limits. **Most likely source of a substantive win.**
+    2. **F2 ARM64 backend**: pure expansion, independent of current ROI. `PlatformEmitter` trait reusable, `AsmInst` needs rewriting.
+    3. **F5 incremental compile cache**: bench shows compile time isn't the bottleneck, weak ROI.
+
+**Dependencies: H1, H2, H3 (P0+P1+P2 + Step 2A/2B) landed. The tiered JIT baseline shows v2 at parity with interpret; the next substantive win requires eligibility relaxation.**
 
 ---
 
