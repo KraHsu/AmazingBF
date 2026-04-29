@@ -141,14 +141,12 @@
 
 - **F1 JIT 执行**：
   - **F1a 整程序 JIT** → 见 H1（已实现）。
-  - **F1b Tiered JIT（解释器驱动热点编译）** → 见 H3（P0 / P1 / P2 已实现，Linux x86_64 only）。后续路径仍可走自写或 [Cranelift](https://cranelift.dev/)（Cranelift 破坏"零运行时依赖"承诺，与 F4 LLVM 的抉择类似）。
-- **F2 ARM64 后端**：Linux aarch64。寄存器约定需重设（建议 `x19–x24` callee-saved 映射），encode 层完全新写。G1 的 `PlatformEmitter` trait 和 `emit_lir_body` 可复用控制流，但需并行的 `AArch64AsmInst` 枚举。
-- **F4 LLVM 后端（可选）**：代价是破坏”零运行时依赖”承诺；作为可开关的 feature flag 存在。`src/llvm/` 目录已预留，`feat/llvm` 分支存在。若实施，LIR 是最佳输入层——已线性化、含显式 label/jump，自然映射到 LLVM basic block。
+  - **F1b Tiered JIT（解释器驱动热点编译）** → 见 H3（P0 / P1 / P2 已实现，Linux x86_64 only）。
 - **F5 增量编译缓存**：对固定 `.bf` 源缓存 HIR / LIR / obj，结合内容哈希。只有当 E5 表明编译时长占比明显时才值得。
 
 ### Phase G — 后端重构（已落地）
 
-> 目标：消除 Linux / Windows 后端之间的代码重复，为后续新增后端（F2 ARM64）降低成本。
+> 目标：消除 Linux / Windows 后端之间的代码重复。
 
 - **G1 提取共享 codegen 逻辑** ✓：新建 `src/backend/codegen_common.rs`，包含：
   - `LabelAllocator`：统一的内部标签分配器（替代 Linux 的 `fresh_internal_label(&mut u32)` 和 Windows 的 `LabelAllocator::new()`）。
@@ -215,8 +213,7 @@
   - **H3-P3 (持久化 mmap-Tape 后端，原计划主性能轴) 暂停**：bench 数据下，即使把 dispatch 桥接成本降到零，per-iteration JIT vs interpreter 的差距太小（30 ns vs 50 ns）。matslina suite 上 P3 的最大可能收益约 30%（150 → 100 ms 量级），完成的工程量与 ROI 不成比例。
   - **下一步候选（按 ROI 排序）**：
     1. **H3 eligibility 放宽（顶层 `Scan(±1)` + Unbalanced loop）**：mandelbrot 的 hot loops 全是 Unbalanced，加上 ABI 出参回填 `data_ptr_offset` 后能进 JIT。potential reach：mandelbrot interpret 8.56 s → exec 812 ms（即 -O1 native），即 ~10× win 是上限。预计实际能拿到 3-5×（~2-3 s），因为外层 BF 程序结构限制了 JIT 复用率。**最大概率的实质性 win 来源**。
-    2. **F2 ARM64 后端**：纯扩展，不依赖现状 ROI。`PlatformEmitter` trait 可复用，`AsmInst` 需重写。
-    3. **F5 增量编译缓存**：bench 看不出编译时间是瓶颈，ROI 弱。
+    2. **F5 增量编译缓存**：bench 看不出编译时间是瓶颈，ROI 弱。
 
 **依赖：H1、H2、H3 (P0+P1+P2 + Step 2A/2B) 已落地。tiered JIT 的实测 baseline 显示 v2 与 interpret 平 parity，下一步真实收益要靠 eligibility 放宽。**
 
@@ -249,7 +246,7 @@ H1 (已落地) ──→ H2 (已落地) ──→ H3-P0 / P1 / P2 (已落地)
                       │                      │
                       └──→ JIT 基准接入 E5    └──→ H3-P3 (持久化共享 tape，性能优化)
 
-F2 (ARM64)、F4 (LLVM)、F5 (增量缓存) 不在近期依赖图内。
+F5 (增量缓存) 不在近期依赖图内。
 ```
 
 ---

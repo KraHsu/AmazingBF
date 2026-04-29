@@ -142,14 +142,12 @@ Goal: add `src/ir/lir_opt.rs` after `src/ir/lower.rs` to provide a no-analysis p
 
 - **F1 JIT execution**:
   - **F1a Whole-program JIT** → see H1 (landed).
-  - **F1b Tiered JIT (interpreter-driven hot-spot compilation)** → see H3 (P0 / P1 / P2 landed, Linux x86_64 only). Future iterations may still pursue hand-rolled or [Cranelift](https://cranelift.dev/) (Cranelift breaks the "zero runtime dependencies" promise; the tradeoff mirrors F4 LLVM).
-- **F2 ARM64 backend**: Linux aarch64. Register conventions need to be redesigned (suggested `x19–x24` callee-saved mapping), and the encode layer rewritten from scratch. G1's `PlatformEmitter` trait and `emit_lir_body` can reuse the control flow, but a parallel `AArch64AsmInst` enum is needed.
-- **F4 LLVM backend (optional)**: the cost is breaking the "zero runtime dependencies" promise; exists behind a toggleable feature flag. `src/llvm/` directory is reserved; `feat/llvm` branch exists. If pursued, LIR is the best input layer — already linearized with explicit labels/jumps, mapping naturally to LLVM basic blocks.
+  - **F1b Tiered JIT (interpreter-driven hot-spot compilation)** → see H3 (P0 / P1 / P2 landed, Linux x86_64 only).
 - **F5 Incremental compilation cache**: cache HIR / LIR / obj for a fixed `.bf` source keyed by content hash. Only worth it if E5 shows compile time is a significant fraction of total time.
 
 ### Phase G — Backend refactoring (landed)
 
-> Goal: eliminate code duplication between the Linux / Windows backends, lowering the cost of adding new backends (F2 ARM64).
+> Goal: eliminate code duplication between the Linux / Windows backends.
 
 - **G1 Extract shared codegen logic** ✓: created `src/backend/codegen_common.rs`, containing:
   - `LabelAllocator`: unified internal label allocator (replacing Linux's `fresh_internal_label(&mut u32)` and Windows's `LabelAllocator::new()`).
@@ -216,8 +214,7 @@ Goal: add `src/ir/lir_opt.rs` after `src/ir/lower.rs` to provide a no-analysis p
   - **H3-P3 (persistent mmap-Tape backend, originally the "main perf axis") deferred**: under this baseline, even zero-cost dispatch bridging would only narrow the per-iteration JIT vs. interpreter gap from 30 ns vs. 50 ns. The matslina-suite ceiling for P3 is ~30% (150 ms → ~100 ms range), out of proportion to the engineering cost.
   - **Next-step candidates (ROI-ordered)**:
     1. **H3 eligibility relaxation (top-level `Scan(±1)` + Unbalanced loops)**: mandelbrot's hot loops are all Unbalanced; adding an ABI out-param to return the final `data_ptr_offset` lets them JIT. Reach: mandelbrot interpret 8.56 s → exec 812 ms (i.e. -O1 native), so the upper bound is ~10×; realistic gain is 3–5× (~2-3 s) given outer-loop reuse limits. **Most likely source of a substantive win.**
-    2. **F2 ARM64 backend**: pure expansion, independent of current ROI. `PlatformEmitter` trait reusable, `AsmInst` needs rewriting.
-    3. **F5 incremental compile cache**: bench shows compile time isn't the bottleneck, weak ROI.
+    2. **F5 incremental compile cache**: bench shows compile time isn't the bottleneck, weak ROI.
 
 **Dependencies: H1, H2, H3 (P0+P1+P2 + Step 2A/2B) landed. The tiered JIT baseline shows v2 at parity with interpret; the next substantive win requires eligibility relaxation.**
 
@@ -250,7 +247,7 @@ H1 (landed) ──→ H2 (landed) ──→ H3-P0 / P1 / P2 (landed)
                       │                      │
                       └──→ JIT benchmark E5   └──→ H3-P3 (persistent shared tape, perf tuning)
 
-F2 (ARM64), F4 (LLVM), F5 (incremental cache) are outside the near-term dependency graph.
+F5 (incremental cache) is outside the near-term dependency graph.
 ```
 
 ---
