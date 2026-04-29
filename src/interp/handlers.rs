@@ -258,8 +258,7 @@ fn handle_loop_end<I: RuntimeIo, H: HostRuntime>(
                         // Sticky reject: skip without consulting profile.
                     }
                     JitState::Ready { .. } => {
-                        dispatch_jit(interp, *start_pc)?;
-                        return Ok(pc + 1);
+                        return dispatch_jit(interp, *start_pc, pc);
                     }
                     JitState::Cold => {
                         if let Some(ref mut profile) = interp.profile {
@@ -267,8 +266,7 @@ fn handle_loop_end<I: RuntimeIo, H: HostRuntime>(
                             if profile.trip_count(*start_pc) >= profile.threshold() {
                                 compile_jit_slot(interp, *start_pc);
                                 if matches!(interp.jit_cache[idx], JitState::Ready { .. }) {
-                                    dispatch_jit(interp, *start_pc)?;
-                                    return Ok(pc + 1);
+                                    return dispatch_jit(interp, *start_pc, pc);
                                 }
                             }
                         }
@@ -315,10 +313,21 @@ fn compile_jit_slot<I: RuntimeIo, H: HostRuntime>(interp: &mut Interpreter<I, H>
         };
         let body = &program.ops[(start_pc as usize) + 1..end_pc as usize];
         match analyse_eligibility(body) {
-            Some(reach) => match compile_hot_loop(body) {
-                Some(buf) => JitState::Ready { buf, reach },
-                None => JitState::Failed,
-            },
+            Some(reach) => {
+                // Unbalanced loops drift each iteration; the JIT body emits
+                // a per-iteration bounds check so it bails before stepping
+                // past the host's scratch. Balanced loops keep the check
+                // off — pre-grow alone is sufficient.
+                let iter_check = if reach.net_delta != 0 {
+                    Some((reach.min_off, reach.max_off))
+                } else {
+                    None
+                };
+                match compile_hot_loop(body, iter_check) {
+                    Some(buf) => JitState::Ready { buf, reach },
+                    None => JitState::Failed,
+                }
+            }
             None => JitState::Failed,
         }
     };
@@ -327,33 +336,55 @@ fn compile_jit_slot<I: RuntimeIo, H: HostRuntime>(interp: &mut Interpreter<I, H>
 
 /// Run the JIT-compiled body for the loop whose `LoopStart` lives at
 /// `start_pc`. Pre-grows the interpreter tape to cover the body's static
-/// reach, memcpys into the interpreter's persistent JIT-scratch buffer
-/// (allocated/grown lazily, never mmap'd per call), calls the function,
-/// then copies the modified tape back.
+/// reach (extended in the drift direction for unbalanced loops to
+/// amortise bail cost), memcpys into the interpreter's persistent
+/// JIT-scratch buffer, calls the function, then copies the modified tape
+/// back. Returns the next pc:
+/// - `loop_end_pc + 1` (past `]`) when the JIT loop completed naturally
+///   (cell at exit equals 0). `exit.status == 0`.
+/// - `start_pc as usize` (re-enter the `[`) when the JIT bailed out of
+///   bounds. The interpreter then runs the body in slow mode for one
+///   iteration; the next back-edge re-dispatches the JIT against the
+///   now-grown tape. `exit.status == 1`.
 ///
-/// The eligibility contract (balanced loop, bounded reach) guarantees the
-/// JIT exits with `data_ptr` at its entry position, so the same byte
-/// offset can be used to restore. The persistent scratch is what
-/// distinguishes this from the v1 path: each dispatch on long.b -O3 now
-/// pays one memcpy in + one memcpy out + a function call, instead of
-/// also paying a 4 KiB mmap + 4 KiB munmap pair.
+/// The persistent scratch is what distinguishes this from the v1 path:
+/// each dispatch pays one memcpy in + one memcpy out + a function call,
+/// instead of also paying a 4 KiB mmap + 4 KiB munmap pair.
 #[cfg(target_os = "linux")]
 fn dispatch_jit<I: RuntimeIo, H: HostRuntime>(
     interp: &mut Interpreter<I, H>,
     start_pc: u32,
-) -> Result<(), RuntimeError> {
+    loop_end_pc: usize,
+) -> Result<usize, RuntimeError> {
     use crate::interp::engine::JitState;
 
-    let (min_off, max_off) = match &interp.jit_cache[start_pc as usize] {
+    /// Drift headroom (bytes) added to the pre-grow span on top of one
+    /// iteration's reach for unbalanced loops. Larger headroom amortises
+    /// the bail cost across more JIT iterations; 4 KiB ≈ one tape page,
+    /// matching the runtime's growth granularity, and lets a `+net=1`
+    /// loop run ~4096 iterations between bails before the host has to
+    /// re-grow + restart.
+    const UNBALANCED_HEADROOM: i32 = 4096;
+
+    let reach = match &interp.jit_cache[start_pc as usize] {
         JitState::Ready { reach, .. } => *reach,
         _ => unreachable!("dispatch_jit invariant: slot must be Ready"),
     };
 
-    // Pre-grow: ensure visited_span covers the loop's per-iteration reach,
-    // so the snapshot below copies every cell the JIT will touch and the
-    // JIT-side ensure_tape never fires during execution.
-    interp.tape.add_at(min_off as isize, 0);
-    interp.tape.add_at(max_off as isize, 0);
+    // Pre-grow: ensure visited_span covers the loop's per-iteration reach.
+    interp.tape.add_at(reach.min_off as isize, 0);
+    interp.tape.add_at(reach.max_off as isize, 0);
+    // For unbalanced loops, also grow in the drift direction so the JIT
+    // can run many iterations before its per-iteration bounds check bails.
+    if reach.net_delta > 0 {
+        interp
+            .tape
+            .add_at((reach.max_off + UNBALANCED_HEADROOM) as isize, 0);
+    } else if reach.net_delta < 0 {
+        interp
+            .tape
+            .add_at((reach.min_off - UNBALANCED_HEADROOM) as isize, 0);
+    }
 
     // Lazy-allocate / grow the persistent scratch buffer. JitTape's mmap
     // size is page-rounded inside `JitTape::new`, so we feed it the
@@ -383,19 +414,10 @@ fn dispatch_jit<I: RuntimeIo, H: HostRuntime>(
         _ => unreachable!("dispatch_jit invariant: slot must be Ready"),
     };
 
-    if exit.status != 0 {
-        return Err(RuntimeError::Jit(format!(
-            "JIT loop returned non-zero exit code {}",
-            exit.status,
-        )));
-    }
-
     // The JIT writes its final r13 into rdx (SysV 16-byte struct return),
     // landing in `exit.data_ptr`. Translate that pointer back into a byte
     // offset within the scratch buffer so `restore_from_flat` knows where
-    // to set the interpreter's tape pointer. For balanced loops this equals
-    // `data_off`; for unbalanced loops or scans (once eligibility is
-    // relaxed) it picks up the new position.
+    // to set the interpreter's tape pointer.
     let final_data_off = (exit.data_ptr as usize).wrapping_sub(scratch.base() as usize);
     debug_assert!(
         final_data_off < scratch.len(),
@@ -404,8 +426,25 @@ fn dispatch_jit<I: RuntimeIo, H: HostRuntime>(
         scratch.base(),
         scratch.end(),
     );
-    interp.tape.restore_from_flat(scratch.as_slice(), final_data_off);
-    Ok(())
+    interp
+        .tape
+        .restore_from_flat(scratch.as_slice(), final_data_off);
+
+    // status: 0 = loop completed (cell at final r13 is zero); fall through
+    //             past `]`.
+    //         1 = bailed out of bounds (per-iter check tripped or a body
+    //             `PtrAdd` slow-path landed in `emit_ensure_tape_bail`).
+    //             The cell may still be non-zero — return to `[` so the
+    //             interpreter re-tests and runs one body iteration in
+    //             slow mode, with the next back-edge re-dispatching us
+    //             against the now-grown tape.
+    match exit.status {
+        0 => Ok(loop_end_pc + 1),
+        1 => Ok(start_pc as usize),
+        s => Err(RuntimeError::Jit(format!(
+            "JIT loop returned unexpected status {s}",
+        ))),
+    }
 }
 
 /// Build the tag-indexed dispatch table. Called once per `run()`; the

@@ -15,6 +15,8 @@
 
 use crate::interp::bytecode::InterpProgram;
 use crate::interp::handlers::dispatch_table;
+#[cfg(target_os = "linux")]
+use crate::interp::jit_compile::LoopReach;
 use crate::interp::lower::lower_hir_to_bytecode;
 use crate::interp::profile::LoopProfile;
 use crate::ir::hir::HirProgram;
@@ -33,9 +35,10 @@ use std::sync::Arc;
 ///
 /// `Failed` is sticky once an eligibility analysis or machine-code emission
 /// rejects the loop, so the back-edge short-circuits without retrying.
-/// `Ready` carries the live `JitBuffer` plus the `(min_off, max_off)` reach
-/// derived during eligibility analysis, used to pre-grow the tape before
-/// each call.
+/// `Ready` carries the live `JitBuffer` plus the `LoopReach` derived during
+/// eligibility analysis (per-iteration `[min_off, max_off]` window plus
+/// `net_delta`), used to pre-grow the tape and decide whether the JIT body
+/// emits a per-iteration bounds check (unbalanced loops only).
 #[cfg(target_os = "linux")]
 #[derive(Default)]
 pub(crate) enum JitState {
@@ -48,7 +51,7 @@ pub(crate) enum JitState {
     /// Loop has compiled successfully; dispatch this on the next back-edge.
     Ready {
         buf: amazingbf_jit::JitBuffer,
-        reach: (i32, i32),
+        reach: LoopReach,
     },
 }
 
@@ -181,7 +184,8 @@ impl<I: RuntimeIo, H: HostRuntime> Interpreter<I, H> {
             // Non-LoopStart slots are never read; we trade a few bytes of
             // unused state for branch-free indexing in `handle_loop_end`.
             self.jit_cache.clear();
-            self.jit_cache.resize_with(bytecode.ops.len(), JitState::default);
+            self.jit_cache
+                .resize_with(bytecode.ops.len(), JitState::default);
         }
         let bytecode = Arc::new(bytecode);
         self.program = Some(bytecode.clone());

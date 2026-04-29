@@ -38,7 +38,9 @@
 //!   overlap user labels.
 
 use crate::backend::asm::{AsmInst, AsmLabel, AsmProgram, Reg64};
-use crate::backend::codegen_common::{LabelAllocator, PlatformEmitter, emit_lir_body};
+use crate::backend::codegen_common::{
+    LabelAllocator, PlatformEmitter, emit_add_reg_isize, emit_lir_body,
+};
 use crate::ir::lir::LirProgram;
 
 /// Initial tape size in bytes.
@@ -664,11 +666,38 @@ pub fn compile_lir_to_jit_asm(lir: &LirProgram) -> AsmProgram {
     AsmProgram { insts: out }
 }
 
+/// Emit a "bail" trampoline at `ensure_tape_label` for the tiered JIT.
+///
+/// The AOT-style [`emit_ensure_tape_contains_r15`] grows the tape in place
+/// via mmap+memcpy+munmap, but in the tiered path the tape it would
+/// `munmap` is the host's persistent `JitTape` scratch buffer — unmapping
+/// it would dangle the host's pointer. Instead, the tiered JIT must hand
+/// control back to the interpreter when the loop body would step out of
+/// the pre-grown scratch.
+///
+/// The trampoline:
+/// - Drops the return address pushed by the `call` site (8 bytes off rsp).
+/// - Falls through to `exit_one_label`, which sets `rax = 1` and runs the
+///   epilogue's `mov rdx, r13` + pops + `ret`. Status 1 then signals to
+///   `dispatch_jit` that the loop needs to be retired and finished by the
+///   interpreter.
+fn emit_ensure_tape_bail(
+    out: &mut Vec<AsmInst>,
+    ensure_tape_label: AsmLabel,
+    exit_one_label: AsmLabel,
+) {
+    out.push(AsmInst::Label(ensure_tape_label));
+    // Drop the return address from the `call` site so `ret` in the
+    // epilogue lands on the host's frame.
+    out.push(AsmInst::AddRegImm32(Reg64::Rsp, 8));
+    out.push(AsmInst::Jmp(exit_one_label));
+}
+
 /// Compile a LIR program into a JIT loop body for the F1b tiered JIT.
 ///
 /// Same SysV ABI as [`compile_lir_to_jit_asm`] (rdi=tape_base, rsi=data_ptr,
-/// rdx=tape_end → i32) but tailored for hot-loop dispatch rather than
-/// whole-program execution:
+/// rdx=tape_end → 16-byte struct {status, data_ptr}) but tailored for
+/// hot-loop dispatch rather than whole-program execution:
 ///
 /// - **No output-buffer mmap**: hot loops are filtered by
 ///   [`crate::interp::jit_compile::analyse_eligibility`] which rejects any
@@ -679,17 +708,32 @@ pub fn compile_lir_to_jit_asm(lir: &LirProgram) -> AsmProgram {
 ///   unnecessary.
 /// - **No `flush_output` helper body**: dead code if the body never calls it.
 ///
-/// `ensure_tape_contains_r15` is still emitted because `PtrAdd` codegen
-/// references it on the slow path. The interpreter pre-grows the tape to
-/// cover the loop's static reach before dispatching, so the slow path is
-/// never taken in practice — but the label has to resolve.
-pub fn compile_lir_to_jit_loop_asm(lir: &LirProgram) -> AsmProgram {
+/// `lir` is the **flat body** between `[` and `]` (no outer wrapper) — the
+/// outer `Label / JumpIfZero / JumpIfNonZero / Label` quartet is emitted
+/// here so the per-iteration bounds check (for `iter_check = Some(_)`) can
+/// sit between the head zero-check and the body.
+///
+/// `iter_check`:
+/// - `None` → balanced loop (`net_delta == 0`); the host pre-grew the tape
+///   to cover one iteration's reach and that suffices forever, so no
+///   per-iteration check is emitted.
+/// - `Some((min_off, max_off))` → unbalanced loop; emit a head check that
+///   bails (status = 1) when `r13 + min_off < r12` or `r13 + max_off ≥ r14`,
+///   so the JIT never reads past the host's scratch buffer.
+///
+/// `ensure_tape_contains_r15` is still referenced by the body's `PtrAdd`
+/// slow path; in tiered mode that label routes to a "bail" trampoline (see
+/// [`emit_ensure_tape_bail`]) because the host owns the tape and the AOT
+/// `mmap+munmap` cannot run safely.
+pub fn compile_lir_to_jit_loop_asm(lir: &LirProgram, iter_check: Option<(i32, i32)>) -> AsmProgram {
     let ensure_tape_label = AsmLabel(INTERNAL_LABEL_ENSURE_TAPE_RAW);
     let exit_one_label = AsmLabel(INTERNAL_LABEL_EXIT_ONE_RAW);
     let flush_output_label = AsmLabel(INTERNAL_LABEL_FLUSH_OUTPUT_RAW);
     let epilogue_label = AsmLabel(INTERNAL_LABEL_JIT_EPILOGUE_RAW);
 
     let mut labels = LabelAllocator::new(INTERNAL_LABEL_JIT_BASE_RAW, 0);
+    let loop_top = labels.fresh();
+    let exit_normal = labels.fresh();
 
     let mut out = vec![
         AsmInst::Push(Reg64::Rbp),
@@ -703,6 +747,30 @@ pub fn compile_lir_to_jit_loop_asm(lir: &LirProgram) -> AsmProgram {
         AsmInst::MovRegReg(Reg64::R14, Reg64::Rdx),
     ];
 
+    // Outer loop wrapper: align(16); loop_top:; cmp [r13],0; jz exit_normal.
+    out.push(AsmInst::Align16);
+    out.push(AsmInst::Label(loop_top));
+    out.push(AsmInst::CmpMem8Imm8(Reg64::R13, 0));
+    out.push(AsmInst::Jz(exit_normal));
+
+    // Per-iteration bounds check (unbalanced loops only). Bail to
+    // `exit_one_label` when the body's reach falls outside the host's
+    // scratch — the host then re-grows the tape and re-dispatches.
+    if let Some((min_off, max_off)) = iter_check {
+        if min_off < 0 {
+            out.push(AsmInst::MovRegReg(Reg64::R15, Reg64::R13));
+            emit_add_reg_isize(&mut out, Reg64::R15, min_off as isize);
+            out.push(AsmInst::CmpRegReg(Reg64::R15, Reg64::R12));
+            out.push(AsmInst::Jb(exit_one_label));
+        }
+        if max_off > 0 {
+            out.push(AsmInst::MovRegReg(Reg64::R15, Reg64::R13));
+            emit_add_reg_isize(&mut out, Reg64::R15, max_off as isize);
+            out.push(AsmInst::CmpRegReg(Reg64::R15, Reg64::R14));
+            out.push(AsmInst::Jae(exit_one_label));
+        }
+    }
+
     let linux_emitter = LinuxEmitter;
     emit_lir_body(
         &mut out,
@@ -714,10 +782,20 @@ pub fn compile_lir_to_jit_loop_asm(lir: &LirProgram) -> AsmProgram {
         &linux_emitter,
     );
 
+    // Back-edge: unconditional jump to head; the head's `cmp/jz` re-tests
+    // and exits when the cell hits zero. One `cmp` per iteration vs. two
+    // for the matslina-style "test at top + test at bottom" lowering.
+    out.push(AsmInst::Jmp(loop_top));
+
+    // Normal exit (cell == 0 at head): status = 0.
+    out.push(AsmInst::Label(exit_normal));
     out.push(AsmInst::MovRegImm64(Reg64::Rax, 0));
     out.push(AsmInst::Jmp(epilogue_label));
 
-    emit_ensure_tape_contains_r15(&mut out, ensure_tape_label, exit_one_label);
+    // Tiered-only: bail out instead of growing the tape in-place. The host
+    // owns the scratch buffer so the AOT path's mmap+munmap would dangle
+    // the host pointer (see `emit_ensure_tape_bail`).
+    emit_ensure_tape_bail(&mut out, ensure_tape_label, exit_one_label);
 
     out.push(AsmInst::Label(exit_one_label));
     out.push(AsmInst::MovRegImm64(Reg64::Rax, 1));
