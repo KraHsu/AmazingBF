@@ -723,6 +723,11 @@ pub fn compile_lir_to_jit_loop_asm(lir: &LirProgram) -> AsmProgram {
     out.push(AsmInst::MovRegImm64(Reg64::Rax, 1));
 
     out.push(AsmInst::Label(epilogue_label));
+    // SysV 16-byte struct return: status in rax, final data_ptr in rdx.
+    // The host's `JitExit` reads rax into `status` and rdx into `data_ptr`.
+    // Capture r13 BEFORE popping the callee-saved regs (after the pops r13
+    // would already be the caller's value).
+    out.push(AsmInst::MovRegReg(Reg64::Rdx, Reg64::R13));
     out.push(AsmInst::Pop(Reg64::R15));
     out.push(AsmInst::Pop(Reg64::R14));
     out.push(AsmInst::Pop(Reg64::R13));

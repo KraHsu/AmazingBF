@@ -185,6 +185,50 @@ impl JitBuffer {
             unsafe { core::mem::transmute(self.ptr) };
         f(tape_base, data_ptr, tape_end)
     }
+
+    /// Tiered-JIT loop entry point: same SysV ABI as [`Self::execute_fn`]
+    /// but also returns the *final* `data_ptr` after the JIT'd loop body
+    /// completes. This lets the host restore its tape state to the right
+    /// position even when the loop is unbalanced (cumulative ptr delta ≠ 0)
+    /// or contains a scan, where the entry `data_ptr` is not preserved.
+    ///
+    /// The generated code must `mov rdx, r13` right before its `ret`, so the
+    /// SysV 16-byte struct return convention places the status in `rax` and
+    /// the final `data_ptr` in `rdx`. Calling this against a buffer that
+    /// doesn't follow the convention reads garbage in `data_ptr` — only
+    /// `compile_lir_to_jit_loop_asm` produces the right shape today.
+    #[allow(unsafe_code)]
+    pub fn execute_loop_fn(
+        &self,
+        tape_base: *mut u8,
+        data_ptr: *mut u8,
+        tape_end: *mut u8,
+    ) -> JitExit {
+        let f: extern "C" fn(*mut u8, *mut u8, *mut u8) -> JitExit =
+            unsafe { core::mem::transmute(self.ptr) };
+        f(tape_base, data_ptr, tape_end)
+    }
+}
+
+/// Result of a tiered-JIT loop dispatch: status word + the JIT's final
+/// `data_ptr` so the caller can update its own tape position.
+///
+/// Layout matches the SysV 16-byte two-register struct return: `status` in
+/// the low half of `rax` (with 4 padding bytes filling the rest of the
+/// 8-byte slot), `data_ptr` in `rdx`. The struct must stay `#[repr(C)]` and
+/// 16 bytes for the ABI to hold.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct JitExit {
+    /// 0 on success; 1 on JIT-side `ensure_tape` growth failure.
+    pub status: i32,
+    /// Padding so `data_ptr` lands at offset 8 (matches SysV class INTEGER
+    /// in the second eight-byte slot).
+    pub _pad: u32,
+    /// The JIT-final value of the data pointer. For balanced loops this
+    /// equals the input `data_ptr`; for unbalanced or scanning loops it
+    /// reflects the new position.
+    pub data_ptr: *mut u8,
 }
 
 impl Drop for JitBuffer {
@@ -421,6 +465,33 @@ mod tests {
         let buf = JitBuffer::new(code).expect("mmap should succeed");
         let ret = buf.execute_fn(1 as *mut u8, 2 as *mut u8, 3 as *mut u8);
         assert_eq!(ret, 6, "execute_fn should pass args via rdi/rsi/rdx");
+    }
+
+    #[test]
+    fn execute_loop_fn_returns_status_and_data_ptr() {
+        // x86_64: mov eax, 7; mov rdx, 0xCAFEBABEDEADBEEF; ret
+        // Returns a 16-byte struct { status: 7, data_ptr: 0xCAFE..F }
+        // via the SysV two-register convention (rax + rdx). This pins the
+        // ABI binding for `execute_loop_fn` independent of any real JIT
+        // codegen, so a wrong Rust-side struct layout would surface here
+        // instead of as silent tape corruption in the integration tests.
+        let code: &[u8] = &[
+            0xB8, 0x07, 0x00, 0x00, 0x00, // mov eax, 7
+            0x48, 0xBA, 0xEF, 0xBE, 0xAD, 0xDE, 0xBE, 0xBA, 0xFE,
+            0xCA, // mov rdx, 0xCAFEBABEDEADBEEF
+            0xC3, // ret
+        ];
+        let buf = JitBuffer::new(code).expect("mmap should succeed");
+        let exit = buf.execute_loop_fn(
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        );
+        assert_eq!(exit.status, 7, "status word should land in the rax slot");
+        assert_eq!(
+            exit.data_ptr as u64, 0xCAFE_BABE_DEAD_BEEF,
+            "data_ptr should land in the rdx slot",
+        );
     }
 
     #[test]

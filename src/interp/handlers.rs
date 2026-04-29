@@ -375,21 +375,36 @@ fn dispatch_jit<I: RuntimeIo, H: HostRuntime>(
         .expect("jit_scratch is Some after the lazy-allocate above");
     let data_off = interp.tape.snapshot_flat_into(scratch.as_mut_slice());
 
-    let exit_code = match &interp.jit_cache[start_pc as usize] {
+    let exit = match &interp.jit_cache[start_pc as usize] {
         JitState::Ready { buf, .. } => {
             let dp = scratch.data_ptr_at(data_off);
-            buf.execute_fn(scratch.base(), dp, scratch.end())
+            buf.execute_loop_fn(scratch.base(), dp, scratch.end())
         }
         _ => unreachable!("dispatch_jit invariant: slot must be Ready"),
     };
 
-    if exit_code != 0 {
+    if exit.status != 0 {
         return Err(RuntimeError::Jit(format!(
-            "JIT loop returned non-zero exit code {exit_code}"
+            "JIT loop returned non-zero exit code {}",
+            exit.status,
         )));
     }
 
-    interp.tape.restore_from_flat(scratch.as_slice(), data_off);
+    // The JIT writes its final r13 into rdx (SysV 16-byte struct return),
+    // landing in `exit.data_ptr`. Translate that pointer back into a byte
+    // offset within the scratch buffer so `restore_from_flat` knows where
+    // to set the interpreter's tape pointer. For balanced loops this equals
+    // `data_off`; for unbalanced loops or scans (once eligibility is
+    // relaxed) it picks up the new position.
+    let final_data_off = (exit.data_ptr as usize).wrapping_sub(scratch.base() as usize);
+    debug_assert!(
+        final_data_off < scratch.len(),
+        "JIT returned data_ptr {:?} outside scratch [{:?}, {:?})",
+        exit.data_ptr,
+        scratch.base(),
+        scratch.end(),
+    );
+    interp.tape.restore_from_flat(scratch.as_slice(), final_data_off);
     Ok(())
 }
 
