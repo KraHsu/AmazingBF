@@ -1,0 +1,144 @@
+// BF self-hosting interpreter, written in BFS.
+//
+// Reads a Brainfuck program from stdin, terminated by `!` (or EOF), then
+// interprets it on a 256-cell tape. Bytes after `!` feed the program's `,`.
+//
+// Encoding: BF instructions are remapped to a compact alphabet (1..8) at
+// load time so the inner dispatch chain only needs cheap small-constant
+// equality checks. Bracket targets are pre-computed once into a jump
+// table so [/] is O(1) per execution rather than O(prog_len) scan.
+//
+// Limits (tied to bfsc's u8 array indexing):
+//   - up to 255 BF instructions in the program
+//   - up to 256 simulated tape cells
+//   - bracket nesting depth up to 32
+
+let prog: [u8; 256];        // encoded opcodes (0 = halt sentinel)
+let jmp:  [u8; 256];        // bracket jump table (matching index)
+let bstk: [u8; 32];         // bracket stack used during pre-pass
+let tape: [u8; 256];        // simulated BF tape
+
+let prog_len: u8 = 0;
+let pc:  u8 = 0;
+let ptr: u8 = 0;
+let bsp: u8 = 0;
+
+let ch:   u8 = 0;
+let op:   u8 = 0;
+let cell: u8 = 0;
+let lbra: u8 = 0;
+let i:    u8 = 0;
+
+let reading: u8 = 1;
+let running: u8 = 1;
+
+// -----------------------------------------------------------------------
+// Phase 1: read program from stdin until `!` (33) or EOF (255).
+// Map BF chars onto a compact 1..8 alphabet.
+// -----------------------------------------------------------------------
+while reading {
+    getchar(ch);
+    if ch == 255 {
+        reading = 0;
+    } else {
+        if ch == 33 {           // '!' separates program from runtime input
+            reading = 0;
+        } else {
+            // Only accept the eight legal BF characters; everything else is
+            // silently skipped.  Most-frequent ops get the lowest opcode so
+            // the dispatch chain hits common cases earliest.
+            if prog_len < 255 {
+                if ch == 62 {                // '>'
+                    prog[prog_len] = 1;
+                    prog_len = prog_len + 1;
+                } else { if ch == 60 {        // '<'
+                    prog[prog_len] = 2;
+                    prog_len = prog_len + 1;
+                } else { if ch == 43 {        // '+'
+                    prog[prog_len] = 3;
+                    prog_len = prog_len + 1;
+                } else { if ch == 45 {        // '-'
+                    prog[prog_len] = 4;
+                    prog_len = prog_len + 1;
+                } else { if ch == 46 {        // '.'
+                    prog[prog_len] = 5;
+                    prog_len = prog_len + 1;
+                } else { if ch == 44 {        // ','
+                    prog[prog_len] = 6;
+                    prog_len = prog_len + 1;
+                } else { if ch == 91 {        // '['
+                    prog[prog_len] = 7;
+                    prog_len = prog_len + 1;
+                } else { if ch == 93 {        // ']'
+                    prog[prog_len] = 8;
+                    prog_len = prog_len + 1;
+                } } } } } } } }
+            }
+        }
+    }
+}
+
+// -----------------------------------------------------------------------
+// Phase 2: pre-compute bracket pairs.
+// jmp[i_open] = i_close, jmp[i_close] = i_open.
+// -----------------------------------------------------------------------
+i = 0;
+while i < prog_len {
+    op = prog[i];
+    if op == 7 {                            // '['
+        bstk[bsp] = i;
+        bsp = bsp + 1;
+    } else { if op == 8 {                   // ']'
+        bsp = bsp - 1;
+        lbra = bstk[bsp];
+        jmp[lbra] = i;
+        jmp[i] = lbra;
+    } }
+    i = i + 1;
+}
+
+// -----------------------------------------------------------------------
+// Phase 3: execute. Dispatch is a most-frequent-first if/else cascade.
+// `op == 0` falls through past prog_len and halts the loop.
+// -----------------------------------------------------------------------
+while running {
+    op = prog[pc];
+
+    if op == 1 {                            // '>'
+        ptr = ptr + 1;
+        pc = pc + 1;
+    } else { if op == 2 {                   // '<'
+        ptr = ptr - 1;
+        pc = pc + 1;
+    } else { if op == 3 {                   // '+'
+        tape[ptr] = tape[ptr] + 1;
+        pc = pc + 1;
+    } else { if op == 4 {                   // '-'
+        tape[ptr] = tape[ptr] - 1;
+        pc = pc + 1;
+    } else { if op == 5 {                   // '.'
+        cell = tape[ptr];
+        putchar(cell);
+        pc = pc + 1;
+    } else { if op == 6 {                   // ','
+        getchar(tape[ptr]);
+        pc = pc + 1;
+    } else { if op == 7 {                   // '['
+        cell = tape[ptr];
+        if cell == 0 {
+            pc = jmp[pc] + 1;
+        } else {
+            pc = pc + 1;
+        }
+    } else { if op == 8 {                   // ']'
+        cell = tape[ptr];
+        if cell != 0 {
+            pc = jmp[pc] + 1;
+        } else {
+            pc = pc + 1;
+        }
+    } else {
+        // op == 0 (sentinel past prog_len) — halt.
+        running = 0;
+    } } } } } } } }
+}

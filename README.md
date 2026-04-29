@@ -157,6 +157,12 @@ bfsc tests/utils/linear_eq.bfs | AmazingBF - -q
 
 Fixture files for `bfsc` live in `tests/utils/` as `.bfs` / `.in` / `.out` triplets.
 
+A larger demonstration of `bfsc` lives at [`examples/bf_self_host.bfs`](examples/bf_self_host.bfs):
+a Brainfuck interpreter implemented in BFS, so AmazingBF can run BF
+programs through a BF interpreter that AmazingBF compiled from BFS. See
+[`docs/SELF_HOST.md`](docs/SELF_HOST.md) for the design notes and
+performance numbers.
+
 ---
 
 ### Optimization Levels

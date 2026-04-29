@@ -156,6 +156,11 @@ bfsc tests/utils/linear_eq.bfs | AmazingBF - -q
 
 `bfsc` 的测试固件以 `.bfs` / `.in` / `.out` 三件套形式存放在 `tests/utils/`。
 
+更进一步的 `bfsc` 演示见 [`examples/bf_self_host.bfs`](../examples/bf_self_host.bfs)：
+用 BFS 实现的 Brainfuck 解释器，再由 AmazingBF 把它从 BFS 编译成 BF
+跑起来，得到一个 BF 自举的解释器。设计与性能数据见
+[`docs/SELF_HOST.md`](./SELF_HOST.md)。
+
 ---
 
 ### 优化级别
