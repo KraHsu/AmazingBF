@@ -1,0 +1,26 @@
+// Exercises the multi-group outer-walk dispatch in
+// `bfsc::codegen::arr_{read,write}_outer_walk`. A 65792-element u8 array
+// (`num_chunks = 257`, `num_groups = 2`) crosses the single-byte macro
+// counter limit; codegen has to fan out into one outer-walk arm per
+// 256-chunk group via `cmp_eq` on the `idx[2]` group-id byte.
+//
+// Indices touch every region: low chunk in group 0, last chunk in group
+// 0, first chunk in group 1, last cell of the array.
+let big: [u8; 65792];
+let i: u32;
+
+i = 0;       big[i] = 11;
+i = 257;     big[i] = 22;
+i = 65535;   big[i] = 33;   // last cell of group 0
+i = 65536;   big[i] = 44;   // first cell of group 1
+i = 65700;   big[i] = 55;
+i = 65791;   big[i] = 66;   // last cell of array
+
+let v: u8;
+i = 0;       v = big[i];   print(v);
+i = 257;     v = big[i];   print(v);
+i = 65535;   v = big[i];   print(v);
+i = 65536;   v = big[i];   print(v);
+i = 65700;   v = big[i];   print(v);
+i = 65791;   v = big[i];   print(v);
+putchar(10);

@@ -1252,36 +1252,69 @@ impl<'a> BfEmitter<'a> {
         debug_assert_eq!(layout.elem_width(), 1, "walk storage is u8-only");
         debug_assert_eq!(chunk_size, 256, "walk chunk_size must be 256 for u8 counter");
         debug_assert!(num_chunks > 1);
-        assert!(
-            num_chunks <= 256,
-            "outer walk supports up to 256 chunks (got {num_chunks}); larger \
-             arrays need a multi-byte chunk-id counter that isn't implemented yet"
-        );
 
         let result = self.talloc();
         self.clear(result);
 
-        // idx layout: byte 0 = local_off, byte 1 = chunk_id.
-        let idx = self.eval_expr_w(idx_expr, 2);
+        // Group dispatch: the macro counter is u8 so each outer walk
+        // covers at most 256 chunks. For larger arrays we cmp_eq on the
+        // group-id byte (idx[2]) and fan out into one outer-walk arm
+        // per group; each arm is at most 256 chunks wide.
+        const GROUP_SIZE: usize = 256;
+        let chunk_total = 4 * chunk_size + 5;
+        let group_total = GROUP_SIZE * chunk_total;
+        let num_groups = num_chunks.div_ceil(GROUP_SIZE);
+        assert!(
+            num_groups <= 256,
+            "walk arrays beyond {} elements not supported (got num_chunks = {num_chunks})",
+            GROUP_SIZE * GROUP_SIZE * chunk_size
+        );
+
+        let idx_w = if num_groups == 1 { 2 } else { 3 };
+        let idx = self.eval_expr_w(idx_expr, idx_w);
 
         let base = layout.base;
-        self.seed_outer_prefix(base, idx, /*val=*/ None, chunk_size);
-        self.tfree_n(idx, 2);
 
-        self.goto(base);
-        self.emit_outer_walk_read_body(chunk_size);
-        // Body ends with the cursor relative-positioned at chunk_0.P_a
-        // dynamically; the static cursor never moved during the walk.
-        self.ptr = base;
+        if num_groups == 1 {
+            self.seed_outer_prefix(base, idx, /*val=*/ None, chunk_size);
+            self.tfree_n(idx, 2);
+            self.goto(base);
+            self.emit_outer_walk_read_body(chunk_size);
+            self.ptr = base;
+            self.extract_outer_walk_result(base, result);
+        } else {
+            // Multi-group cmp_eq dispatch. idx[0] = local_off, idx[1] =
+            // chunk_in_group, idx[2] = group_id.
+            for g in 0..num_groups {
+                let group_base = base + g * group_total;
 
-        // chunk_0.P_b leftover = chunk_id; chunk_0.P_c = read value.
-        self.clear(base + 1);
-        self.goto(base + 2);
-        self.raw("[-");
-        self.goto(result);
-        self.raw("+");
-        self.goto(base + 2);
-        self.raw("]");
+                let cid_copy = self.talloc();
+                self.copy(idx + 2, cid_copy);
+                let const_g = self.talloc();
+                self.setv(const_g, g as u8);
+                let eq = self.cmp_eq(cid_copy, const_g);
+
+                self.goto(eq);
+                self.raw("[");
+                // Fresh 2-byte idx (local_off, chunk_in_group) for the
+                // group's outer walk; the original 3-byte idx is left
+                // untouched so the next arm can reuse it.
+                let idx_arm = self.talloc_n(2);
+                self.copy(idx, idx_arm);
+                self.copy(idx + 1, idx_arm + 1);
+                self.seed_outer_prefix(group_base, idx_arm, None, chunk_size);
+                self.tfree_n(idx_arm, 2);
+                self.goto(group_base);
+                self.emit_outer_walk_read_body(chunk_size);
+                self.ptr = group_base;
+                self.extract_outer_walk_result(group_base, result);
+                self.clear(eq);
+                self.goto(eq);
+                self.raw("]");
+                self.tfree(eq);
+            }
+            self.tfree_n(idx, 3);
+        }
 
         (result, 1)
     }
@@ -1297,36 +1330,92 @@ impl<'a> BfEmitter<'a> {
         debug_assert_eq!(layout.elem_width(), 1, "walk storage is u8-only");
         debug_assert_eq!(chunk_size, 256);
         debug_assert!(num_chunks > 1);
+
+        const GROUP_SIZE: usize = 256;
+        let chunk_total = 4 * chunk_size + 5;
+        let group_total = GROUP_SIZE * chunk_total;
+        let num_groups = num_chunks.div_ceil(GROUP_SIZE);
         assert!(
-            num_chunks <= 256,
-            "outer walk supports up to 256 chunks (got {num_chunks}); larger \
-             arrays need a multi-byte chunk-id counter that isn't implemented yet"
+            num_groups <= 256,
+            "walk arrays beyond {} elements not supported (got num_chunks = {num_chunks})",
+            GROUP_SIZE * GROUP_SIZE * chunk_size
         );
 
-        let idx = self.eval_expr_w(idx_expr, 2);
+        let idx_w = if num_groups == 1 { 2 } else { 3 };
+        let idx = self.eval_expr_w(idx_expr, idx_w);
         let base = layout.base;
-        self.seed_outer_prefix(base, idx, Some(val), chunk_size);
-        self.tfree_n(idx, 2);
-        self.tfree(val);
 
-        self.goto(base);
-        self.emit_outer_walk_write_body(chunk_size);
-        self.ptr = base;
+        if num_groups == 1 {
+            self.seed_outer_prefix(base, idx, Some(val), chunk_size);
+            self.tfree_n(idx, 2);
+            self.tfree(val);
+            self.goto(base);
+            self.emit_outer_walk_write_body(chunk_size);
+            self.ptr = base;
+            self.clear(base + 1);
+        } else {
+            for g in 0..num_groups {
+                let group_base = base + g * group_total;
 
-        // chunk_0.P_b leftover = chunk_id; clear it.
+                let cid_copy = self.talloc();
+                self.copy(idx + 2, cid_copy);
+                let const_g = self.talloc();
+                self.setv(const_g, g as u8);
+                let eq = self.cmp_eq(cid_copy, const_g);
+
+                self.goto(eq);
+                self.raw("[");
+                let idx_arm = self.talloc_n(2);
+                self.copy(idx, idx_arm);
+                self.copy(idx + 1, idx_arm + 1);
+                let val_arm = self.talloc();
+                self.copy(val, val_arm);
+                self.seed_outer_prefix(group_base, idx_arm, Some(val_arm), chunk_size);
+                self.tfree_n(idx_arm, 2);
+                self.tfree(val_arm);
+                self.goto(group_base);
+                self.emit_outer_walk_write_body(chunk_size);
+                self.ptr = group_base;
+                self.clear(group_base + 1);
+                self.clear(eq);
+                self.goto(eq);
+                self.raw("]");
+                self.tfree(eq);
+            }
+            self.tfree_n(idx, 3);
+            self.tfree(val);
+        }
+    }
+
+    // Final step of the read outer walk: the body left chunk_0.P_b with
+    // a leftover chunk-id and chunk_0.P_c with the read value. Clear
+    // P_b and move P_c into the caller's result cell.
+    fn extract_outer_walk_result(&mut self, base: usize, result: usize) {
         self.clear(base + 1);
+        self.goto(base + 2);
+        self.raw("[-");
+        self.goto(result);
+        self.raw("+");
+        self.goto(base + 2);
+        self.raw("]");
     }
 
     // Move the index components (and optional `val`) into chunk_0's
-    // prefix cells, defensively clearing destinations first. Layout:
+    // prefix cells. Layout:
     //   P_a (counter)   = chunk_id  (idx byte 1)
     //   P_b (survivor)  = chunk_id
     //   P_c (payload 1) = local_off (idx byte 0)
     //   P_d (payload 2) = val       (write paths only; offset 4N+4)
     //
-    // `idx` is consumed in-place but the caller still owns the temp
-    // (the `tfree_n` and `tfree(val)` happen at the call site after
-    // this returns).
+    // The transfers are fused into a minimal sequence so each named
+    // source pays only one round-trip of large `goto`s. We rely on
+    // every previous walk having restored P_a, P_b, P_c, E, P_d to 0
+    // (which they do by design); the array is also zero-initialised by
+    // layout, so defensive clears are skipped.
+    //
+    // `idx` is consumed in-place but the caller still owns the temp;
+    // `tfree_n(idx, ...)` / `tfree(val)` happen at the call site after
+    // this returns.
     fn seed_outer_prefix(
         &mut self,
         base: usize,
@@ -1335,31 +1424,22 @@ impl<'a> BfEmitter<'a> {
         chunk_size: usize,
     ) {
         let chunk_total = 4 * chunk_size + 5;
-        // Need a duplicate of chunk_id so we can fill both P_a and P_b
-        // without re-reading idx (which is consumed by the moves).
-        let cid_dup = self.talloc();
-        self.copy(idx + 1, cid_dup);
 
-        self.clear(base);
-        self.clear(base + 1);
-        self.clear(base + 2);
-
-        // chunk_id (idx byte 1) → P_a.
+        // Fuse "chunk_id → P_a" and "chunk_id → P_b" into a single
+        // loop. Source: idx + 1 (chunk_id byte). Destinations: P_a
+        // (offset 0) and P_b (offset 1). Per outer iteration we step
+        // from idx+1 to base, increment P_a, advance one cell to P_b
+        // and increment, return to P_a so the cursor matches
+        // `self.ptr`, then jump back to idx+1 — two large gotos per
+        // iteration plus a one-time entry/exit.
         self.goto(idx + 1);
         self.raw("[-");
         self.goto(base);
-        self.raw("+");
+        self.raw("+>+<");
         self.goto(idx + 1);
         self.raw("]");
-        // duplicate → P_b.
-        self.goto(cid_dup);
-        self.raw("[-");
-        self.goto(base + 1);
-        self.raw("+");
-        self.goto(cid_dup);
-        self.raw("]");
-        self.tfree(cid_dup);
-        // local_off (idx byte 0) → P_c.
+
+        // local_off → P_c. Cursor still at idx+1 after the loop above.
         self.goto(idx);
         self.raw("[-");
         self.goto(base + 2);
@@ -1368,23 +1448,14 @@ impl<'a> BfEmitter<'a> {
         self.raw("]");
 
         if let Some(v) = val {
-            // val → P_d at offset chunk_total - 1.
+            // val → P_d (offset chunk_total - 1).
             let p_d = base + chunk_total - 1;
-            self.clear(p_d);
             self.goto(v);
             self.raw("[-");
             self.goto(p_d);
             self.raw("+");
             self.goto(v);
             self.raw("]");
-            // Also clear E (offset chunk_total - 2) defensively.
-            self.clear(base + chunk_total - 2);
-        } else {
-            // Read paths still need E and P_d zeroed (they're outside
-            // the inner walk's reach but feed into the outer walk's
-            // save/restore sequence).
-            self.clear(base + chunk_total - 2);
-            self.clear(base + chunk_total - 1);
         }
     }
 
@@ -1539,21 +1610,6 @@ impl<'a> BfEmitter<'a> {
         self.raw(&lt_s);
         self.raw("]");
         // Cursor: chunk_0.P_a. chunk_0.P_b=chunk_id leftover.
-    }
-}
-
-/// Bytes of `idx` reserved for the chunk-id high bytes. `num_chunks == 1`
-/// collapses to no chunk id at all (the access skips the dispatch).
-fn chunks_id_width(num_chunks: usize) -> usize {
-    if num_chunks <= 1 {
-        0
-    } else if num_chunks <= 256 {
-        1
-    } else if num_chunks <= 65536 {
-        2
-    } else {
-        // 3-byte chunk id is plenty in practice (16M chunks * 256 elems ≈ 4G).
-        3
     }
 }
 

@@ -16,35 +16,44 @@
 //                consume cnt[pc]; Zero/ScanLeft/ScanRight short-circuit
 //                common idioms instead of looping through dispatch.
 //
-// Buffers — sized to keep `bfsc`'s cheap 1-byte indexing path active for
-// every array (`arr_len ≤ 256`). The historical 255-BF-instruction cap
-// stays *as a literal-character count*, but RLE+pattern fold typically
-// gives 2-5× compression so the effective program capacity rises to ~500-
-// 1200 BF chars depending on the input. Layout order (bstk first, tape
-// last) puts the hot arrays nearest the temp pool so emitted gotos stay
-// short.
-//   bstk: [u8;  64]   — bracket stack used during Phase 2
-//   jmp:  [u8; 256]   — bracket targets
-//   prog: [u8; 256]   — opcode stream (0 sentinel past prog_len)
-//   cnt:  [u8; 256]   — RLE counts paralleling prog
-//   tape: [u8; 256]   — simulated BF tape
+// Buffers. Above 256 elements `bfsc` switches each u8 array to its
+// chunked moving-pointer ("walk") storage; for `num_chunks > 1` the
+// access goes through `arr_{read,write}_outer_walk`, and for
+// `num_chunks > 256` (i.e. arrays beyond ~65K elements) codegen fans
+// out into one outer-walk arm per 256-chunk group via `cmp_eq` on the
+// idx group-id byte. The current 1024-element sizing exercises the
+// single-group multi-chunk path (4 chunks each) cheaply; bumping any
+// of `prog`/`cnt`/`jmp` past 65K trips the multi-group path, which is
+// implemented in codegen but emits BF output that grows roughly
+// quadratically in `num_chunks * arr_len` — fine for compilation,
+// expensive to interpret end-to-end, so the test budget intentionally
+// stays well under the post-fold counts of fixtures 6.bf / 7.bf.
+//
+// Layout order: `bstk` and the small scalars first (linear / cheap),
+// `tape` last (touched on every program op so we want it nearest the
+// temp pool). The walk-storage arrays sit in the middle.
+//   bstk: [u8;   64]   — bracket stack used during Phase 2
+//   jmp:  [u8; 1024]   — bracket targets, indexed by post-fold pc
+//   prog: [u8; 1024]   — opcode stream (0 sentinel past prog_len)
+//   cnt:  [u8; 1024]   — RLE counts paralleling prog
+//   tape: [u8; 1024]   — simulated BF tape
 
-let bstk: [u8;  64];
-let jmp:  [u8; 256];
-let prog: [u8; 256];
-let cnt:  [u8; 256];
-let tape: [u8; 256];
+let bstk: [u8;    64];
+let jmp:  [u8;  1024];
+let prog: [u8;  1024];
+let cnt:  [u8;  1024];
+let tape: [u8;  1024];
 
-let prog_len: u8 = 0;
-let pc:       u8 = 0;
-let ptr:      u8 = 0;
-let bsp:      u8 = 0;
-let i:        u8 = 0;
-let r:        u8 = 0;
-let w:        u8 = 0;
-let lbra:     u8 = 0;
-let lpc:      u8 = 0;
-let new_pc:   u8 = 0;
+let prog_len: u32 = 0;
+let pc:       u32 = 0;
+let ptr:      u32 = 0;
+let bsp:      u8  = 0;
+let i:        u32 = 0;
+let r:        u32 = 0;
+let w:        u32 = 0;
+let lbra:     u32 = 0;
+let lpc:      u32 = 0;
+let new_pc:   u32 = 0;
 
 let ch:     u8 = 0;
 let ckind:  u8 = 0;
@@ -106,7 +115,7 @@ while reading {
             }
         }
         if merged == 0 {
-            if prog_len < 255 {
+            if prog_len < 1024 {
                 prog[prog_len] = ckind;
                 cnt[prog_len] = 1;
                 prog_len = prog_len + 1;
