@@ -837,43 +837,80 @@ impl<'a> BfEmitter<'a> {
         let base = layout.base;
         let arr_len = layout.array_len();
         let ew = layout.elem_width();
-        let idx = self.eval_expr_1(idx_expr);
+        // Index width: 1 byte for arrays ≤256 (back-compat, byte-identical BF),
+        // 2 bytes when arr_len exceeds u8 range.
+        let iw = if arr_len > 256 { 2 } else { 1 };
         let result = self.talloc_n(ew);
         for k in 0..ew {
             self.clear(result + k);
         }
-        for i in 0..arr_len {
-            let ti = self.talloc();
-            self.copy(idx, ti);
-            if i > 0 {
-                self.dec(ti, i);
+        if iw == 1 {
+            // Legacy 1-byte path. Re-copies idx and decrements by `i` each
+            // iteration (O(arr_len^2) emitted BF chars, fine for ≤256).
+            let idx = self.eval_expr_1(idx_expr);
+            for i in 0..arr_len {
+                let ti = self.talloc();
+                self.copy(idx, ti);
+                if i > 0 {
+                    self.dec(ti, i);
+                }
+                let eq = self.talloc();
+                self.setv(eq, 1);
+                let tc = self.talloc();
+                self.copy(ti, tc);
+                self.goto(tc);
+                self.raw("[");
+                self.clear(eq);
+                self.clear(tc);
+                self.goto(tc);
+                self.raw("]");
+                self.tfree(tc);
+                let base_i = base + i * ew;
+                let r = result;
+                let ew2 = ew;
+                self.goto(eq);
+                self.raw("[");
+                for off in 0..ew2 {
+                    self.copy(base_i + off, r + off);
+                }
+                self.clear(eq);
+                self.goto(eq);
+                self.raw("]");
+                self.tfree(eq);
+                self.tfree(ti);
             }
-            let eq = self.talloc();
-            self.setv(eq, 1);
-            let tc = self.talloc();
-            self.copy(ti, tc);
-            self.goto(tc);
-            self.raw("[");
-            self.clear(eq);
-            self.clear(tc);
-            self.goto(tc);
-            self.raw("]");
-            self.tfree(tc);
-            let base_i = base + i * ew;
-            let r = result;
-            let ew2 = ew;
-            self.goto(eq);
-            self.raw("[");
-            for off in 0..ew2 {
-                self.copy(base_i + off, r + off);
+            self.tfree(idx);
+        } else {
+            // 2-byte path. Hoist `ti` and decrement by 1 per iteration so the
+            // emitted BF stays linear in arr_len rather than quadratic.
+            let idx = self.eval_expr_w(idx_expr, iw);
+            let ti = self.talloc_n(iw);
+            self.copy_n(idx, ti, iw);
+            for i in 0..arr_len {
+                if i > 0 {
+                    self.dec_n(ti, iw);
+                }
+                let nz = self.is_nz_n(ti, iw);
+                let eq = self.negate(nz);
+                let base_i = base + i * ew;
+                self.goto(eq);
+                self.raw("[");
+                for off in 0..ew {
+                    self.copy(base_i + off, result + off);
+                }
+                self.clear(eq);
+                self.goto(eq);
+                self.raw("]");
+                self.tfree(eq);
             }
-            self.clear(eq);
-            self.goto(eq);
-            self.raw("]");
-            self.tfree(eq);
-            self.tfree(ti);
+            // ti was decremented to (idx - (arr_len-1)); is_nz_n / negate left
+            // it intact. Clear it before freeing.
+            for k in 0..iw {
+                self.clear(ti + k);
+            }
+            self.tfree_n(ti, iw);
+            self.tfree_n(idx, iw);
         }
-        self.tfree(idx);
         (result, ew)
     }
 
@@ -893,40 +930,71 @@ impl<'a> BfEmitter<'a> {
         } else {
             val
         };
-        let idx = self.eval_expr_1(idx_expr);
-        for i in 0..arr_len {
-            let ti = self.talloc();
-            self.copy(idx, ti);
-            if i > 0 {
-                self.dec(ti, i);
+        // Index width matches arr_read.
+        let iw = if arr_len > 256 { 2 } else { 1 };
+        if iw == 1 {
+            let idx = self.eval_expr_1(idx_expr);
+            for i in 0..arr_len {
+                let ti = self.talloc();
+                self.copy(idx, ti);
+                if i > 0 {
+                    self.dec(ti, i);
+                }
+                let eq = self.talloc();
+                self.setv(eq, 1);
+                let tc = self.talloc();
+                self.copy(ti, tc);
+                self.goto(tc);
+                self.raw("[");
+                self.clear(eq);
+                self.clear(tc);
+                self.goto(tc);
+                self.raw("]");
+                self.tfree(tc);
+                let base_i = base + i * ew;
+                let v2 = val;
+                let ew2 = ew;
+                self.goto(eq);
+                self.raw("[");
+                for off in 0..ew2 {
+                    self.clear(base_i + off);
+                    self.copy(v2 + off, base_i + off);
+                }
+                self.clear(eq);
+                self.goto(eq);
+                self.raw("]");
+                self.tfree(eq);
+                self.tfree(ti);
             }
-            let eq = self.talloc();
-            self.setv(eq, 1);
-            let tc = self.talloc();
-            self.copy(ti, tc);
-            self.goto(tc);
-            self.raw("[");
-            self.clear(eq);
-            self.clear(tc);
-            self.goto(tc);
-            self.raw("]");
-            self.tfree(tc);
-            let base_i = base + i * ew;
-            let v2 = val;
-            let ew2 = ew;
-            self.goto(eq);
-            self.raw("[");
-            for off in 0..ew2 {
-                self.clear(base_i + off);
-                self.copy(v2 + off, base_i + off);
+            self.tfree(idx);
+        } else {
+            let idx = self.eval_expr_w(idx_expr, iw);
+            let ti = self.talloc_n(iw);
+            self.copy_n(idx, ti, iw);
+            for i in 0..arr_len {
+                if i > 0 {
+                    self.dec_n(ti, iw);
+                }
+                let nz = self.is_nz_n(ti, iw);
+                let eq = self.negate(nz);
+                let base_i = base + i * ew;
+                self.goto(eq);
+                self.raw("[");
+                for off in 0..ew {
+                    self.clear(base_i + off);
+                    self.copy(val + off, base_i + off);
+                }
+                self.clear(eq);
+                self.goto(eq);
+                self.raw("]");
+                self.tfree(eq);
             }
-            self.clear(eq);
-            self.goto(eq);
-            self.raw("]");
-            self.tfree(eq);
-            self.tfree(ti);
+            for k in 0..iw {
+                self.clear(ti + k);
+            }
+            self.tfree_n(ti, iw);
+            self.tfree_n(idx, iw);
         }
-        self.tfree(idx);
         self.tfree_n(val, ew);
     }
 
@@ -1356,6 +1424,28 @@ impl<'a> BfEmitter<'a> {
                 (r, 1)
             }
         }
+    }
+
+    // Evaluate expression and produce a result of exactly `w` bytes by widening
+    // (zero-extension) or truncation (low `w` bytes copied, high bytes
+    // discarded). Caller frees with `tfree_n(result, w)`. Used by `arr_read` /
+    // `arr_write` when the array index needs ≥2-byte resolution.
+    fn eval_expr_w(&mut self, expr: &Expr, w: usize) -> usize {
+        let (base, ew) = self.eval_expr(expr);
+        if ew == w {
+            return base;
+        }
+        if ew < w {
+            return self.widen(base, ew, w);
+        }
+        // ew > w: truncate to low `w` bytes.
+        let lo = self.talloc_n(w);
+        self.bfmove_n(base, lo, w);
+        for i in w..ew {
+            self.clear(base + i);
+        }
+        self.tfree_n(base, ew);
+        lo
     }
 
     // Convenience: evaluate expecting single byte (for array indices, conditions)

@@ -1,0 +1,18 @@
+// Locks the 2-byte array-indexing path in `bfsc::codegen::arr_read` /
+// `arr_write` (active when `arr_len > 256`). Writes and reads at indices
+// 300 and 400 of a 512-cell u8 array, including via a u16 variable, and
+// prints the round-tripped values. (`print` auto-emits a trailing space.)
+let big: [u8; 512];
+big[300] = 7;
+big[400] = 11;
+let i: u16 = 256;
+big[i] = 99;
+
+let v: u8;
+v = big[300];
+print(v);
+v = big[400];
+print(v);
+v = big[i];
+print(v);
+putchar(10);

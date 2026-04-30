@@ -5,9 +5,11 @@
 //! interpreter (running under `AmazingBF`) and checks the output against
 //! the matching `.out`.
 //!
-//! Cases are gated on program length ≤ 255 — the interpreter's encoded
-//! program buffer is sized for `bfsc`'s u8-indexed arrays. Anything bigger
-//! lives outside the supported envelope and is skipped here, not failed.
+//! The interpreter's `prog`/`cnt` buffers hold up to 255 *post-fold* opcodes
+//! (RLE for `+/-/<>`, plus `[-]`/`[<]`/`[>]` patterns collapsed to a single
+//! op). `effective_op_count` mirrors that pipeline well enough to gate
+//! candidates: anything that would overflow is skipped, not failed, so the
+//! suite stays green as the budget grows.
 
 use assert_cmd::cargo::CommandCargoExt;
 use std::fs;
@@ -21,7 +23,7 @@ mod common;
 const CASES_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/cases");
 const BFS_SRC: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/bf_self_host.bfs");
 
-const PROG_BUDGET: usize = 255;
+const PROG_BUDGET: usize = 254;
 
 fn compile_self_host_to_bf() -> PathBuf {
     let mut compile_cmd = Command::cargo_bin("bfsc").unwrap();
@@ -44,6 +46,45 @@ fn filter_bf(prog: &[u8]) -> Vec<u8> {
         .collect()
 }
 
+/// Mirrors `bf_self_host.bfs` Phase 1a + 1b: RLE-fuse `+/-/<>` runs and
+/// fold `[ X ]` (X ∈ Add/Sub/Right/Left, single step) into one super-op.
+/// Returned count is the prog/cnt occupancy that the interpreter would
+/// see after load, so the test gate matches the on-tape budget.
+fn effective_op_count(filtered: &[u8]) -> usize {
+    let mut rle: Vec<(u8, u32)> = Vec::with_capacity(filtered.len());
+    for &c in filtered {
+        let last = rle.last_mut();
+        match (c, last) {
+            (b'+', Some((b'+', n)))
+            | (b'-', Some((b'-', n)))
+            | (b'<', Some((b'<', n)))
+            | (b'>', Some((b'>', n)))
+                if *n < 255 =>
+            {
+                *n += 1;
+            }
+            _ => rle.push((c, 1)),
+        }
+    }
+    let mut out = 0usize;
+    let mut j = 0;
+    while j < rle.len() {
+        if j + 2 < rle.len()
+            && rle[j].0 == b'['
+            && rle[j + 2].0 == b']'
+            && rle[j + 1].1 == 1
+            && matches!(rle[j + 1].0, b'+' | b'-' | b'<' | b'>')
+        {
+            out += 1;
+            j += 3;
+        } else {
+            out += 1;
+            j += 1;
+        }
+    }
+    out
+}
+
 #[test]
 fn self_host_runs_small_fixtures() {
     let bfi_path = compile_self_host_to_bf();
@@ -62,8 +103,8 @@ fn self_host_runs_small_fixtures() {
         let stem = case.file_stem().unwrap().to_string_lossy().into_owned();
         let prog_raw = fs::read(case).expect("read .bf fixture");
         let prog = filter_bf(&prog_raw);
-        if prog.len() > PROG_BUDGET {
-            continue; // outside the self-host envelope
+        if effective_op_count(&prog) > PROG_BUDGET {
+            continue; // outside the self-host envelope (post-fold)
         }
         let in_path = case.with_extension("in");
         let out_path = case.with_extension("out");

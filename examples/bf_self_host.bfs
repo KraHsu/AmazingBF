@@ -1,94 +1,190 @@
 // BF self-hosting interpreter, written in BFS.
 //
 // Reads a Brainfuck program from stdin, terminated by `!` (or EOF), then
-// interprets it on a 256-cell tape. Bytes after `!` feed the program's `,`.
+// interprets it on a simulated tape. Bytes after `!` feed the program's `,`.
 //
-// Encoding: BF instructions are remapped to a compact alphabet (1..8) at
-// load time so the inner dispatch chain only needs cheap small-constant
-// equality checks. Bracket targets are pre-computed once into a jump
-// table so [/] is O(1) per execution rather than O(prog_len) scan.
+// Pipeline (load-time):
+//   Phase 1a — read program, compactly encode to opcodes 1..8.
+//                Inline RLE: consecutive >, <, +, -  fold into (op, cnt)
+//                pairs (cnt up to 255). cnt[i] is unused for ops 5..8.
+//   Phase 1b — pattern fold: `[ Sub(1) ]` / `[ Add(1) ]` -> Zero (9),
+//                `[ Right(1) ]` -> ScanRight (11), `[ Left(1) ]` -> ScanLeft (10).
+//                Two-pointer in-place rewrite; `prog_len` shrinks accordingly.
+//   Phase 2  — single linear pass populates a bracket jump table so [/]
+//                resolve in O(1) at execute time.
+//   Phase 3  — most-frequent-first dispatch cascade. Add/Sub/Right/Left
+//                consume cnt[pc]; Zero/ScanLeft/ScanRight short-circuit
+//                common idioms instead of looping through dispatch.
 //
-// Limits (tied to bfsc's u8 array indexing):
-//   - up to 255 BF instructions in the program
-//   - up to 256 simulated tape cells
-//   - bracket nesting depth up to 32
+// Buffers — sized to keep `bfsc`'s cheap 1-byte indexing path active for
+// every array (`arr_len ≤ 256`). The historical 255-BF-instruction cap
+// stays *as a literal-character count*, but RLE+pattern fold typically
+// gives 2-5× compression so the effective program capacity rises to ~500-
+// 1200 BF chars depending on the input. Layout order (bstk first, tape
+// last) puts the hot arrays nearest the temp pool so emitted gotos stay
+// short.
+//   bstk: [u8;  64]   — bracket stack used during Phase 2
+//   jmp:  [u8; 256]   — bracket targets
+//   prog: [u8; 256]   — opcode stream (0 sentinel past prog_len)
+//   cnt:  [u8; 256]   — RLE counts paralleling prog
+//   tape: [u8; 256]   — simulated BF tape
 
-let prog: [u8; 256];        // encoded opcodes (0 = halt sentinel)
-let jmp:  [u8; 256];        // bracket jump table (matching index)
-let bstk: [u8; 32];         // bracket stack used during pre-pass
-let tape: [u8; 256];        // simulated BF tape
+let bstk: [u8;  64];
+let jmp:  [u8; 256];
+let prog: [u8; 256];
+let cnt:  [u8; 256];
+let tape: [u8; 256];
 
 let prog_len: u8 = 0;
-let pc:  u8 = 0;
-let ptr: u8 = 0;
-let bsp: u8 = 0;
+let pc:       u8 = 0;
+let ptr:      u8 = 0;
+let bsp:      u8 = 0;
+let i:        u8 = 0;
+let r:        u8 = 0;
+let w:        u8 = 0;
+let lbra:     u8 = 0;
+let lpc:      u8 = 0;
+let new_pc:   u8 = 0;
 
-let ch:   u8 = 0;
-let op:   u8 = 0;
-let cell: u8 = 0;
-let lbra: u8 = 0;
-let i:    u8 = 0;
+let ch:     u8 = 0;
+let ckind:  u8 = 0;
+let op:     u8 = 0;
+let cell:   u8 = 0;
+let lop:    u8 = 0;
+let lcnt:   u8 = 0;
+let merged: u8 = 0;
+let nstep:  u8 = 0;
+let acc:    u8 = 0;
 
 let reading: u8 = 1;
 let running: u8 = 1;
 
 // -----------------------------------------------------------------------
-// Phase 1: read program from stdin until `!` (33) or EOF (255).
-// Map BF chars onto a compact 1..8 alphabet.
+// Phase 1a: read program from stdin until `!` (33) or EOF (255).
+// Map BF chars onto the compact 1..8 alphabet AND fold consecutive
+// >, <, +, - into (op, cnt) pairs.
 // -----------------------------------------------------------------------
 while reading {
     getchar(ch);
+    ckind = 0;
     if ch == 255 {
         reading = 0;
-    } else {
-        if ch == 33 {           // '!' separates program from runtime input
-            reading = 0;
-        } else {
-            // Only accept the eight legal BF characters; everything else is
-            // silently skipped.  Most-frequent ops get the lowest opcode so
-            // the dispatch chain hits common cases earliest.
+    } else { if ch == 33 {
+        reading = 0;
+    } else { if ch == 62 {
+        ckind = 1;
+    } else { if ch == 60 {
+        ckind = 2;
+    } else { if ch == 43 {
+        ckind = 3;
+    } else { if ch == 45 {
+        ckind = 4;
+    } else { if ch == 46 {
+        ckind = 5;
+    } else { if ch == 44 {
+        ckind = 6;
+    } else { if ch == 91 {
+        ckind = 7;
+    } else { if ch == 93 {
+        ckind = 8;
+    } } } } } } } } } }
+
+    if ckind {
+        merged = 0;
+        // RLE only applies to Right/Left/Add/Sub (ckind in 1..4).
+        if ckind < 5 {
+            if prog_len {
+                lpc = prog_len - 1;
+                lop = prog[lpc];
+                if lop == ckind {
+                    lcnt = cnt[lpc];
+                    if lcnt < 255 {
+                        cnt[lpc] = lcnt + 1;
+                        merged = 1;
+                    }
+                }
+            }
+        }
+        if merged == 0 {
             if prog_len < 255 {
-                if ch == 62 {                // '>'
-                    prog[prog_len] = 1;
-                    prog_len = prog_len + 1;
-                } else { if ch == 60 {        // '<'
-                    prog[prog_len] = 2;
-                    prog_len = prog_len + 1;
-                } else { if ch == 43 {        // '+'
-                    prog[prog_len] = 3;
-                    prog_len = prog_len + 1;
-                } else { if ch == 45 {        // '-'
-                    prog[prog_len] = 4;
-                    prog_len = prog_len + 1;
-                } else { if ch == 46 {        // '.'
-                    prog[prog_len] = 5;
-                    prog_len = prog_len + 1;
-                } else { if ch == 44 {        // ','
-                    prog[prog_len] = 6;
-                    prog_len = prog_len + 1;
-                } else { if ch == 91 {        // '['
-                    prog[prog_len] = 7;
-                    prog_len = prog_len + 1;
-                } else { if ch == 93 {        // ']'
-                    prog[prog_len] = 8;
-                    prog_len = prog_len + 1;
-                } } } } } } } }
+                prog[prog_len] = ckind;
+                cnt[prog_len] = 1;
+                prog_len = prog_len + 1;
             }
         }
     }
 }
 
 // -----------------------------------------------------------------------
+// Phase 1b: pattern fold.
+// Recognize the 3-element window `[ X ]` where X has cnt == 1 and X is
+// one of Add/Sub/Right/Left. Rewrites to a single super-opcode in place.
+//   [ Sub(1) ] / [ Add(1) ] -> Zero (9)
+//   [ Right(1) ]            -> ScanRight (11)
+//   [ Left(1) ]             -> ScanLeft  (10)
+// Two-pointer scan: r advances over the input, w writes the output.
+// -----------------------------------------------------------------------
+r = 0;
+w = 0;
+while r < prog_len {
+    op = prog[r];
+    merged = 0;
+    if op == 7 {
+        // Need at least r+2 < prog_len to look at X and `]`.
+        if r + 2 < prog_len {
+            new_pc = r + 1;
+            lop = prog[new_pc];   // X
+            // Only fold if X has cnt == 1 (so the loop body is exactly one
+            // primitive op, not a folded run).
+            if lop > 0 {
+                if lop < 5 {
+                    lcnt = cnt[new_pc];
+                    if lcnt == 1 {
+                        new_pc = r + 2;
+                        nstep = prog[new_pc];
+                        if nstep == 8 {
+                            // Determine the super-opcode.
+                            acc = 0;
+                            if lop == 3 { acc = 9; }
+                            if lop == 4 { acc = 9; }
+                            if lop == 1 { acc = 11; }
+                            if lop == 2 { acc = 10; }
+                            prog[w] = acc;
+                            cnt[w] = 0;
+                            w = w + 1;
+                            r = r + 3;
+                            merged = 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if merged == 0 {
+        prog[w] = op;
+        cnt[w] = cnt[r];
+        w = w + 1;
+        r = r + 1;
+    }
+}
+// Halt sentinel — Phase 1a may have written opcodes at positions [w, old_len)
+// that the fold pass collapsed; without an explicit 0 here the dispatch loop
+// would read stale opcodes after the live program.
+prog[w] = 0;
+prog_len = w;
+
+// -----------------------------------------------------------------------
 // Phase 2: pre-compute bracket pairs.
-// jmp[i_open] = i_close, jmp[i_close] = i_open.
+// Only `[` (7) and `]` (8) participate; Zero/ScanLeft/ScanRight don't.
+// Run AFTER Phase 1b so bracket targets reflect the post-fold indices.
 // -----------------------------------------------------------------------
 i = 0;
 while i < prog_len {
     op = prog[i];
-    if op == 7 {                            // '['
+    if op == 7 {
         bstk[bsp] = i;
         bsp = bsp + 1;
-    } else { if op == 8 {                   // ']'
+    } else { if op == 8 {
         bsp = bsp - 1;
         lbra = bstk[bsp];
         jmp[lbra] = i;
@@ -98,47 +194,64 @@ while i < prog_len {
 }
 
 // -----------------------------------------------------------------------
-// Phase 3: execute. Dispatch is a most-frequent-first if/else cascade.
-// `op == 0` falls through past prog_len and halts the loop.
+// Phase 3: execute. Most-frequent-first dispatch cascade.
+// `op == 0` (sentinel past prog_len) halts the loop.
 // -----------------------------------------------------------------------
 while running {
     op = prog[pc];
 
-    if op == 1 {                            // '>'
-        ptr = ptr + 1;
+    if op == 1 {                              // Right(n)
+        ptr = ptr + cnt[pc];
         pc = pc + 1;
-    } else { if op == 2 {                   // '<'
-        ptr = ptr - 1;
+    } else { if op == 2 {                     // Left(n)
+        ptr = ptr - cnt[pc];
         pc = pc + 1;
-    } else { if op == 3 {                   // '+'
-        tape[ptr] = tape[ptr] + 1;
+    } else { if op == 3 {                     // Add(n)
+        tape[ptr] = tape[ptr] + cnt[pc];
         pc = pc + 1;
-    } else { if op == 4 {                   // '-'
-        tape[ptr] = tape[ptr] - 1;
+    } else { if op == 4 {                     // Sub(n)
+        tape[ptr] = tape[ptr] - cnt[pc];
         pc = pc + 1;
-    } else { if op == 5 {                   // '.'
-        cell = tape[ptr];
-        putchar(cell);
+    } else { if op == 9 {                     // Zero
+        tape[ptr] = 0;
         pc = pc + 1;
-    } else { if op == 6 {                   // ','
-        getchar(tape[ptr]);
-        pc = pc + 1;
-    } else { if op == 7 {                   // '['
+    } else { if op == 7 {                     // [
         cell = tape[ptr];
         if cell == 0 {
             pc = jmp[pc] + 1;
         } else {
             pc = pc + 1;
         }
-    } else { if op == 8 {                   // ']'
+    } else { if op == 8 {                     // ]
         cell = tape[ptr];
         if cell != 0 {
             pc = jmp[pc] + 1;
         } else {
             pc = pc + 1;
         }
+    } else { if op == 5 {                     // .
+        cell = tape[ptr];
+        putchar(cell);
+        pc = pc + 1;
+    } else { if op == 6 {                     // ,
+        getchar(tape[ptr]);
+        pc = pc + 1;
+    } else { if op == 11 {                    // ScanRight
+        cell = tape[ptr];
+        while cell {
+            ptr = ptr + 1;
+            cell = tape[ptr];
+        }
+        pc = pc + 1;
+    } else { if op == 10 {                    // ScanLeft
+        cell = tape[ptr];
+        while cell {
+            ptr = ptr - 1;
+            cell = tape[ptr];
+        }
+        pc = pc + 1;
     } else {
-        // op == 0 (sentinel past prog_len) — halt.
+        // op == 0 sentinel -> halt.
         running = 0;
-    } } } } } } } }
+    } } } } } } } } } } }
 }
