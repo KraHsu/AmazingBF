@@ -21,10 +21,17 @@ pub(crate) enum ArrayLayout {
     Linear,
     /// Moving-pointer ("walk") storage. Each element occupies 4 cells
     /// (V, S_a control, S_b survivor, S_c value-carrier). `chunk_size`
-    /// elements live consecutively, then 3 prefix cells (P_a, P_b, P_c)
-    /// are inserted, then the next chunk starts. `num_chunks * (4 *
-    /// chunk_size + 3)` cells total. Only valid for `ty == U8` (the
-    /// walk idiom is single-byte counter-based).
+    /// elements live consecutively in `chunk_size` slots. The chunk's
+    /// envelope is:
+    ///   [P_a, P_b, P_c, V_0, S_0a, S_0b, S_0c, …, V_(N-1), S_(N-1)a,
+    ///    S_(N-1)b, S_(N-1)c, E, P_d]
+    /// `4*chunk_size + 5` cells. The 3 leading prefix cells are the
+    /// outer walk's macro counter / survivor / payload; the trailing E
+    /// (offset `4*N+3`) parks the chunk-id survivor across the inner
+    /// walk; and P_d (offset `4*N+4`) carries the write value alongside
+    /// the macro walk on write paths. Read paths leave P_d untouched.
+    /// Only valid for `ty == U8` (the walk idiom is single-byte
+    /// counter-based).
     Walk {
         chunk_size: usize,
         num_chunks: usize,
@@ -39,7 +46,7 @@ impl ArrayLayout {
             ArrayLayout::Walk {
                 chunk_size,
                 num_chunks,
-            } => num_chunks * (4 * chunk_size + 3),
+            } => num_chunks * (4 * chunk_size + 5),
         }
     }
 }

@@ -839,12 +839,19 @@ impl<'a> BfEmitter<'a> {
         // per access regardless of `arr_len`. The legacy linear-scan paths
         // below stay in place for ≤256-cell arrays — they're byte-identical
         // to the older emitter on existing fixtures.
+        //
+        // Single-chunk arrays go through the fast-path `arr_read_walk`;
+        // anything bigger uses the chunk-level outer walk so per-access
+        // emit stays constant in `num_chunks`.
         if let super::layout::ArrayLayout::Walk {
             chunk_size,
             num_chunks,
         } = layout.layout
         {
-            return self.arr_read_walk(layout, idx_expr, chunk_size, num_chunks);
+            if num_chunks == 1 {
+                return self.arr_read_walk(layout, idx_expr, chunk_size);
+            }
+            return self.arr_read_outer_walk(layout, idx_expr, chunk_size, num_chunks);
         }
         let base = layout.base;
         let arr_len = layout.array_len();
@@ -956,7 +963,11 @@ impl<'a> BfEmitter<'a> {
             } else {
                 val
             };
-            self.arr_write_walk(layout, idx_expr, v_byte, chunk_size, num_chunks);
+            if num_chunks == 1 {
+                self.arr_write_walk(layout, idx_expr, v_byte, chunk_size);
+            } else {
+                self.arr_write_outer_walk(layout, idx_expr, v_byte, chunk_size, num_chunks);
+            }
             return;
         }
         let base = layout.base;
@@ -1039,109 +1050,63 @@ impl<'a> BfEmitter<'a> {
     // Walk-based array access (moving-pointer idiom).
     //
     // Layout (per chunk, written `[..]` per cell):
-    //   [P_a, P_b, P_c, V_0, S_0a, S_0b, S_0c, V_1, S_1a, S_1b, S_1c, …]
-    // where each "slot" k after the 3-cell prefix is `(V_k, S_ka, S_kb, S_kc)`
-    // (4 cells). The walk transfers `idx` through the S_a control cells in
-    // strides of 4, dropping a survivor (S_b) and a value carrier (S_c) at
-    // the target slot. Forward + read step + backward walk run with O(1)
+    //   [P_a, P_b, P_c, V_0, S_0a, S_0b, S_0c, V_1, S_1a, S_1b, S_1c, …
+    //    V_(N-1), S_(N-1)a, S_(N-1)b, S_(N-1)c, E]
+    // where `N = chunk_size`, each "slot" k after the 3-cell prefix is
+    // `(V_k, S_ka, S_kb, S_kc)` (4 cells), and a trailing scratch cell E
+    // (offset `4*N+3`) is reserved for the outer walk to park its
+    // chunk-id survivor across the inner walk's body. The inner walk
+    // never touches E.
+    //
+    // The walk transfers `idx` through the S_a control cells in strides
+    // of 4, dropping a survivor (S_b) and a value carrier (S_c) at the
+    // target slot. Forward + read step + backward walk run with O(1)
     // emitted BF — the only thing that grows with `arr_len` is runtime
     // (each access takes O(idx) tape ops).
     //
     // For `arr_len > chunk_size` the array is broken into `num_chunks`
-    // independent chunks. Codegen emits a linear chunk-id dispatch (one
-    // arm per chunk); each arm contains the constant-size walk for its
-    // chunk's storage. So per-access emit is O(num_chunks), constant in
-    // the per-chunk size.
+    // independent chunks. The chunk-level dispatch lives in
+    // `arr_read_outer_walk` / `arr_write_outer_walk`: it walks chunks
+    // with the same moving-pointer idiom (3-cell prefix transfer at
+    // stride `chunk_total`), so per-access emit stays O(chunk_total)
+    // regardless of `num_chunks`.
     //
-    // Setup invariant: P_a, P_b, P_c are 0 between accesses (the walk
-    // always restores them). Codegen guarantees the array starts that way
-    // because typeck/layout never initialises walk storage.
-    //
-    // Cursor convention: this routine ends with `self.ptr` at the chunk's
-    // P_c (`chunk_base + 2`) of whichever arm fired. We resync to a known
-    // cell just before exiting so the conditional branches aren't visible
-    // to subsequent gotos.
+    // Setup invariant: P_a, P_b, P_c, E are 0 between accesses (every
+    // walk restores them). Layout zeroes the storage at allocation time
+    // and the BFS source never initialises walk-typed arrays directly.
+
+    /// Single-chunk fast path. Caller has already established `num_chunks
+    /// == 1`; this routine assumes the chunk lives at `layout.base` and
+    /// leaves `self.ptr` at `base + 2` (P_c, now zero).
     fn arr_read_walk(
         &mut self,
         layout: &super::layout::CellLayout,
         idx_expr: &Expr,
         chunk_size: usize,
-        num_chunks: usize,
     ) -> (usize, usize) {
         debug_assert_eq!(layout.elem_width(), 1, "walk storage is u8-only");
         debug_assert_eq!(chunk_size, 256, "walk chunk_size must be 256 for u8 counter");
-        let base = layout.base;
-        let chunk_total = 4 * chunk_size + 3;
 
-        // Result slot — we'll move the read value into here.
         let result = self.talloc();
         self.clear(result);
 
-        // Decide idx representation. Need at least 1 byte (local offset)
-        // plus enough bytes of chunk_id to reach `num_chunks - 1`.
-        // chunk_id width = 0 (single chunk), 1 (≤256 chunks), 2 (≤65536),
-        // or 3 (≤2^24 chunks). The walk only handles u8 chunk_id today;
-        // larger sources should split arrays at the BFS level.
-        let chunk_id_w = chunks_id_width(num_chunks);
-        let idx_w = 1 + chunk_id_w;
-        let idx = self.eval_expr_w(idx_expr, idx_w);
-
-        if num_chunks == 1 {
-            // Single-chunk fast path — no dispatch needed.
-            self.walk_read_chunk(base, idx, result);
-            // walk_read_chunk consumed `idx` (moved into the chunk's P_a)
-            // and freed it. Nothing else to clean up.
-            return (result, 1);
-        }
-
-        // Local offset (low byte) and chunk id (high bytes). Both are
-        // copies; the original `idx` survives so we can hand a fresh copy
-        // into whichever chunk's arm fires.
-        let local_off = self.talloc();
-        self.copy(idx, local_off);
-
-        let chunk_id = self.talloc_n(chunk_id_w);
-        for k in 0..chunk_id_w {
-            self.copy(idx + 1 + k, chunk_id + k);
-        }
-        self.tfree_n(idx, idx_w);
-
-        // Linear chunk dispatch. Each arm: cmp_eq_n, then conditional walk.
-        for chunk in 0..num_chunks {
-            let chunk_base = base + chunk * chunk_total;
-
-            // Compute eq = (chunk_id_copy == chunk_const)? cmp_eq_n
-            // consumes both arguments, so we copy chunk_id and recreate
-            // the constant on each arm.
-            let cid_copy = self.talloc_n(chunk_id_w);
-            for k in 0..chunk_id_w {
-                self.copy(chunk_id + k, cid_copy + k);
-            }
-            let cmp_const = self.talloc_n(chunk_id_w);
-            self.set_const_n(cmp_const, chunk as u32, chunk_id_w);
-            let eq = self.cmp_eq_n(cid_copy, cmp_const, chunk_id_w);
-
-            // if eq: do walk into this chunk's storage.
-            self.goto(eq);
-            self.raw("[");
-            // Fresh copy of local_off so the walk can consume it
-            // without disturbing other arms.
-            let lo_copy = self.talloc();
-            self.copy(local_off, lo_copy);
-            self.walk_read_chunk(chunk_base, lo_copy, result);
-            // walk_read_chunk left ptr at `chunk_base + 2`; route back to
-            // `eq` so the branch closes cleanly.
-            self.clear(eq);
-            self.goto(eq);
-            self.raw("]");
-            self.tfree(eq);
-        }
-
-        // Cleanup.
-        self.tfree(local_off);
-        self.tfree_n(chunk_id, chunk_id_w);
-
+        let idx = self.eval_expr_w(idx_expr, 1);
+        self.walk_read_chunk(layout.base, idx, result);
         (result, 1)
+    }
+
+    fn arr_write_walk(
+        &mut self,
+        layout: &super::layout::CellLayout,
+        idx_expr: &Expr,
+        val: usize,
+        chunk_size: usize,
+    ) {
+        debug_assert_eq!(layout.elem_width(), 1, "walk storage is u8-only");
+        debug_assert_eq!(chunk_size, 256);
+
+        let idx = self.eval_expr_w(idx_expr, 1);
+        self.walk_write_chunk(layout.base, idx, val);
     }
 
     // Walk a single chunk to read `chunk_base[local_offset]` into `result`.
@@ -1199,66 +1164,6 @@ impl<'a> BfEmitter<'a> {
         // Cursor lands at P_c (chunk_base + 2).
     }
 
-    fn arr_write_walk(
-        &mut self,
-        layout: &super::layout::CellLayout,
-        idx_expr: &Expr,
-        val: usize,
-        chunk_size: usize,
-        num_chunks: usize,
-    ) {
-        debug_assert_eq!(layout.elem_width(), 1, "walk storage is u8-only");
-        debug_assert_eq!(chunk_size, 256);
-        let base = layout.base;
-        let chunk_total = 4 * chunk_size + 3;
-
-        let chunk_id_w = chunks_id_width(num_chunks);
-        let idx_w = 1 + chunk_id_w;
-        let idx = self.eval_expr_w(idx_expr, idx_w);
-
-        if num_chunks == 1 {
-            self.walk_write_chunk(base, idx, val);
-            return;
-        }
-
-        let local_off = self.talloc();
-        self.copy(idx, local_off);
-
-        let chunk_id = self.talloc_n(chunk_id_w);
-        for k in 0..chunk_id_w {
-            self.copy(idx + 1 + k, chunk_id + k);
-        }
-        self.tfree_n(idx, idx_w);
-
-        for chunk in 0..num_chunks {
-            let chunk_base = base + chunk * chunk_total;
-
-            let cid_copy = self.talloc_n(chunk_id_w);
-            for k in 0..chunk_id_w {
-                self.copy(chunk_id + k, cid_copy + k);
-            }
-            let cmp_const = self.talloc_n(chunk_id_w);
-            self.set_const_n(cmp_const, chunk as u32, chunk_id_w);
-            let eq = self.cmp_eq_n(cid_copy, cmp_const, chunk_id_w);
-
-            self.goto(eq);
-            self.raw("[");
-            let lo_copy = self.talloc();
-            self.copy(local_off, lo_copy);
-            let val_copy = self.talloc();
-            self.copy(val, val_copy);
-            self.walk_write_chunk(chunk_base, lo_copy, val_copy);
-            self.clear(eq);
-            self.goto(eq);
-            self.raw("]");
-            self.tfree(eq);
-        }
-
-        self.tfree(local_off);
-        self.tfree(val);
-        self.tfree_n(chunk_id, chunk_id_w);
-    }
-
     // Walk a single chunk to write `val` into `chunk_base[local_offset]`.
     // Consumes both `local_offset` and `val`. Cursor ends at chunk_base + 1.
     fn walk_write_chunk(&mut self, chunk_base: usize, local_offset: usize, val: usize) {
@@ -1309,6 +1214,331 @@ impl<'a> BfEmitter<'a> {
         self.raw("[-[-<<<<+>>>>]<<<<]");
         // Cursor lands at P_b.
         self.ptr = chunk_base + 1;
+    }
+
+    // Outer-walk array access for `num_chunks > 1`.
+    //
+    // Treats the chunks themselves as a moving-pointer walk substrate:
+    // each chunk's 3 leading prefix cells (P_a, P_b, P_c) act as the
+    // per-step counter / survivor / payload, with stride
+    // `chunk_total = 4*N + 5` cells. The forward macro walk transfers
+    // these cells (plus P_d for write paths) from chunk[k] to
+    // chunk[k+1] per iteration; after `chunk_id` iterations the cursor
+    // lands at chunk[chunk_id]'s P_a with P_b = chunk_id and the
+    // payloads (local_off, val) materialised in P_c / P_d.
+    //
+    // The trailing E cell (offset `4*N + 3`) parks the chunk-id
+    // survivor across the inner walk's body, which clobbers P_b. Read
+    // paths use a 3-cell macro transfer (P_d untouched and irrelevant);
+    // write paths use a 4-cell macro transfer that also routes `val`
+    // through P_d.
+    //
+    // Per-access emit is O(chunk_total) BF chars regardless of
+    // `num_chunks`. Per-access runtime is O(chunk_id * chunk_total +
+    // local_off * 4) tape ops — proportional to the addressed offset
+    // but constant in the array's unused tail.
+    //
+    // chunk_id width is fixed at 1 byte (`num_chunks ≤ 256`) — the
+    // macro counter is single-byte today. Larger arrays would need a
+    // multi-byte counter or an extra dispatch level on top, which
+    // isn't implemented yet.
+    fn arr_read_outer_walk(
+        &mut self,
+        layout: &super::layout::CellLayout,
+        idx_expr: &Expr,
+        chunk_size: usize,
+        num_chunks: usize,
+    ) -> (usize, usize) {
+        debug_assert_eq!(layout.elem_width(), 1, "walk storage is u8-only");
+        debug_assert_eq!(chunk_size, 256, "walk chunk_size must be 256 for u8 counter");
+        debug_assert!(num_chunks > 1);
+        assert!(
+            num_chunks <= 256,
+            "outer walk supports up to 256 chunks (got {num_chunks}); larger \
+             arrays need a multi-byte chunk-id counter that isn't implemented yet"
+        );
+
+        let result = self.talloc();
+        self.clear(result);
+
+        // idx layout: byte 0 = local_off, byte 1 = chunk_id.
+        let idx = self.eval_expr_w(idx_expr, 2);
+
+        let base = layout.base;
+        self.seed_outer_prefix(base, idx, /*val=*/ None, chunk_size);
+        self.tfree_n(idx, 2);
+
+        self.goto(base);
+        self.emit_outer_walk_read_body(chunk_size);
+        // Body ends with the cursor relative-positioned at chunk_0.P_a
+        // dynamically; the static cursor never moved during the walk.
+        self.ptr = base;
+
+        // chunk_0.P_b leftover = chunk_id; chunk_0.P_c = read value.
+        self.clear(base + 1);
+        self.goto(base + 2);
+        self.raw("[-");
+        self.goto(result);
+        self.raw("+");
+        self.goto(base + 2);
+        self.raw("]");
+
+        (result, 1)
+    }
+
+    fn arr_write_outer_walk(
+        &mut self,
+        layout: &super::layout::CellLayout,
+        idx_expr: &Expr,
+        val: usize,
+        chunk_size: usize,
+        num_chunks: usize,
+    ) {
+        debug_assert_eq!(layout.elem_width(), 1, "walk storage is u8-only");
+        debug_assert_eq!(chunk_size, 256);
+        debug_assert!(num_chunks > 1);
+        assert!(
+            num_chunks <= 256,
+            "outer walk supports up to 256 chunks (got {num_chunks}); larger \
+             arrays need a multi-byte chunk-id counter that isn't implemented yet"
+        );
+
+        let idx = self.eval_expr_w(idx_expr, 2);
+        let base = layout.base;
+        self.seed_outer_prefix(base, idx, Some(val), chunk_size);
+        self.tfree_n(idx, 2);
+        self.tfree(val);
+
+        self.goto(base);
+        self.emit_outer_walk_write_body(chunk_size);
+        self.ptr = base;
+
+        // chunk_0.P_b leftover = chunk_id; clear it.
+        self.clear(base + 1);
+    }
+
+    // Move the index components (and optional `val`) into chunk_0's
+    // prefix cells, defensively clearing destinations first. Layout:
+    //   P_a (counter)   = chunk_id  (idx byte 1)
+    //   P_b (survivor)  = chunk_id
+    //   P_c (payload 1) = local_off (idx byte 0)
+    //   P_d (payload 2) = val       (write paths only; offset 4N+4)
+    //
+    // `idx` is consumed in-place but the caller still owns the temp
+    // (the `tfree_n` and `tfree(val)` happen at the call site after
+    // this returns).
+    fn seed_outer_prefix(
+        &mut self,
+        base: usize,
+        idx: usize,
+        val: Option<usize>,
+        chunk_size: usize,
+    ) {
+        let chunk_total = 4 * chunk_size + 5;
+        // Need a duplicate of chunk_id so we can fill both P_a and P_b
+        // without re-reading idx (which is consumed by the moves).
+        let cid_dup = self.talloc();
+        self.copy(idx + 1, cid_dup);
+
+        self.clear(base);
+        self.clear(base + 1);
+        self.clear(base + 2);
+
+        // chunk_id (idx byte 1) → P_a.
+        self.goto(idx + 1);
+        self.raw("[-");
+        self.goto(base);
+        self.raw("+");
+        self.goto(idx + 1);
+        self.raw("]");
+        // duplicate → P_b.
+        self.goto(cid_dup);
+        self.raw("[-");
+        self.goto(base + 1);
+        self.raw("+");
+        self.goto(cid_dup);
+        self.raw("]");
+        self.tfree(cid_dup);
+        // local_off (idx byte 0) → P_c.
+        self.goto(idx);
+        self.raw("[-");
+        self.goto(base + 2);
+        self.raw("+");
+        self.goto(idx);
+        self.raw("]");
+
+        if let Some(v) = val {
+            // val → P_d at offset chunk_total - 1.
+            let p_d = base + chunk_total - 1;
+            self.clear(p_d);
+            self.goto(v);
+            self.raw("[-");
+            self.goto(p_d);
+            self.raw("+");
+            self.goto(v);
+            self.raw("]");
+            // Also clear E (offset chunk_total - 2) defensively.
+            self.clear(base + chunk_total - 2);
+        } else {
+            // Read paths still need E and P_d zeroed (they're outside
+            // the inner walk's reach but feed into the outer walk's
+            // save/restore sequence).
+            self.clear(base + chunk_total - 2);
+            self.clear(base + chunk_total - 1);
+        }
+    }
+
+    // Emit the relative BF for the read path's in-array body. Caller
+    // has staged P_a, P_b, P_c (and zeroed E, P_d) at chunk_0 and the
+    // cursor is at chunk_0.P_a. Static cursor is unchanged across this
+    // routine; on exit the dynamic cursor is back at chunk_0.P_a.
+    fn emit_outer_walk_read_body(&mut self, chunk_size: usize) {
+        let chunk_total = 4 * chunk_size + 5;
+        let s = chunk_total;
+        let to_e = chunk_total - 3; // P_b (offset 1) → E (offset 4N+3)
+        let pa_to_e = chunk_total - 2; // P_a (0) → E (4N+3)
+        let gt_s = ">".repeat(s);
+        let lt_s = "<".repeat(s);
+
+        // Forward macro walk: 3-cell transfer (P_a, P_b, P_c).
+        // `[-[->S+<S]>[->S+<S]>[->S+<S]<<>S]`
+        self.raw("[-");
+        self.raw(&format!("[-{gt_s}+{lt_s}]>"));
+        self.raw(&format!("[-{gt_s}+{lt_s}]>"));
+        self.raw(&format!("[-{gt_s}+{lt_s}]<<"));
+        self.raw(&gt_s);
+        self.raw("]");
+        // Cursor: chunk_target.P_a. P_a=0, P_b=chunk_id, P_c=local_off.
+
+        // Save P_b → E so the inner walk's setup can repurpose P_b.
+        // From P_a, `>` to P_b, transfer to_e cells right.
+        self.raw(">");
+        self.raw(&format!("[-{}+{}]", ">".repeat(to_e), "<".repeat(to_e)));
+        self.raw("<"); // back to P_a.
+
+        // Setup inner walk: P_a = local_off, P_b = local_off, P_c = 0.
+        // From P_a, `>>` to P_c, then `[-<+<+>>]` decrements P_c while
+        // incrementing P_b and P_a, finally `<<` back to P_a.
+        self.raw(">>[-<+<+>>]<<");
+
+        // Inner read walk steps 2-6 (no setup — we built P_b ourselves).
+        self.raw("[-[->>>>+<<<<]>[->>>>+<<<<]<>>>>]"); // forward
+        self.raw(">>>"); // V_idx
+        self.raw("<[-]>[-<+>>+<]>[-<+>]<"); // read step
+        self.raw("<<"); // S_(idx-1)_b
+        self.raw("[-[-<<<<+>>>>]>[-<<<<+>>>>]<<<<<]"); // backward
+        // Cursor: chunk_target.P_b. P_a=0, P_b=0, P_c=read value,
+        // E=chunk_id, P_d=0.
+
+        // Restore E → P_a. P_b → E distance = to_e. E → P_a = pa_to_e.
+        self.raw(&">".repeat(to_e));
+        self.raw(&format!(
+            "[-{}+{}]",
+            "<".repeat(pa_to_e),
+            ">".repeat(pa_to_e)
+        ));
+        self.raw(&"<".repeat(pa_to_e)); // back to P_a.
+
+        // Build P_b = chunk_id from P_a using S_0_a (offset 4) as scratch.
+        self.raw("[->+>>>+<<<<]>>>>[-<<<<+>>>>]<<<<");
+        // Cursor: chunk_target.P_a. P_a=P_b=chunk_id, P_c=value.
+
+        // Backward macro walk: 3-cell transfer.
+        // `[-[-<S+>S]>[-<S+>S]>[-<S+>S]<<<S]`
+        self.raw("[-");
+        self.raw(&format!("[-{lt_s}+{gt_s}]>"));
+        self.raw(&format!("[-{lt_s}+{gt_s}]>"));
+        self.raw(&format!("[-{lt_s}+{gt_s}]<<"));
+        self.raw(&lt_s);
+        self.raw("]");
+        // Cursor: chunk_0.P_a. chunk_0.P_b=chunk_id leftover,
+        // chunk_0.P_c=read value.
+    }
+
+    // Emit the relative BF for the write path's in-array body. Caller
+    // has staged P_a, P_b, P_c, P_d at chunk_0 and the cursor is at
+    // chunk_0.P_a. Same cursor invariant as the read path.
+    fn emit_outer_walk_write_body(&mut self, chunk_size: usize) {
+        let chunk_total = 4 * chunk_size + 5;
+        let s = chunk_total;
+        let to_e = chunk_total - 3; // P_b (1) → E (4N+3)
+        let pa_to_e = chunk_total - 2; // P_a (0) → E
+        let pa_to_pd = chunk_total - 1; // P_a (0) → P_d (4N+4)
+        let pc_to_pd = chunk_total - 3; // P_c (2) → P_d
+        let gt_s = ">".repeat(s);
+        let lt_s = "<".repeat(s);
+
+        // Forward macro walk: 4-cell transfer (P_a, P_b, P_c, P_d).
+        // From P_c (offset 2) to P_d (offset 4N+4) is `pc_to_pd` cells.
+        // From P_d back to P_a (offset 0) is `pa_to_pd` cells.
+        let gt_pc_to_pd = ">".repeat(pc_to_pd);
+        let lt_pd_to_pa = "<".repeat(pa_to_pd);
+        self.raw("[-");
+        self.raw(&format!("[-{gt_s}+{lt_s}]>"));
+        self.raw(&format!("[-{gt_s}+{lt_s}]>"));
+        self.raw(&format!("[-{gt_s}+{lt_s}]"));
+        self.raw(&gt_pc_to_pd);
+        self.raw(&format!("[-{gt_s}+{lt_s}]"));
+        self.raw(&lt_pd_to_pa);
+        self.raw(&gt_s);
+        self.raw("]");
+        // Cursor: chunk_target.P_a. P_a=0, P_b=chunk_id, P_c=local_off,
+        // P_d=val.
+
+        // Save P_b → E.
+        self.raw(">");
+        self.raw(&format!("[-{}+{}]", ">".repeat(to_e), "<".repeat(to_e)));
+        self.raw("<"); // back to P_a.
+
+        // Move P_c (local_off) → P_a.
+        self.raw(">>[-<<+>>]<<"); // P_c → P_a. Cursor at P_a.
+
+        // Move P_d (val) → P_c. From P_a, `>{pa_to_pd}` to P_d, then
+        // `[-<{pc_to_pd}+>{pc_to_pd}]` transfers to P_c.
+        let gt_pa_to_pd = ">".repeat(pa_to_pd);
+        let lt_pc_to_pd = "<".repeat(pc_to_pd);
+        let gt_pc_to_pd2 = ">".repeat(pc_to_pd);
+        let lt_pa_to_pd = "<".repeat(pa_to_pd);
+        self.raw(&gt_pa_to_pd);
+        self.raw(&format!("[-{lt_pc_to_pd}+{gt_pc_to_pd2}]"));
+        self.raw(&lt_pa_to_pd); // back to P_a.
+        // State: P_a=local_off, P_b=0, P_c=val, S_0_c=0, ..., E=chunk_id.
+
+        // Inner write walk's setup builds P_b from P_a via S_0_c (offset
+        // 6), preserving P_c. Pattern reused from `walk_write_chunk`.
+        self.raw("[->+>>>>>+<<<<<<]>>>>>>[-<<<<<<+>>>>>>]<<<<<<");
+
+        // Forward write walk (3-cell transfer: P_a, P_b, P_c).
+        self.raw("[-[->>>>+<<<<]>[->>>>+<<<<]>[->>>>+<<<<]<<>>>>]");
+        // Step to V_idx and write.
+        self.raw(">>>");
+        self.raw("[-]<[->+<]<");
+        // Backward walk (counter only).
+        self.raw("[-[-<<<<+>>>>]<<<<]");
+        // Cursor: chunk_target.P_b. State: P_a=P_b=P_c=0, V_local_off=val,
+        // E=chunk_id.
+
+        // Restore E → P_a. (Same pattern as read path.)
+        self.raw(&">".repeat(to_e));
+        self.raw(&format!(
+            "[-{}+{}]",
+            "<".repeat(pa_to_e),
+            ">".repeat(pa_to_e)
+        ));
+        self.raw(&"<".repeat(pa_to_e));
+
+        // Build P_b = chunk_id via S_0_a.
+        self.raw("[->+>>>+<<<<]>>>>[-<<<<+>>>>]<<<<");
+
+        // Backward macro walk: 3-cell transfer (P_c is 0 here, transfer
+        // is a no-op for that slot).
+        self.raw("[-");
+        self.raw(&format!("[-{lt_s}+{gt_s}]>"));
+        self.raw(&format!("[-{lt_s}+{gt_s}]>"));
+        self.raw(&format!("[-{lt_s}+{gt_s}]<<"));
+        self.raw(&lt_s);
+        self.raw("]");
+        // Cursor: chunk_0.P_a. chunk_0.P_b=chunk_id leftover.
     }
 }
 
