@@ -8,6 +8,42 @@
 use super::ast::ScalarType;
 use std::collections::HashMap;
 
+/// Storage strategy for an array binding.
+///
+/// Drives `bfsc::codegen::arr_read` / `arr_write`: linear scan emits
+/// O(arr_len^2) BF and is fine for tiny arrays, while `Walk` uses a
+/// moving-pointer idiom that emits O(1) BF per access at the cost of
+/// 4 extra scratch cells per element.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ArrayLayout {
+    /// `arr_len * elem_width` contiguous cells. The legacy 1- and 2-byte
+    /// linear-scan code paths in codegen.rs operate on this shape.
+    Linear,
+    /// Moving-pointer ("walk") storage. Each element occupies 4 cells
+    /// (V, S_a control, S_b survivor, S_c value-carrier). `chunk_size`
+    /// elements live consecutively, then 3 prefix cells (P_a, P_b, P_c)
+    /// are inserted, then the next chunk starts. `num_chunks * (4 *
+    /// chunk_size + 3)` cells total. Only valid for `ty == U8` (the
+    /// walk idiom is single-byte counter-based).
+    Walk {
+        chunk_size: usize,
+        num_chunks: usize,
+    },
+}
+
+impl ArrayLayout {
+    /// Total cell count for this array layout.
+    pub(crate) fn total_cells(&self, array_len: usize, elem_width: usize) -> usize {
+        match self {
+            ArrayLayout::Linear => array_len * elem_width,
+            ArrayLayout::Walk {
+                chunk_size,
+                num_chunks,
+            } => num_chunks * (4 * chunk_size + 3),
+        }
+    }
+}
+
 /// Memory layout of one declared variable or array in the BFS source.
 #[derive(Debug, Clone)]
 pub(crate) struct CellLayout {
@@ -19,6 +55,9 @@ pub(crate) struct CellLayout {
     pub(crate) ty: ScalarType,
     /// Array element count; `None` for scalar bindings.
     pub(crate) array_len: Option<usize>,
+    /// Storage strategy. `Linear` for scalars and the legacy array path;
+    /// `Walk` for arrays that opted into the moving-pointer idiom.
+    pub(crate) layout: ArrayLayout,
 }
 
 impl CellLayout {
@@ -74,15 +113,36 @@ impl MemMapBuilder {
                 width,
                 ty,
                 array_len: None,
+                layout: ArrayLayout::Linear,
             },
         );
         self.next_cell += width;
     }
 
     /// Allocate cells for an array binding and advance the cursor past it.
+    ///
+    /// Picks the storage strategy automatically: linear for arrays small
+    /// enough to keep the legacy linear-scan emit at a tolerable size
+    /// (≤ 256 cells with the existing 1-byte path), or walk-based with
+    /// 256-element chunks once the linear path's quadratic emit explodes.
     pub(crate) fn alloc_array(&mut self, name: String, ty: ScalarType, len: usize) {
+        // Walk storage is single-byte counter only — restrict to u8 arrays.
+        // The threshold mirrors the old 1-byte index path: arrays up to 256
+        // elements stay byte-identical to the previous emitter; anything
+        // larger gets the walk layout (with chunked dispatch when arr_len
+        // exceeds the chunk size of 256).
+        let layout = if matches!(ty, ScalarType::U8) && len > 256 {
+            const CHUNK: usize = 256;
+            let num_chunks = len.div_ceil(CHUNK);
+            ArrayLayout::Walk {
+                chunk_size: CHUNK,
+                num_chunks,
+            }
+        } else {
+            ArrayLayout::Linear
+        };
         let elem_width = ty.cell_width();
-        let total = elem_width * len;
+        let total = layout.total_cells(len, elem_width);
         self.vars.insert(
             name,
             CellLayout {
@@ -90,6 +150,7 @@ impl MemMapBuilder {
                 width: total,
                 ty,
                 array_len: Some(len),
+                layout,
             },
         );
         self.next_cell += total;
