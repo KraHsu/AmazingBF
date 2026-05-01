@@ -1,0 +1,21 @@
+// Exercises the two-stage outer-walk path through hi=0..3 boundaries.
+// arr_len = 263000 → num_chunks = 1028 (= 4*256 + 4) → num_groups = 5.
+// Indices touch the start of each hi group plus the array tail.
+let big: [u8; 263000];
+let i: u32;
+
+i = 0;       big[i] = 10;   // hi=0, lo=0
+i = 65536;   big[i] = 20;   // hi=1, lo=0
+i = 131072;  big[i] = 30;   // hi=2, lo=0
+i = 196608;  big[i] = 40;   // hi=3, lo=0
+i = 262144;  big[i] = 50;   // hi=4, lo=0  (start of last partial group)
+i = 262999;  big[i] = 60;   // last cell of array (hi=4)
+
+let v: u8;
+i = 0;       v = big[i];   print(v);
+i = 65536;   v = big[i];   print(v);
+i = 131072;  v = big[i];   print(v);
+i = 196608;  v = big[i];   print(v);
+i = 262144;  v = big[i];   print(v);
+i = 262999;  v = big[i];   print(v);
+putchar(10);

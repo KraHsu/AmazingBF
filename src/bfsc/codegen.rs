@@ -1283,37 +1283,21 @@ impl<'a> BfEmitter<'a> {
             self.ptr = base;
             self.extract_outer_walk_result(base, result);
         } else {
-            // Multi-group cmp_eq dispatch. idx[0] = local_off, idx[1] =
-            // chunk_in_group, idx[2] = group_id.
-            for g in 0..num_groups {
-                let group_base = base + g * group_total;
-
-                let cid_copy = self.talloc();
-                self.copy(idx + 2, cid_copy);
-                let const_g = self.talloc();
-                self.setv(const_g, g as u8);
-                let eq = self.cmp_eq(cid_copy, const_g);
-
-                self.goto(eq);
-                self.raw("[");
-                // Fresh 2-byte idx (local_off, chunk_in_group) for the
-                // group's outer walk; the original 3-byte idx is left
-                // untouched so the next arm can reuse it.
-                let idx_arm = self.talloc_n(2);
-                self.copy(idx, idx_arm);
-                self.copy(idx + 1, idx_arm + 1);
-                self.seed_outer_prefix(group_base, idx_arm, None, chunk_size);
-                self.tfree_n(idx_arm, 2);
-                self.goto(group_base);
-                self.emit_outer_walk_read_body(chunk_size);
-                self.ptr = group_base;
-                self.extract_outer_walk_result(group_base, result);
-                self.clear(eq);
-                self.goto(eq);
-                self.raw("]");
-                self.tfree(eq);
-            }
+            // Two-stage macro walk. idx[0]=local_off, idx[1]=lo (chunk_id mod
+            // 256), idx[2]=hi (chunk_id / 256). Per-access emit is
+            // O(group_total + chunk_total), independent of num_groups.
+            let _ = group_total;
+            self.seed_outer_prefix_2stage(base, idx, None, chunk_size);
             self.tfree_n(idx, 3);
+            self.goto(base);
+            self.emit_stage1_macro_walk_forward(chunk_size, /*with_val=*/ false);
+            self.emit_stage1_to_stage2_transition(chunk_size);
+            self.emit_outer_walk_read_body(chunk_size); // stage 2
+            self.emit_stage2_to_stage1_transition_read(chunk_size);
+            self.emit_stage1_macro_walk_backward(chunk_size, /*carry_value=*/ true);
+            self.ptr = base;
+            // chunk_0.P_a = 0, chunk_0.P_b = 0, chunk_0.P_c = read_value.
+            self.extract_outer_walk_result(base, result);
         }
 
         (result, 1)
@@ -1354,36 +1338,19 @@ impl<'a> BfEmitter<'a> {
             self.ptr = base;
             self.clear(base + 1);
         } else {
-            for g in 0..num_groups {
-                let group_base = base + g * group_total;
-
-                let cid_copy = self.talloc();
-                self.copy(idx + 2, cid_copy);
-                let const_g = self.talloc();
-                self.setv(const_g, g as u8);
-                let eq = self.cmp_eq(cid_copy, const_g);
-
-                self.goto(eq);
-                self.raw("[");
-                let idx_arm = self.talloc_n(2);
-                self.copy(idx, idx_arm);
-                self.copy(idx + 1, idx_arm + 1);
-                let val_arm = self.talloc();
-                self.copy(val, val_arm);
-                self.seed_outer_prefix(group_base, idx_arm, Some(val_arm), chunk_size);
-                self.tfree_n(idx_arm, 2);
-                self.tfree(val_arm);
-                self.goto(group_base);
-                self.emit_outer_walk_write_body(chunk_size);
-                self.ptr = group_base;
-                self.clear(group_base + 1);
-                self.clear(eq);
-                self.goto(eq);
-                self.raw("]");
-                self.tfree(eq);
-            }
+            // Two-stage macro walk; see arr_read_outer_walk.
+            let _ = group_total;
+            self.seed_outer_prefix_2stage(base, idx, Some(val), chunk_size);
             self.tfree_n(idx, 3);
             self.tfree(val);
+            self.goto(base);
+            self.emit_stage1_macro_walk_forward(chunk_size, /*with_val=*/ true);
+            self.emit_stage1_to_stage2_transition(chunk_size);
+            self.emit_outer_walk_write_body(chunk_size); // stage 2
+            self.emit_stage2_to_stage1_transition_write(chunk_size);
+            self.emit_stage1_macro_walk_backward(chunk_size, /*carry_value=*/ false);
+            self.ptr = base;
+            // chunk_0 prefix all 0; nothing to clean up.
         }
     }
 
@@ -1610,6 +1577,221 @@ impl<'a> BfEmitter<'a> {
         self.raw(&lt_s);
         self.raw("]");
         // Cursor: chunk_0.P_a. chunk_0.P_b=chunk_id leftover.
+    }
+
+    // -- two-stage outer walk (num_chunks > 256) -----------------------------
+    //
+    // For arrays whose `num_chunks` exceeds the single-byte macro counter
+    // limit (256), we run a two-stage macro walk instead of the per-group
+    // `cmp_eq` fanout. Stage 1 strides at `S1 = 256 * chunk_total` (one step
+    // per group), stage 2 reuses the existing single-group walk at stride
+    // `chunk_total` inside the destination group. Per-access emit becomes
+    // `O(group_total + chunk_total)`, decoupled from `num_groups`.
+    //
+    // 3-byte idx layout: [local_off, lo, hi] with lo = chunk_id mod 256 and
+    // hi = chunk_id / 256. Per-chunk prefix (chunk_total = 4N+5):
+    //   offset 0           P_a  stage 1: hi (counter) → stage 2: lo (counter)
+    //   offset 1           P_b  stage 1: hi_dup       → stage 2: lo_dup
+    //   offset 2           P_c  stage 1: lo (carrier) → stage 2: local_off
+    //   offset chunk_total-2  E    stage 1: local_off carrier; stage 2: parking
+    //   offset chunk_total-1  P_d  val (write only)
+    // `hi` is parked at chunk_(hi*256).S_(N-1)_c (offset chunk_total-3) across
+    // stage 2; the inner walk's read/write step touches offsets up to
+    // 4*local_off+4 ≤ 4N (= 1024 for N=256), so S_(N-1)_c at offset 4N+2 is
+    // never touched regardless of local_off. Restored to 0 by the back-half
+    // before stage 1 backward starts.
+    fn seed_outer_prefix_2stage(
+        &mut self,
+        base: usize,
+        idx: usize,
+        val: Option<usize>,
+        chunk_size: usize,
+    ) {
+        let chunk_total = 4 * chunk_size + 5;
+        let e = base + chunk_total - 2;
+
+        // hi (idx+2) → P_a + P_b (fused).
+        self.goto(idx + 2);
+        self.raw("[-");
+        self.goto(base);
+        self.raw("+>+<");
+        self.goto(idx + 2);
+        self.raw("]");
+
+        // lo (idx+1) → P_c.
+        self.goto(idx + 1);
+        self.raw("[-");
+        self.goto(base + 2);
+        self.raw("+");
+        self.goto(idx + 1);
+        self.raw("]");
+
+        // local_off (idx+0) → E.
+        self.goto(idx);
+        self.raw("[-");
+        self.goto(e);
+        self.raw("+");
+        self.goto(idx);
+        self.raw("]");
+
+        if let Some(v) = val {
+            let p_d = base + chunk_total - 1;
+            self.goto(v);
+            self.raw("[-");
+            self.goto(p_d);
+            self.raw("+");
+            self.goto(v);
+            self.raw("]");
+        }
+    }
+
+    // Stage 1 forward macro walk at stride `S1 = 256 * chunk_total`. Carries
+    // 4 cells (P_a, P_b, P_c, E) for read or 5 cells (+ P_d) for write.
+    // Caller's static cursor (`self.ptr`) stays at chunk_0.P_a; dynamic
+    // cursor lands at chunk_(hi*256).P_a on exit. After K = hi iterations:
+    //   chunk_(hi*256): P_a=0, P_b=hi, P_c=lo, E=local_off, [P_d=val]
+    //   intermediate chunks: all carried slots = 0
+    fn emit_stage1_macro_walk_forward(&mut self, chunk_size: usize, with_val: bool) {
+        let chunk_total = 4 * chunk_size + 5;
+        let s1 = 256 * chunk_total;
+        let gt_s1 = ">".repeat(s1);
+        let lt_s1 = "<".repeat(s1);
+        let pc_to_e = chunk_total - 4; // offset 2 → offset chunk_total-2
+
+        self.raw("[-");
+        // P_a → next chunk's P_a.
+        self.raw(&format!("[-{gt_s1}+{lt_s1}]>"));
+        // P_b → next chunk's P_b.
+        self.raw(&format!("[-{gt_s1}+{lt_s1}]>"));
+        // P_c → next chunk's P_c.
+        self.raw(&format!("[-{gt_s1}+{lt_s1}]"));
+        // Advance from P_c (offset 2) to E (offset chunk_total - 2).
+        self.raw(&">".repeat(pc_to_e));
+        // E → next chunk's E.
+        self.raw(&format!("[-{gt_s1}+{lt_s1}]"));
+
+        if with_val {
+            // Advance E (offset chunk_total-2) → P_d (offset chunk_total-1).
+            self.raw(">");
+            // P_d → next chunk's P_d.
+            self.raw(&format!("[-{gt_s1}+{lt_s1}]"));
+            // Back to P_a (offset 0): distance chunk_total - 1.
+            self.raw(&"<".repeat(chunk_total - 1));
+        } else {
+            // Back to P_a (offset 0): distance chunk_total - 2.
+            self.raw(&"<".repeat(chunk_total - 2));
+        }
+
+        // Advance to next chunk's P_a (loop condition).
+        self.raw(&gt_s1);
+        self.raw("]");
+    }
+
+    // Rearrange chunk_(hi*256) prefix from stage-1 layout to stage-2 layout.
+    // Entry state (cursor at P_a): P_a=0, P_b=hi, P_c=lo, E=local_off, [P_d=val].
+    // Exit state (cursor at P_a):  P_a=lo, P_b=lo, P_c=local_off, E=0,
+    //                              S_(N-1)_c=hi (parked), [P_d=val].
+    fn emit_stage1_to_stage2_transition(&mut self, chunk_size: usize) {
+        let chunk_total = 4 * chunk_size + 5;
+        let pc_to_e = chunk_total - 4;
+        // P_b (offset 1) → S_(N-1)_c (offset chunk_total - 3): distance = chunk_total - 4.
+        let pb_to_park = chunk_total - 4;
+
+        // Park hi: from P_a, > to P_b, then empty P_b → S_(N-1)_c at distance
+        // pb_to_park = chunk_total - 4. Cursor ends at P_b.
+        self.raw(">");
+        self.raw(&format!(
+            "[-{}+{}]",
+            ">".repeat(pb_to_park),
+            "<".repeat(pb_to_park)
+        ));
+
+        // Move lo (P_c) → P_a: from P_b, > to P_c, [-<<+>>] empties P_c → P_a.
+        // Cursor ends at P_c.
+        self.raw(">[-<<+>>]");
+
+        // Move local_off (E) → P_c: from P_c, >(pc_to_e) to E, then
+        // [-<(pc_to_e)+>(pc_to_e)] empties E → P_c. Cursor ends at E.
+        self.raw(&">".repeat(pc_to_e));
+        self.raw(&format!(
+            "[-{}+{}]",
+            "<".repeat(pc_to_e),
+            ">".repeat(pc_to_e)
+        ));
+
+        // Back to P_a (offset 0): distance chunk_total - 2.
+        self.raw(&"<".repeat(chunk_total - 2));
+
+        // Build P_b = lo from P_a using S_0_c (offset 6) as scratch
+        // (preserves P_a and P_c, mirrors the pattern at line 1580).
+        self.raw("[->+>>>>>+<<<<<<]>>>>>>[-<<<<<<+>>>>>>]<<<<<<");
+    }
+
+    // After stage 2 returns to chunk_(hi*256).P_a, prepare for stage 1 bwd.
+    // Read entry state: P_a=0, P_b=lo (leftover), P_c=read_value,
+    //                   S_(N-1)_c=hi (parked), others=0.
+    // Read exit state:  P_a=hi, P_b=0, P_c=read_value, S_(N-1)_c=0.
+    fn emit_stage2_to_stage1_transition_read(&mut self, chunk_size: usize) {
+        let chunk_total = 4 * chunk_size + 5;
+        // P_a (offset 0) → S_(N-1)_c (offset chunk_total - 3): distance.
+        let pa_to_park = chunk_total - 3;
+
+        // Clear P_b leftover.
+        self.raw(">[-]<");
+        // Unpark S_(N-1)_c → P_a: >(pa_to_park) to S_(N-1)_c,
+        // [-<(pa_to_park)+>(pa_to_park)] empties → P_a, <(pa_to_park) back.
+        self.raw(&">".repeat(pa_to_park));
+        self.raw(&format!(
+            "[-{}+{}]",
+            "<".repeat(pa_to_park),
+            ">".repeat(pa_to_park)
+        ));
+        self.raw(&"<".repeat(pa_to_park));
+    }
+
+    // Write entry state: P_a=0, P_b=lo (leftover), P_c=0, V_local_off=val,
+    //                    S_(N-1)_c=hi (parked), others=0.
+    // Write exit state:  P_a=hi, others=0 (in prefix).
+    fn emit_stage2_to_stage1_transition_write(&mut self, chunk_size: usize) {
+        let chunk_total = 4 * chunk_size + 5;
+        let pa_to_park = chunk_total - 3;
+
+        self.raw(">[-]<");
+        self.raw(&">".repeat(pa_to_park));
+        self.raw(&format!(
+            "[-{}+{}]",
+            "<".repeat(pa_to_park),
+            ">".repeat(pa_to_park)
+        ));
+        self.raw(&"<".repeat(pa_to_park));
+    }
+
+    // Stage 1 backward macro walk at stride `S1`. Read carries (P_a counter,
+    // P_c value); write carries only the counter. Cursor enters at
+    // chunk_(hi*256).P_a, exits at chunk_0.P_a. After K = hi iterations,
+    // chunk_0.P_a = 0; chunk_0.P_c = read_value (if carrying value).
+    fn emit_stage1_macro_walk_backward(&mut self, chunk_size: usize, carry_value: bool) {
+        let chunk_total = 4 * chunk_size + 5;
+        let s1 = 256 * chunk_total;
+        let gt_s1 = ">".repeat(s1);
+        let lt_s1 = "<".repeat(s1);
+
+        self.raw("[-");
+        // P_a → chunk_(j-1).P_a.
+        self.raw(&format!("[-{lt_s1}+{gt_s1}]"));
+
+        if carry_value {
+            // Advance to P_c (offset 2; P_b at offset 1 is 0, skipped).
+            self.raw(">>");
+            // P_c → chunk_(j-1).P_c.
+            self.raw(&format!("[-{lt_s1}+{gt_s1}]"));
+            // Back to P_a.
+            self.raw("<<");
+        }
+
+        // Advance left to chunk_(j-1).P_a.
+        self.raw(&lt_s1);
+        self.raw("]");
     }
 }
 

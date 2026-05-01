@@ -1,0 +1,20 @@
+// Exercises the two-stage outer-walk path at hi=1 and hi=2 boundaries.
+// arr_len = 131072 → num_chunks = 512 → num_groups = 2. Indices touch:
+// hi=0 chunks (0, 65535), hi=1 first chunk (65536), hi=1 last chunk
+// (131071), and a hi=1 middle chunk (98765).
+let big: [u8; 131072];
+let i: u32;
+
+i = 0;       big[i] = 11;
+i = 65535;   big[i] = 22;   // last cell of hi=0 last chunk
+i = 65536;   big[i] = 33;   // first cell of hi=1 first chunk
+i = 98765;   big[i] = 44;   // hi=1 middle chunk
+i = 131071;  big[i] = 55;   // last cell of array
+
+let v: u8;
+i = 0;       v = big[i];   print(v);
+i = 65535;   v = big[i];   print(v);
+i = 65536;   v = big[i];   print(v);
+i = 98765;   v = big[i];   print(v);
+i = 131071;  v = big[i];   print(v);
+putchar(10);
