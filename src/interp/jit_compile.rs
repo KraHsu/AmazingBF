@@ -54,6 +54,18 @@ fn lower_ops_to_lir(ops: &[InterpOp], lir: &mut Vec<LirInst>, labels: &mut Label
                 lir.push(LirInst::CellSet(0));
                 lir.push(LirInst::PtrAdd(*d as isize));
             }
+            InterpOp::AddAt { off, delta } => {
+                lir.push(LirInst::CellAddAt {
+                    off: *off as isize,
+                    delta: *delta,
+                });
+            }
+            InterpOp::SetAt { off, val } => {
+                lir.push(LirInst::CellSetAt {
+                    off: *off as isize,
+                    val: *val,
+                });
+            }
             InterpOp::PutByte => lir.push(LirInst::PutByte),
             InterpOp::GetByte => lir.push(LirInst::GetByte),
             InterpOp::Zero => lir.push(LirInst::CellSet(0)),
@@ -64,6 +76,20 @@ fn lower_ops_to_lir(ops: &[InterpOp], lir: &mut Vec<LirInst>, labels: &mut Label
                     .map(|(off, f)| (*off as isize, *f as i32))
                     .collect();
                 lir.push(LirInst::LinearMul(factors));
+            }
+            InterpOp::LinearMul1 { off, factor } => {
+                lir.push(LirInst::LinearMul(vec![(*off as isize, *factor as i32)]));
+            }
+            InterpOp::LinearMul2 {
+                off1,
+                factor1,
+                off2,
+                factor2,
+            } => {
+                lir.push(LirInst::LinearMul(vec![
+                    (*off1 as isize, *factor1 as i32),
+                    (*off2 as isize, *factor2 as i32),
+                ]));
             }
             InterpOp::LinearMulWithSets(plan) => {
                 let factors: Vec<(isize, i32)> = plan
@@ -199,18 +225,21 @@ pub(crate) fn analyse_eligibility(body: &[InterpOp]) -> Option<LoopReach> {
                 ptr = ptr.checked_add(*d)?;
                 record(&mut min_off, &mut max_off, ptr);
             }
-            InterpOp::MoveAdd { d, k: _ } => {
+            InterpOp::MoveAdd { d, .. } => {
                 ptr = ptr.checked_add(*d)?;
                 record(&mut min_off, &mut max_off, ptr);
             }
             InterpOp::ZeroMove(d) => {
-                // ZeroMove writes the cell at the current ptr first, then moves.
                 record(&mut min_off, &mut max_off, ptr);
                 ptr = ptr.checked_add(*d)?;
                 record(&mut min_off, &mut max_off, ptr);
             }
             InterpOp::Add(_) | InterpOp::Zero => {
                 record(&mut min_off, &mut max_off, ptr);
+            }
+            InterpOp::AddAt { off, .. } | InterpOp::SetAt { off, .. } => {
+                let abs = ptr.checked_add(*off)?;
+                record(&mut min_off, &mut max_off, abs);
             }
             InterpOp::LinearMul(plan) => {
                 // The head cell (at ptr) is read and zeroed.
@@ -219,6 +248,18 @@ pub(crate) fn analyse_eligibility(body: &[InterpOp]) -> Option<LoopReach> {
                     let abs = ptr.checked_add(*off)?;
                     record(&mut min_off, &mut max_off, abs);
                 }
+            }
+            InterpOp::LinearMul1 { off, .. } => {
+                record(&mut min_off, &mut max_off, ptr);
+                let abs = ptr.checked_add(*off)?;
+                record(&mut min_off, &mut max_off, abs);
+            }
+            InterpOp::LinearMul2 { off1, off2, .. } => {
+                record(&mut min_off, &mut max_off, ptr);
+                let abs1 = ptr.checked_add(*off1)?;
+                record(&mut min_off, &mut max_off, abs1);
+                let abs2 = ptr.checked_add(*off2)?;
+                record(&mut min_off, &mut max_off, abs2);
             }
             InterpOp::LinearMulWithSets(plan) => {
                 record(&mut min_off, &mut max_off, ptr);
@@ -307,7 +348,11 @@ mod tests {
 
     #[test]
     fn compile_move_add_body() {
-        let body = vec![InterpOp::MoveAdd { d: 1, k: 1 }, InterpOp::Add(-1)];
+        let body = vec![
+            InterpOp::AddAt { off: 1, delta: 1 },
+            InterpOp::Move(1),
+            InterpOp::Add(-1),
+        ];
         let buf = compile_hot_loop(&body, None);
         assert!(buf.is_some());
     }
@@ -326,7 +371,7 @@ mod tests {
     #[test]
     fn compile_unbalanced_body_with_iter_check() {
         // An unbalanced loop body — ptr drifts +1 each iteration.
-        let body = vec![InterpOp::MoveAdd { d: 1, k: -1 }];
+        let body = vec![InterpOp::AddAt { off: 1, delta: -1 }, InterpOp::Move(1)];
         let buf = compile_hot_loop(&body, Some((0, 1)));
         assert!(
             buf.is_some(),
@@ -377,13 +422,13 @@ mod tests {
         // Unbalanced loops are deferred until the persistent mmap-shared
         // tape lands; the per-dispatch snapshot/restore overhead buries
         // the JIT win for the small bodies that typically drift.
-        let body = vec![InterpOp::MoveAdd { d: 1, k: -1 }];
+        let body = vec![InterpOp::AddAt { off: 1, delta: -1 }, InterpOp::Move(1)];
         assert_eq!(analyse_eligibility(&body), None);
     }
 
     #[test]
     fn ineligible_unbalanced_drift_left() {
-        let body = vec![InterpOp::MoveAdd { d: -1, k: -1 }];
+        let body = vec![InterpOp::AddAt { off: -1, delta: -1 }, InterpOp::Move(-1)];
         assert_eq!(analyse_eligibility(&body), None);
     }
 

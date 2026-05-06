@@ -28,6 +28,7 @@ use crate::driver::config::{
 };
 use crate::driver::pipeline::build_frontend;
 use crate::interp::engine::Interpreter;
+use crate::interp::profile::{DEFAULT_HOTSPOT_TOP_N, format_hotspot_report};
 use crate::ir::hir::HirProgram;
 use crate::ir::lir::LirProgram;
 use crate::ir::lir_opt::optimize_lir;
@@ -71,6 +72,9 @@ fn run_interpret(config: &DriverConfig, hir: &HirProgram) -> Result<()> {
         BufferedStdIo::new(),
         NullHost::new(),
     );
+    if config.interp_debug {
+        interp.enable_hotspot_profiling(1);
+    }
     interp.run(hir)?;
     log_info(format!(
         "interpreter finished (hir_insts={})",
@@ -78,20 +82,7 @@ fn run_interpret(config: &DriverConfig, hir: &HirProgram) -> Result<()> {
     ));
 
     if config.interp_debug {
-        let s = interp.tape.stats();
-        eprintln!(
-            "[interp-debug] tape initial_cells={} final_cells={} visited_span={} \
-             right_grew_bytes={} ptr_min={} ptr_max={} \
-             move_left_units={} move_right_units={}",
-            s.initial_len,
-            s.final_len,
-            s.visited_span(),
-            s.right_grew_bytes,
-            s.ptr_min,
-            s.ptr_max,
-            s.move_left_units,
-            s.move_right_units,
-        );
+        emit_interp_debug_report(&interp);
     }
 
     Ok(())
@@ -209,6 +200,26 @@ fn build_optimized_lir(hir: &HirProgram, opt_level: OptLevel) -> LirProgram {
     }
 }
 
+fn emit_interp_debug_report(interp: &Interpreter<BufferedStdIo, NullHost>) {
+    let s = interp.tape.stats();
+    eprintln!(
+        "[interp-debug] tape initial_cells={} final_cells={} visited_span={} \
+         right_grew_bytes={} ptr_min={} ptr_max={} \
+         move_left_units={} move_right_units={}",
+        s.initial_len,
+        s.final_len,
+        s.visited_span(),
+        s.right_grew_bytes,
+        s.ptr_min,
+        s.ptr_max,
+        s.move_left_units,
+        s.move_right_units,
+    );
+    if let Some(profile) = interp.profile() {
+        eprint!("{}", format_hotspot_report(profile, DEFAULT_HOTSPOT_TOP_N));
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn run_tiered(config: &DriverConfig, hir: &HirProgram) -> Result<()> {
     let threshold = config.jit_threshold.unwrap_or(DEFAULT_JIT_THRESHOLD);
@@ -218,6 +229,10 @@ fn run_tiered(config: &DriverConfig, hir: &HirProgram) -> Result<()> {
         NullHost::new(),
     );
     interp.enable_tiered_jit(threshold);
+    if config.interp_debug {
+        interp.enable_hotspot_profiling(threshold);
+        interp.jit_enabled = true;
+    }
     interp.run(hir)?;
     log_info(format!(
         "tiered interpreter finished (hir_insts={} jit_threshold={})",
@@ -226,20 +241,7 @@ fn run_tiered(config: &DriverConfig, hir: &HirProgram) -> Result<()> {
     ));
 
     if config.interp_debug {
-        let s = interp.tape.stats();
-        eprintln!(
-            "[interp-debug] tape initial_cells={} final_cells={} visited_span={} \
-             right_grew_bytes={} ptr_min={} ptr_max={} \
-             move_left_units={} move_right_units={}",
-            s.initial_len,
-            s.final_len,
-            s.visited_span(),
-            s.right_grew_bytes,
-            s.ptr_min,
-            s.ptr_max,
-            s.move_left_units,
-            s.move_right_units,
-        );
+        emit_interp_debug_report(&interp);
     }
 
     Ok(())
