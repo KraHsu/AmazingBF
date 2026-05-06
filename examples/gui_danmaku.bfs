@@ -33,8 +33,43 @@ fn draw_bullet(x: u8, y: u8, c: u8) {
     setpixel(x + 2, y + 4, c);
 }
 
+fn bg_color(x: u8, y: u8) -> u8 {
+    let c: u8 = 0;
+    if x == 18 { if y == 32 { c = 3; } }
+    if x == 40 { if y == 98 { c = 28; } }
+    if x == 71 { if y == 55 { c = 31; } }
+    if x == 93 { if y == 151 { c = 3; } }
+    if x == 116 { if y == 24 { c = 28; } }
+    if x == 148 { if y == 83 { c = 31; } }
+    if x == 174 { if y == 137 { c = 3; } }
+    if x == 203 { if y == 43 { c = 28; } }
+    if x == 231 { if y == 118 { c = 31; } }
+    if x == 33 { if y == 183 { c = 3; } }
+    if x == 83 { if y == 210 { c = 28; } }
+    if x == 139 { if y == 197 { c = 31; } }
+    if x == 198 { if y == 220 { c = 3; } }
+    if x == 238 { if y == 174 { c = 28; } }
+    return c;
+}
+
+fn restore_pixel(x: u8, y: u8) {
+    setpixel(x, y, bg_color(x, y));
+}
+
 fn erase_bullet(x: u8, y: u8) {
-    draw_bullet(x, y, 0);
+    restore_pixel(x + 2, y);
+    restore_pixel(x + 1, y + 1);
+    restore_pixel(x + 2, y + 1);
+    restore_pixel(x + 3, y + 1);
+    restore_pixel(x, y + 2);
+    restore_pixel(x + 1, y + 2);
+    restore_pixel(x + 2, y + 2);
+    restore_pixel(x + 3, y + 2);
+    restore_pixel(x + 4, y + 2);
+    restore_pixel(x + 1, y + 3);
+    restore_pixel(x + 2, y + 3);
+    restore_pixel(x + 3, y + 3);
+    restore_pixel(x + 2, y + 4);
 }
 
 fn draw_player(x: u8, c: u8) {
@@ -62,7 +97,26 @@ fn draw_player(x: u8, c: u8) {
 }
 
 fn erase_player(x: u8) {
-    draw_player(x, 0);
+    restore_pixel(x, 236);
+    restore_pixel(x - 1, 237);
+    restore_pixel(x, 237);
+    restore_pixel(x + 1, 237);
+    restore_pixel(x - 2, 238);
+    restore_pixel(x - 1, 238);
+    restore_pixel(x, 238);
+    restore_pixel(x + 1, 238);
+    restore_pixel(x + 2, 238);
+    restore_pixel(x - 3, 239);
+    restore_pixel(x - 1, 239);
+    restore_pixel(x, 239);
+    restore_pixel(x + 1, 239);
+    restore_pixel(x + 3, 239);
+    restore_pixel(x - 3, 240);
+    restore_pixel(x - 2, 240);
+    restore_pixel(x + 2, 240);
+    restore_pixel(x + 3, 240);
+    restore_pixel(x - 1, 241);
+    restore_pixel(x + 1, 241);
 }
 
 fn draw_heart(x: u8, c: u8) {
@@ -138,6 +192,17 @@ fn draw_burst(x: u8, c: u8) {
     setpixel(x, 246, c);
 }
 
+fn erase_burst(x: u8) {
+    restore_pixel(x, 232);
+    restore_pixel(x - 4, 236);
+    restore_pixel(x + 4, 236);
+    restore_pixel(x - 6, 238);
+    restore_pixel(x + 6, 238);
+    restore_pixel(x - 4, 242);
+    restore_pixel(x + 4, 242);
+    restore_pixel(x, 246);
+}
+
 fn bullet_hits(bx: u8, by: u8, player_x: u8) -> u8 {
     let h: u8 = 0;
     if bx + 5 > player_x - 4 {
@@ -175,6 +240,7 @@ let speed: u8 = 2;
 let dash_cd: u8 = 0;
 let invuln: u8 = 0;
 let hurt_flash: u8 = 0;
+let burst_x: u8 = 0;
 
 let b0_active: u8 = 0;
 let b0_x: u8 = 0;
@@ -301,7 +367,7 @@ while running > 0 {
         if hurt_flash > 0 {
             hurt_flash = hurt_flash - 1;
             if hurt_flash == 0 {
-                draw_burst(px, 0);
+                erase_burst(burst_x);
             }
         }
 
@@ -511,7 +577,8 @@ while running > 0 {
                         draw_heart(heart_x, 0);
                         invuln = 24;
                         hurt_flash = 7;
-                        draw_burst(px, 224);
+                        burst_x = px;
+                        draw_burst(burst_x, 224);
                     }
                 }
             }

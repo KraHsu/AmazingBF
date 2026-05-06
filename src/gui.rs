@@ -30,7 +30,21 @@ const FRAME_CHANNEL_DEPTH: usize = 1;
 fn send_key(key: u8, shared: State<Arc<GuiShared>>) {
     {
         let mut q = shared.keys.lock().unwrap();
-        q.push_back(key);
+        if key == 0 {
+            if !q.iter().any(|&k| k == 0) {
+                q.push_back(key);
+            }
+        } else {
+            q.retain(|&k| {
+                if k == 0 {
+                    return false;
+                }
+                let stale_horizontal = (key == b'a' || key == b'd') && (k == b'a' || k == b'd');
+                let stale_dash = (key == b'w' || key == b' ') && (k == b'w' || k == b' ');
+                !(stale_horizontal || stale_dash)
+            });
+            q.push_back(key);
+        }
     }
     shared.cv_key.notify_one();
 }
