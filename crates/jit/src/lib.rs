@@ -454,17 +454,30 @@ mod tests {
 
     #[test]
     fn execute_fn_receives_args() {
-        // x86_64: mov rax, rdi; add rax, rsi; add rax, rdx; ret
-        // Returns the sum of the three pointer arguments (as integers).
+        // x86_64:
+        //   mov rax, rsi
+        //   sub rax, rdi
+        //   add rax, rdx
+        //   sub rax, rsi
+        //   ret
+        //
+        // Returns rdx - rdi, which lets the test validate that all three
+        // arguments arrived in the expected registers without depending on
+        // absolute pointer values.
         let code: &[u8] = &[
-            0x48, 0x89, 0xF8, // mov rax, rdi
-            0x48, 0x01, 0xF0, // add rax, rsi
+            0x48, 0x89, 0xF0, // mov rax, rsi
+            0x48, 0x29, 0xF8, // sub rax, rdi
             0x48, 0x01, 0xD0, // add rax, rdx
+            0x48, 0x29, 0xF0, // sub rax, rsi
             0xC3, // ret
         ];
         let buf = JitBuffer::new(code).expect("mmap should succeed");
-        let ret = buf.execute_fn(1 as *mut u8, 2 as *mut u8, 3 as *mut u8);
-        assert_eq!(ret, 6, "execute_fn should pass args via rdi/rsi/rdx");
+        let mut tape = [0u8; 8];
+        let base = tape.as_mut_ptr();
+        let data = base.wrapping_add(2);
+        let end = base.wrapping_add(5);
+        let ret = buf.execute_fn(base, data, end);
+        assert_eq!(ret, 5, "execute_fn should pass args via rdi/rsi/rdx");
     }
 
     #[test]

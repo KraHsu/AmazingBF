@@ -1,9 +1,6 @@
 /target
 
 .vscode/
-.cursor/*
-!.cursor/rules/
-!.cursor/rules/*.mdc
 
 /tmp
 

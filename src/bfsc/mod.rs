@@ -245,8 +245,7 @@ fn print_help() {
          \x20 # 将 .bfs 直接编译为原生可执行文件\n\
          \x20 bfsc foo.bfs -c -o foo\n\n\
          \x20 # 指定目标平台\n\
-         \x20 bfsc foo.bfs -c --target x86_64-linux -o foo\n\n\
-         手册页（若已安装）: man bfsc"
+         \x20 bfsc foo.bfs -c --target x86_64-linux -o foo"
     );
 }
 

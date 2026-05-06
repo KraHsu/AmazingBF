@@ -211,30 +211,30 @@ impl Tape {
     /// performs one pointer/stat update for the whole run.
     pub(crate) fn scan_zero(&mut self, dir: i8) {
         debug_assert!(dir == -1 || dir == 1, "scan_zero dir must be +/-1");
-        while self.current() != 0 {
-            let next_zero = if dir > 0 {
-                self.scan_right_zero()
-            } else {
-                self.scan_left_zero()
-            };
+        if self.current() == 0 {
+            return;
+        }
 
-            match next_zero {
-                Some(target) => {
-                    self.move_ptr(target - self.ptr);
-                    break;
-                }
-                None => {
-                    // The first cell beyond the allocated side is implicitly
-                    // zero after growth, so stepping one past the side ends
-                    // the scan with the same observable state as the old loop.
-                    let target = if dir > 0 {
-                        self.right.len() as isize
-                    } else {
-                        -(self.left.len() as isize) - 1
-                    };
-                    self.move_ptr(target - self.ptr);
-                    break;
-                }
+        let next_zero = if dir > 0 {
+            self.scan_right_zero()
+        } else {
+            self.scan_left_zero()
+        };
+
+        match next_zero {
+            Some(target) => {
+                self.move_ptr(target - self.ptr);
+            }
+            None => {
+                // The first cell beyond the allocated side is implicitly
+                // zero after growth, so stepping one past the side ends
+                // the scan with the same observable state as the old loop.
+                let target = if dir > 0 {
+                    self.right.len() as isize
+                } else {
+                    -(self.left.len() as isize) - 1
+                };
+                self.move_ptr(target - self.ptr);
             }
         }
     }

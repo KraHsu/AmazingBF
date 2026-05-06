@@ -43,9 +43,7 @@ const AFTER_LONG_HELP: &str = "\
 
   # 特化入口（无需 -m）：bf-interpreter / bf-compiler
   bf-interpreter path/to/hello.bf
-  bf-compiler path/to/hello.bf -o ./hello_bf
-
-手册页（若已安装）: man amazingbf";
+  bf-compiler path/to/hello.bf -o ./hello_bf";
 
 const INTERP_LONG_ABOUT: &str = "\
 在优化后的 HIR 上解释执行 Brainfuck。与 `AmazingBF -m interpret` 等价，无需 `-m`。";

@@ -1,439 +1,137 @@
-# AmazingBF [简体中文](./docs/README_CN.md)
+# AmazingBF 参赛说明
 
-`AmazingBF` is a Brainfuck toolchain project written in Rust. It currently provides two executable paths:
+参赛人：`1120221735 张宸豪（KraHsu）`
 
-* **Interpretation**: parses the source code and runs it on HIR
-* **Native compilation**: compiles LIR into x86_64 native executables (Linux ELF and Windows PE64 backends implemented)
+本仓库是北京理工大学第四届“十行代码”挑战赛参赛作品，对应两个赛道：
 
-It also includes `bfsc`, a compiler for the **BFS (Brainf Script)** domain-specific language that transpiles `.bfs` source to Brainfuck.
+- 赛道一：Brainfuck 解释器 / 编译器
+- 赛道二：弹幕游戏
 
-Running `cargo build` produces four entry points:
+项目主体使用 Rust 编写，提供 4 个可执行入口：
 
-* `AmazingBF` (full CLI with `-m` / `--mode` / `--target`)
-* `bf-interpreter` (fixed interpretation mode)
-* `bf-compiler` (fixed compilation mode, default target follows build target, also supports cross-compilation via `--target`)
-* `bfsc` (BFS → BF compiler)
+- `AmazingBF`：完整命令行入口
+- `bf-interpreter`：固定为解释执行
+- `bf-compiler`：固定为编译为原生可执行文件
+- `bfsc`：将 BFS（Brainf Script）编译为 Brainfuck
 
-The second and third are **specifically designed for ten-line code benchmarks**, and behave the same as `AmazingBF -m interpret -q` and `AmazingBF -m compile`.
+图形界面作品通过 `bf-gui` 运行，它读取 `.bf` 或 `.bfs` 文件并驱动 Tauri GUI。
 
----
+## 运行环境
 
-## Current Capabilities
+- Rust stable（见 `rust-toolchain.toml`）
+- Linux 或 Windows
+- 创意赛道 GUI 额外需要：
+  - `cargo` 可构建 `tauri` feature
+  - Linux 下需要可用的 WebKitGTK / 桌面图形环境
 
-* Supports basic Brainfuck syntax: `><+-.,[]`
-* Provides three execution modes: `interpret`, `compile`, and `dump`
-* Complete frontend pipeline: `Lexer -> Parser -> AST`
-* Layered intermediate representations: `HIR -> optimize -> LIR`
-* Interpreter executes based on `HIR`
-* Native backend generates `Linux ELF` or `Windows PE64`, and outputs `.asm` / `.lst` debug files with the same basename as the target
-* Optional stderr progress text via `-q` / `-v` flags only (no `tracing` or extra logging crates)
-
----
-
-## Quick Start
-
-### Requirements
-
-* `Rust stable`
-* When using `AmazingBF` in `compile` mode or `bf-compiler`, you can select the target via `--target x86_64-linux|x86_64-windows`; **default follows the build target**
-* Currently supported native backends: `x86_64-linux` (ELF) and `x86_64-windows` (PE64)
-
----
-
-### Build
+## 构建
 
 ```bash
 cargo build --release
 ```
 
-The release profile in `Cargo.toml` favors a smaller binary (`opt-level = "z"`, LTO, `strip`, `panic = "abort"`). Runtime dependencies are empty beyond `std`.
-
----
-
-### Interpretation
+如需构建 GUI：
 
 ```bash
-cargo run --bin AmazingBF -- tests/cases/1.bf -q
-# or use the specialized entry
-cargo run --bin bf-interpreter -- tests/cases/1.bf
+cargo build --release --features gui --bin bf-gui
 ```
 
-`AmazingBF` defaults to `interpret` mode. The above example outputs the classic Hello World.
+## 赛道一：Brainfuck 解释器 / 编译器
 
-In interpret mode, you can add `--interp-debug` to print tape statistics to **stderr** after execution:
-initial/final cell count, accessed index range width, bytes allocated due to right expansion, and total left/right pointer movements.
+传统赛道说明见：
 
----
+- [解释器文档](docs/interpreter.md)
+- [编译器文档](docs/compiler.md)
 
-### Compile to Executable
+### 解释器入口
+
+比赛评测格式要求解释器接收 Brainfuck 文件路径，并从标准输入读取程序输入。
 
 ```bash
-cargo run --bin AmazingBF -- tests/cases/1.bf -m compile --target x86_64-linux -o hello_bf
-# or
-cargo run --bin bf-compiler -- tests/cases/1.bf -o hello_bf
-./hello_bf
+./target/release/bf-interpreter tests/cases/1.bf < tests/cases/1.in
 ```
 
-`bf-compiler` outputs in the format matching the current build target by default, but also supports explicit cross-compilation:
+也可以使用完整入口：
 
 ```bash
-cargo run --bin bf-compiler -- tests/cases/1.bf --target x86_64-windows -o hello_bf
+./target/release/AmazingBF tests/cases/1.bf -q < tests/cases/1.in
 ```
 
-**When targeting Windows, `.exe` is appended by default.**
+### 编译器入口
 
-During compilation, additional debug artifacts are generated alongside the output:
-
-* `hello_bf.asm`: readable assembly listing
-* `hello_bf.lst`: hex listing with offsets
-
-Debug artifact paths follow Rust’s `Path::with_extension()` rules:
-
-* `-o hello_bf` → `hello_bf.asm` / `hello_bf.lst`
-* Linux default output `a.out` → `a.asm` / `a.lst`
-* Windows default output `a.exe` → `a.asm` / `a.lst`
-
----
-
-### BFS (Brainf Script) Compiler
-
-`bfsc` compiles `.bfs` source files to Brainfuck text, which can then be run through `AmazingBF`.
-
-**Supported types:**
-
-| Type  | BF cells | Representation                    |
-|-------|----------|------------------------------------|
-| `u8`  | 1        | wrapping mod 256                  |
-| `u16` | 2        | little-endian (lo byte first)     |
-| `u32` | 4        | little-endian (lo byte first)     |
-
-**Language features:** variable declarations, arrays, `while`, `if/else`, arithmetic (`+ - * / %`), comparisons (`< > <= >= == !=`), boolean operators (`&& ||`), `scan()`, `print()`, `putchar()`.
-
-```bfs
-// Example: bubble sort
-let n: u8 = 0;
-let arr: [u8; 10];
-let i: u8 = 0;
-
-scan(n);
-i = 0;
-while i < n { scan(arr[i]); i = i + 1; }
-// ... sort body ...
-```
-
-**Usage:**
+比赛评测格式要求编译器接收 Brainfuck 文件路径，并生成目标可执行文件。
 
 ```bash
-# Compile .bfs to BF text (stdout)
-bfsc tests/utils/sort.bfs
-
-# Save BF text to a file, then run it
-bfsc tests/utils/sort.bfs -o /tmp/sort.bf
-echo "3 2 1" | tr ' ' '\n' | cat <(echo 3) - | AmazingBF /tmp/sort.bf -q
-
-# Compile .bfs directly to a native executable (no intermediate .bf file needed)
-bfsc tests/utils/sort.bfs -c -o sort
-
-# Compile for a specific target platform
-bfsc tests/utils/sort.bfs -c --target x86_64-linux -o sort
-
-# Pipe directly (only when the BF program does not read stdin)
-bfsc tests/utils/linear_eq.bfs | AmazingBF - -q
+./target/release/bf-compiler tests/cases/1.bf -o hello_bf
+./hello_bf < tests/cases/1.in
 ```
 
-**`bfsc` CLI flags:**
-
-| Flag | Description |
-|------|-------------|
-| `-o, --output <PATH>` | Without `-c`: write BF text to file (default: stdout). With `-c`: executable output path (default: `a.out` / `a.exe`). |
-| `-c, --compile` | Compile all the way to a native x86_64 executable via the AmazingBF backend. Without this flag, only BF text is output. |
-| `--target <T>` | Compilation target (only with `-c`): `x86_64-linux` \| `x86_64-windows`. Default follows build target. |
-| `-O, --opt-level <0-3>` | Optimization level passed to the AmazingBF backend (only with `-c`, default `3`). |
-| `-q, --quiet` | Suppress backend progress messages (only with `-c`). |
-| `-h, --help` | Print help. |
-| `-V, --version` | Print version. |
-
-> **Note:** When the BF program reads from stdin (e.g. `scan`), always write the compiled BF to a file first and pass it as an argument to `AmazingBF`. Piping both the BF code and program input through stdin simultaneously does not work.
-
-Fixture files for `bfsc` live in `tests/utils/` as `.bfs` / `.in` / `.out` triplets.
-
-A larger demonstration of `bfsc` lives at [`examples/bf_self_host.bfs`](examples/bf_self_host.bfs):
-a Brainfuck interpreter implemented in BFS, so AmazingBF can run BF
-programs through a BF interpreter that AmazingBF compiled from BFS. See
-[`docs/SELF_HOST.md`](docs/SELF_HOST.md) for the design notes and
-performance numbers.
-
----
-
-### Optimization Levels
-
-Set via `-O` / `--opt-level` (default: `0`):
-
-* **O0**: merges consecutive `Move` / `Add` on HIR (single pass), then proceeds normally to LIR → assembly
-
-* **O1**: adds one more HIR pass:
-
-  * `[-]` → `Zero`
-  * `[>]` / `[<]` → `Scan`
-  * affine loops (e.g. `[->+<]`, `[->>++<<]`) → `LinearMul`
-  * simple constant propagation under zero-initial tape assumption
-  * removes empty loops `[]` when entry cell is zero
-  * peephole simplifications like `Add; Zero → Zero`
-  * **does NOT** fold `Zero; Add(k)` into `Add(k)` (semantics differ)
-
-* **O2**: repeats the entire HIR optimization pipeline until reaching a fixed point
-
-* **O3**: same HIR as O2, plus aggressive compile-time folding:
-
-  * no `.` → generate minimal executable with `exit(0)`
-  * has `.` but no `,` → interpret at compile time to collect output, then generate a program that directly prints it (`write+exit` on Linux, `WriteFile+ExitProcess` on Windows)
-
----
-
-### CLI Help
+交叉输出 Windows 可执行文件：
 
 ```bash
-cargo run -- --help
-# short version
-cargo run -- -h
+./target/release/bf-compiler tests/cases/1.bf --target x86_64-windows -o hello_bf.exe
 ```
 
-Man page sources are included:
-`man/amazingbf.1` → preview with `man -l man/amazingbf.1`
-`man/bfsc.1` → preview with `man -l man/bfsc.1`
+### BFS 与自举解释器
 
----
+仓库同时保留了 BFS 编译器 `bfsc`，以及使用 BFS 编写的自举解释器
+`examples/bf_self_host.bfs`。这部分作为参赛作品的一部分保留，用于展示
+“用自定义语言编写 Brainfuck 解释器，再由本项目工具链运行”的能力。
 
-### Logging
+## 赛道二：弹幕游戏
 
-Pipeline messages go to **stderr** as plain text:
+创意赛道作品说明见：
 
-* Default: short progress lines (e.g. start/finish, compile summary)
-* `-v` / `-vv` / `-vvv`: add more detailed diagnostics
-* `-q`: silence those messages (errors from the program under interpretation still use normal stdin/stdout)
+- [弹幕游戏文档](docs/gui_danmaku.md)
 
-There are no `RUST_LOG`-style environment overrides.
+核心脚本是 [`examples/gui_danmaku.bfs`](examples/gui_danmaku.bfs)，玩法为
+在 256x256 像素画面中躲避弹幕，坚持完整个六段波次。
 
----
-
-## Project Architecture
-
-### Pipeline
-
-```text
-Brainfuck source
-  -> lexer
-  -> parser
-  -> AST
-  -> HIR
-  -> optimize
-  -> LIR
-  -> AsmProgram
-  -> machine code
-  -> target-specific executable
-
-BFS source (.bfs)
-  -> bfsc (lexer -> parser -> typeck -> layout -> codegen)
-  -> Brainfuck text
-  -> AmazingBF (interpret or compile)
-```
-
-Driver behavior:
-
-* **interpret**: runs directly on optimized HIR
-* **compile**: continues through LIR → backend → executable
-* **dump**: stops at assembly IR, logs only
-
----
-
-### Module Layout
-
-```text
-src/
-  lib.rs
-  main.rs
-  bin/bf-interpreter.rs
-  bin/bf-compiler.rs
-  bin/bfsc.rs
-  cli.rs
-  app.rs
-  logging.rs
-  error.rs
-  driver/
-  frontend/
-  ir/
-  interp/
-  runtime/
-  backend/
-  bfsc/          (lexer, parser, typeck, layout, codegen)
-tests/
-  cases/         (BF fixtures for AmazingBF)
-  utils/         (BFS fixtures for bfsc)
-  *.rs
-```
-
----
-
-### Key Modules
-
-* `main.rs`: default entry → calls `AmazingBF::run_amazingbf()`
-* `app.rs`: CLI parsing, logging init, driver dispatch
-* `cli.rs`: minimal argv parser (no `clap`); converts flags into `DriverConfig`
-* `logging.rs`: verbosity level from CLI; `log_info` / `log_debug` use `eprintln!`
-* `driver/run.rs`: mode dispatch and output handling
-* `interp/engine.rs`: HIR interpreter
-* `backend/codegen.rs`: LIR → assembly IR
-* `backend/x86_64/`: machine code + ELF/PE generation
-* `bfsc/`: BFS compiler — `lexer`, `parser`, `typeck`, `layout`, `codegen` modules
-
----
-
-## Interpreter vs Compiler Boundary
-
-* Interpreter operates on `HIR`
-* Backend consumes `LIR`
-* `AsmProgram` is backend-internal IR
-* Register conventions and memory strategy defined in backend
-
----
-
-## Testing
-
-### Run Tests
+构建并运行示例：
 
 ```bash
-cargo test
+./target/release/bfsc examples/gui_danmaku.bfs -o /tmp/gui_danmaku.bf
+./target/release/bf-gui /tmp/gui_danmaku.bf
 ```
 
-Covers backend encoding, ELF/PE structure, and `.lst` consistency.
-
----
-
-### Test Structure
-
-Located in `tests/cases/`, each case may include:
-
-* `.bf`: program
-* `.in`: input (optional)
-* `.out`: expected output
-* `.md`: description
-
-Test categories:
-
-* `cases_pipeline.rs`: interpreter vs compiler output validation
-* `bfsc_pipeline.rs`: BFS compiler end-to-end — `.bfs` → `bfsc` → `AmazingBF` → compare `.out`
-* `windows_target.rs`: PE64 structure and cross-compilation
-* `compile_artifacts.rs`: ELF/PE artifact validity, `.asm`/`.lst` emission, and EOF semantics across O0–O3
-
----
-
-## Benchmarks
-
-Two benchmark harnesses live under `benches/`; both are developer-local (CI runs `cargo test` only).
-
-### `compile_levels` (compile + run timings, 9 cases)
-
-Custom-main harness (no Criterion). For each `tests/cases/*.bf` × `-O0..3`, runs `TRIALS = 10` compile-then-run cycles, printing per-case mean/min/max compile ms and run ms plus a grand-total table summing per-case means for every opt level. On Unix the first trial per cell also captures max RSS via `/usr/bin/time`. Artifact correctness (ELF/PE, `.asm`/`.lst`, EOF stdout) is **not** re-validated here — that's the job of `tests/compile_artifacts.rs`.
-
-Run it:
+也可以直接让 `bf-gui` 读取 `.bfs` 源文件：
 
 ```bash
-cargo bench --bench compile_levels
+./target/release/bf-gui examples/gui_danmaku.bfs
 ```
 
-Reference totals — **sum of per-case mean times** in milliseconds (compile time rises with optimization; run time usually drops). Recorded on an Intel Core i9-14900K; treat as indicative only.
+## 功能简介
 
-**Linux (`x86_64-linux`):**
+- 支持标准 Brainfuck 八指令 `><+-.,[]`
+- 支持解释执行与原生编译
+- 编译目标支持 `x86_64-linux` 与 `x86_64-windows`
+- BFS 提供变量、数组、条件、循环、函数与简单图形接口
+- GUI 运行时支持键盘输入与 256x256 RGB332 帧缓冲绘制
 
-```text
-=== TOTALS (sum of per-case mean times over 9 cases) ===
-lvl      sum_compile_mean_ms        sum_run_mean_ms
-O0                  3429.332                918.855
-O1                  3484.395                 88.178
-O2                  3799.838                 87.838
-O3                  3809.176                 85.724
-ALL_O              14522.741               1180.596
-```
+## 开源库与外部工具说明
 
-**Windows (`x86_64-windows`):**
+- Rust 标准工具链
+- `tauri`：用于 GUI 窗口、IPC 与前端承载
 
-```text
-=== TOTALS (sum of per-case mean times over 9 cases) ===
-lvl      sum_compile_mean_ms        sum_run_mean_ms
-O0                  4412.682               1151.832
-O1                  4440.346                223.700
-O2                  4789.201                193.640
-O3                  4770.761                194.311
-ALL_O              18412.990               1763.483
-```
+复杂赛题说明：本项目的 `bf-compiler` 不调用 `clang`、`gcc` 等现成 C/C++
+编译器；而是直接生成目标平台可执行文件（Linux ELF / Windows PE64）。
 
-### `standard_suite` (runtime across opt levels, matslina BF programs)
+发布阶段使用 `gh` 创建 GitHub Release，但它不参与参赛程序本身的构建与运行。
 
-Criterion harness that benchmarks interpretation and native-compiled execution on a curated set of canonical BF programs (`long`, `dbfi`, `factor`, `mandelbrot`, `hanoi`) under O0–O3 where tractable.
+## AI 使用说明
 
-```bash
-cargo bench --bench standard_suite
-```
+- 使用工具：OpenAI Codex
+- AI 辅助部分：
+  - 参赛文档结构整理
+  - 仓库冗余内容清理
+  - 发布流程执行辅助
+- 自主完成部分：
+  - Brainfuck 解释器、编译器、BFS 编译器与 GUI 运行链路的设计与实现
+  - 弹幕游戏脚本与自举解释器脚本本体
 
-Criterion baseline workflow (save a baseline before a change, compare after):
+## 仓库内容
 
-```bash
-cargo bench --bench standard_suite -- --save-baseline main
-# ... make changes ...
-cargo bench --bench standard_suite -- --baseline main
-```
-
----
-
-## Appendix
-
-### Sample `.lst` excerpt (`tests/cases/1.bf`, `-O3`, `x86_64-linux`)
-
-At **O3**, programs with `.` but no `,` may be folded into a minimal `write` + `exit` binary. Below is a representative fragment from the generated `.lst` (formatting may vary slightly by toolchain version).
-
-```text
-; === Brainfuck x86_64 Hex Listing ===
-; 1 instruction(s), 130 bytes encoded
-
-Offset    Hex                                          Assembly
---------- -------------------------------------------- ----------------------------------------
-0x0000:   48 83 ec 10                                  sub rsp, 0x10                ; 16-byte stack buffer
-          c6 44 24 00 48                               mov byte ptr [rsp+0x00],0x48 ; 'H'
-          c6 44 24 01 65                               mov byte ptr [rsp+0x01],0x65 ; 'e'
-          c6 44 24 02 6c                               mov byte ptr [rsp+0x02],0x6c ; 'l'
-          c6 44 24 03 6c                               mov byte ptr [rsp+0x03],0x6c ; 'l'
-          c6 44 24 04 6f                               mov byte ptr [rsp+0x04],0x6f ; 'o'
-          c6 44 24 05 20                               mov byte ptr [rsp+0x05],0x20 ; ' '
-          c6 44 24 06 57                               mov byte ptr [rsp+0x06],0x57 ; 'W'
-          c6 44 24 07 6f                               mov byte ptr [rsp+0x07],0x6f ; 'o'
-          c6 44 24 08 72                               mov byte ptr [rsp+0x08],0x72 ; 'r'
-          c6 44 24 09 6c                               mov byte ptr [rsp+0x09],0x6c ; 'l'
-          c6 44 24 0a 64                               mov byte ptr [rsp+0x0a],0x64 ; 'd'
-          c6 44 24 0b 21                               mov byte ptr [rsp+0x0b],0x21 ; '!'
-          c6 44 24 0c 0a                               mov byte ptr [rsp+0x0c],0x0a ; '\n'
-
-          48 b8 01 00 00 00 00 00 00 00                mov rax, 1                   ; sys_write
-          48 bf 01 00 00 00 00 00 00 00                mov rdi, 1                   ; stdout
-          48 89 e6                                     mov rsi, rsp                 ; buffer
-          48 ba 0d 00 00 00 00 00 00 00                mov rdx, 13                  ; length
-          0f 05                                        syscall
-
-          48 83 c4 10                                  add rsp, 0x10
-          48 b8 3c 00 00 00 00 00 00 00                mov rax, 60                  ; sys_exit
-          48 bf 00 00 00 00 00 00 00 00                mov rdi, 0                   ; status
-          0f 05                                        syscall
-
-; total 130 bytes machine code
-```
-
----
-
-Development workflow and conventions are described in `CONTRIBUTING.md` ([简体中文](./docs/CONTRIBUTING_CN.md)).
-
-CI runs:
-
-```bash
-cargo fmt --check
-cargo clippy --all-targets -- -D warnings
-cargo test
-```
+- `src/`：解释器、编译器、BFS 编译器、GUI 运行时源码
+- `examples/`：弹幕游戏与 BFS 自举解释器示例
+- `tests/`：解释器、编译器、BFS、自举相关测试
+- `docs/`：本次参赛说明文档

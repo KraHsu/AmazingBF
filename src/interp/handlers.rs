@@ -345,17 +345,13 @@ fn handle_loop_end<I: RuntimeIo, H: HostRuntime>(
                 match &interp.jit_cache[idx] {
                     JitState::Failed => {
                         // Sticky reject: skip without consulting profile.
-                        if diagnostic_profile {
-                            if let Some(ref mut profile) = interp.profile {
-                                profile.record_back_edge(*start_pc);
-                            }
+                        if diagnostic_profile && let Some(ref mut profile) = interp.profile {
+                            profile.record_back_edge(*start_pc);
                         }
                     }
                     JitState::Ready { .. } => {
-                        if diagnostic_profile {
-                            if let Some(ref mut profile) = interp.profile {
-                                profile.record_back_edge(*start_pc);
-                            }
+                        if diagnostic_profile && let Some(ref mut profile) = interp.profile {
+                            profile.record_back_edge(*start_pc);
                         }
                         return dispatch_jit(interp, *start_pc, pc);
                     }
@@ -391,10 +387,10 @@ fn handle_loop_end<I: RuntimeIo, H: HostRuntime>(
 
 #[inline]
 fn record_opcode<I: RuntimeIo, H: HostRuntime>(interp: &mut Interpreter<I, H>, op: &InterpOp) {
-    if let Some(ref mut profile) = interp.profile {
-        if profile.opcode_counts_enabled() {
-            profile.record_opcode(op.tag());
-        }
+    if let Some(ref mut profile) = interp.profile
+        && profile.opcode_counts_enabled()
+    {
+        profile.record_opcode(op.tag());
     }
 }
 

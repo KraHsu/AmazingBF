@@ -4,8 +4,8 @@
 //! against the fixture stdin (if any) to check its stdout matches the
 //! expected `.out`.
 //!
-//! Timing / RSS / aggregation used to live here; it now lives in
-//! `benches/compile_levels.rs`.
+//! Timing / RSS / aggregation is intentionally not part of the final contest
+//! handoff test surface.
 
 mod common;
 
