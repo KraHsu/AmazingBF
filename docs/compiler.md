@@ -3,7 +3,7 @@
 ## 作品定位
 
 本项目提供 `bf-compiler`，用于完成比赛“复杂赛题（Brainfuck 编译器）”。
-它接收 Brainfuck 文件路径，输出可直接运行的原生可执行文件。
+接收 Brainfuck 文件路径，输出可直接运行的原生可执行文件。
 
 对应二进制：
 
@@ -71,9 +71,7 @@ cargo build --release
 - `hello_bf.asm`
 - `hello_bf.lst`
 
-## 说明：是否调用现成编译工具
-
-按照比赛细则要求，复杂赛题若调用 `clang`、`gcc` 等现成编译工具需要在 README 说明。
+## 说明：NO 现成编译工具
 
 本项目的 `bf-compiler` 不调用 `clang`、`gcc` 等现成 C/C++ 编译器；而是直接从内部
 IR 生成目标平台可执行文件。

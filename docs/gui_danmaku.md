@@ -6,6 +6,8 @@
 
 - [`examples/gui_danmaku.bfs`](../examples/gui_danmaku.bfs)
 
+![](./images/弹幕游戏.png)
+
 这是一份用 BFS 编写的图形界面弹幕游戏。BFS 脚本通过 `setpixel` 与键盘输入接口
 驱动 `bf-gui` 提供的 256x256 GUI 画面。
 

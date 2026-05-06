@@ -3,7 +3,7 @@
 ## 作品定位
 
 本项目提供 `bf-interpreter`，用于完成比赛“简单赛题（Brainfuck 解释器）”。
-它接收 Brainfuck 文件路径，读取标准输入作为 `,` 指令输入，并将程序输出写到标准输出。
+接收 Brainfuck 文件路径，读取标准输入作为 `,` 指令输入，并将程序输出写到标准输出。
 
 对应二进制：
 
@@ -62,7 +62,7 @@ cat tests/cases/1.bf | ./target/release/bf-interpreter -
 
 - [`examples/bf_self_host.bfs`](../examples/bf_self_host.bfs)
 
-它不是 `bf-interpreter` 主入口的一部分，但属于本次参赛作品展示内容：先用
+它不是 `bf-interpreter` 主入口的一部分，但属于本次参赛作品……吗？：先用
 `bfsc` 把 BFS 编译成 Brainfuck，再交给 `AmazingBF` 运行，形成“BF 工具链运行
 BF 解释器”的自举效果。
 
