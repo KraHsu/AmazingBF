@@ -1085,7 +1085,10 @@ impl<'a> BfEmitter<'a> {
         chunk_size: usize,
     ) -> (usize, usize) {
         debug_assert_eq!(layout.elem_width(), 1, "walk storage is u8-only");
-        debug_assert_eq!(chunk_size, 256, "walk chunk_size must be 256 for u8 counter");
+        debug_assert_eq!(
+            chunk_size, 256,
+            "walk chunk_size must be 256 for u8 counter"
+        );
 
         let result = self.talloc();
         self.clear(result);
@@ -1250,7 +1253,10 @@ impl<'a> BfEmitter<'a> {
         num_chunks: usize,
     ) -> (usize, usize) {
         debug_assert_eq!(layout.elem_width(), 1, "walk storage is u8-only");
-        debug_assert_eq!(chunk_size, 256, "walk chunk_size must be 256 for u8 counter");
+        debug_assert_eq!(
+            chunk_size, 256,
+            "walk chunk_size must be 256 for u8 counter"
+        );
         debug_assert!(num_chunks > 1);
 
         let result = self.talloc();

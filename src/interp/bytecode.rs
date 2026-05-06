@@ -116,6 +116,22 @@ impl InterpOp {
 /// Number of distinct [`InterpOp`] tags. Sizes the dispatch table.
 pub(crate) const INTERP_OP_TAG_COUNT: usize = 12;
 
+/// Human-readable tag names, indexed by [`InterpOp::tag`].
+pub(crate) const INTERP_OP_TAG_NAMES: [&str; INTERP_OP_TAG_COUNT] = [
+    "Move",
+    "Add",
+    "MoveAdd",
+    "ZeroMove",
+    "PutByte",
+    "GetByte",
+    "Zero",
+    "LinearMul",
+    "LinearMulWithSets",
+    "Scan",
+    "LoopStart",
+    "LoopEnd",
+];
+
 /// A program in interpreter-bytecode form.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct InterpProgram {

@@ -46,6 +46,7 @@ fn handle_move<I: RuntimeIo, H: HostRuntime>(
     op: &InterpOp,
     pc: usize,
 ) -> Result<usize, RuntimeError> {
+    record_opcode::<I, H>(interp, op);
     if let InterpOp::Move(d) = op {
         interp.tape.move_ptr(*d as isize);
         Ok(pc + 1)
@@ -59,6 +60,7 @@ fn handle_add<I: RuntimeIo, H: HostRuntime>(
     op: &InterpOp,
     pc: usize,
 ) -> Result<usize, RuntimeError> {
+    record_opcode::<I, H>(interp, op);
     if let InterpOp::Add(k) = op {
         interp.tape.add_current(*k);
         Ok(pc + 1)
@@ -72,6 +74,7 @@ fn handle_move_add<I: RuntimeIo, H: HostRuntime>(
     op: &InterpOp,
     pc: usize,
 ) -> Result<usize, RuntimeError> {
+    record_opcode::<I, H>(interp, op);
     if let InterpOp::MoveAdd { d, k } = op {
         interp.tape.move_ptr(*d as isize);
         interp.tape.add_current(*k);
@@ -86,6 +89,7 @@ fn handle_zero_move<I: RuntimeIo, H: HostRuntime>(
     op: &InterpOp,
     pc: usize,
 ) -> Result<usize, RuntimeError> {
+    record_opcode::<I, H>(interp, op);
     if let InterpOp::ZeroMove(d) = op {
         interp.tape.set_current(0);
         interp.tape.move_ptr(*d as isize);
@@ -100,6 +104,7 @@ fn handle_put_byte<I: RuntimeIo, H: HostRuntime>(
     _op: &InterpOp,
     pc: usize,
 ) -> Result<usize, RuntimeError> {
+    record_opcode::<I, H>(interp, _op);
     let ptr = interp.tape.ptr();
     let byte = interp.tape.current();
     interp.io.put_byte(ptr, byte)?;
@@ -111,6 +116,7 @@ fn handle_get_byte<I: RuntimeIo, H: HostRuntime>(
     _op: &InterpOp,
     pc: usize,
 ) -> Result<usize, RuntimeError> {
+    record_opcode::<I, H>(interp, _op);
     let ptr = interp.tape.ptr();
     let byte = interp.io.get_byte(ptr)?;
     interp.tape.set_current(byte);
@@ -122,6 +128,7 @@ fn handle_zero<I: RuntimeIo, H: HostRuntime>(
     _op: &InterpOp,
     pc: usize,
 ) -> Result<usize, RuntimeError> {
+    record_opcode::<I, H>(interp, _op);
     interp.tape.set_current(0);
     Ok(pc + 1)
 }
@@ -131,6 +138,7 @@ fn handle_linear_mul<I: RuntimeIo, H: HostRuntime>(
     op: &InterpOp,
     pc: usize,
 ) -> Result<usize, RuntimeError> {
+    record_opcode::<I, H>(interp, op);
     if let InterpOp::LinearMul(plan) = op {
         exec_linear_mul(interp, plan);
         Ok(pc + 1)
@@ -167,6 +175,7 @@ fn handle_linear_mul_with_sets<I: RuntimeIo, H: HostRuntime>(
     op: &InterpOp,
     pc: usize,
 ) -> Result<usize, RuntimeError> {
+    record_opcode::<I, H>(interp, op);
     if let InterpOp::LinearMulWithSets(plan) = op {
         exec_linear_mul_with_sets(interp, plan);
         Ok(pc + 1)
@@ -203,6 +212,7 @@ fn handle_scan<I: RuntimeIo, H: HostRuntime>(
     op: &InterpOp,
     pc: usize,
 ) -> Result<usize, RuntimeError> {
+    record_opcode::<I, H>(interp, op);
     if let InterpOp::Scan(dir) = op {
         let step = *dir as isize;
         while interp.tape.current() != 0 {
@@ -219,6 +229,7 @@ fn handle_loop_start<I: RuntimeIo, H: HostRuntime>(
     op: &InterpOp,
     pc: usize,
 ) -> Result<usize, RuntimeError> {
+    record_opcode::<I, H>(interp, op);
     if let InterpOp::LoopStart { end_pc } = op {
         if interp.tape.current() == 0 {
             Ok(*end_pc as usize + 1)
@@ -235,8 +246,14 @@ fn handle_loop_end<I: RuntimeIo, H: HostRuntime>(
     op: &InterpOp,
     pc: usize,
 ) -> Result<usize, RuntimeError> {
+    record_opcode::<I, H>(interp, op);
     if let InterpOp::LoopEnd { start_pc } = op {
         if interp.tape.current() != 0 {
+            let diagnostic_profile = interp
+                .profile
+                .as_ref()
+                .is_some_and(|profile| profile.opcode_counts_enabled());
+
             // F1b tiered JIT: dispatch hot loops into compiled machine
             // code. The fast path is one Vec index + tag compare per
             // back-edge, so `Failed` loops add no measurable overhead — a
@@ -256,8 +273,18 @@ fn handle_loop_end<I: RuntimeIo, H: HostRuntime>(
                 match &interp.jit_cache[idx] {
                     JitState::Failed => {
                         // Sticky reject: skip without consulting profile.
+                        if diagnostic_profile {
+                            if let Some(ref mut profile) = interp.profile {
+                                profile.record_back_edge(*start_pc);
+                            }
+                        }
                     }
                     JitState::Ready { .. } => {
+                        if diagnostic_profile {
+                            if let Some(ref mut profile) = interp.profile {
+                                profile.record_back_edge(*start_pc);
+                            }
+                        }
                         return dispatch_jit(interp, *start_pc, pc);
                     }
                     JitState::Cold => {
@@ -287,6 +314,15 @@ fn handle_loop_end<I: RuntimeIo, H: HostRuntime>(
         }
     } else {
         unreachable!("dispatch invariant: handle_loop_end only for LoopEnd")
+    }
+}
+
+#[inline]
+fn record_opcode<I: RuntimeIo, H: HostRuntime>(interp: &mut Interpreter<I, H>, op: &InterpOp) {
+    if let Some(ref mut profile) = interp.profile {
+        if profile.opcode_counts_enabled() {
+            profile.record_opcode(op.tag());
+        }
     }
 }
 

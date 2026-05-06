@@ -107,6 +107,8 @@ pub(crate) struct Interpreter<I: RuntimeIo, H: HostRuntime> {
     pub(crate) host: H,
     /// Optional loop trip-count profiler (F1b foundation).
     pub(crate) profile: Option<LoopProfile>,
+    /// Whether opcode dispatch counts should be recorded for debug hotspots.
+    pub(crate) profile_opcode_counts: bool,
     /// The bytecode currently executing. Stored as an `Arc` so handlers
     /// can look up loop bodies (e.g. for hot-loop JIT compilation) without
     /// fighting the `&mut self` borrow on the dispatch loop.
@@ -139,6 +141,7 @@ impl<I: RuntimeIo, H: HostRuntime> Interpreter<I, H> {
             io,
             host,
             profile: None,
+            profile_opcode_counts: false,
             program: None,
             #[cfg(target_os = "linux")]
             jit_enabled: false,
@@ -154,6 +157,13 @@ impl<I: RuntimeIo, H: HostRuntime> Interpreter<I, H> {
     #[allow(dead_code)] // reason: still useful for measurement-only runs without JIT
     pub(crate) fn enable_profiling(&mut self, threshold: u64) {
         self.profile = Some(LoopProfile::new(0, threshold));
+        self.profile_opcode_counts = false;
+    }
+
+    /// Enable profiling plus opcode dispatch counts for hotspot diagnostics.
+    pub(crate) fn enable_hotspot_profiling(&mut self, threshold: u64) {
+        self.profile = Some(LoopProfile::new(0, threshold));
+        self.profile_opcode_counts = true;
     }
 
     /// Enable the F1b tiered JIT: profile loop trip counts and dispatch
@@ -162,6 +172,7 @@ impl<I: RuntimeIo, H: HostRuntime> Interpreter<I, H> {
     #[cfg(target_os = "linux")]
     pub(crate) fn enable_tiered_jit(&mut self, threshold: u64) {
         self.profile = Some(LoopProfile::new(0, threshold));
+        self.profile_opcode_counts = false;
         self.jit_enabled = true;
     }
 
@@ -177,6 +188,9 @@ impl<I: RuntimeIo, H: HostRuntime> Interpreter<I, H> {
         if self.profile.is_some() {
             let threshold = self.profile.as_ref().unwrap().threshold();
             self.profile = Some(LoopProfile::new(bytecode.ops.len(), threshold));
+            if self.profile_opcode_counts {
+                self.profile.as_mut().unwrap().enable_opcode_counts();
+            }
         }
         #[cfg(target_os = "linux")]
         if self.jit_enabled {
