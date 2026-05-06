@@ -60,6 +60,10 @@ pub(crate) enum InterpOp {
     MoveAdd { d: i32, k: i32 },
     /// Fused `Zero; Move(d)`: clear the current cell, then move.
     ZeroMove(i32),
+    /// Add `delta` to `cell[ptr + off]` without moving the pointer.
+    AddAt { off: i32, delta: i32 },
+    /// Set `cell[ptr + off]` without moving the pointer.
+    SetAt { off: i32, val: u8 },
     /// Emit the current cell to stdout (BF `.`).
     PutByte,
     /// Read a byte from stdin into the current cell (BF `,`).
@@ -69,6 +73,15 @@ pub(crate) enum InterpOp {
     /// Execute a `LinearMul` plan: scale-and-add several offsets by the
     /// current cell value, then zero the head cell.
     LinearMul(Arc<LinearMulPlan>),
+    /// Specialised one-factor `LinearMul`.
+    LinearMul1 { off: i32, factor: i16 },
+    /// Specialised two-factor `LinearMul`.
+    LinearMul2 {
+        off1: i32,
+        factor1: i16,
+        off2: i32,
+        factor2: i16,
+    },
     /// Like [`LinearMul`](Self::LinearMul), but also zeroes a set of offsets
     /// when the head cell is non-zero. Guarded by `v != 0`.
     LinearMulWithSets(Arc<LinearMulWithSetsPlan>),
@@ -101,20 +114,24 @@ impl InterpOp {
             InterpOp::Add(_) => 1,
             InterpOp::MoveAdd { .. } => 2,
             InterpOp::ZeroMove(_) => 3,
-            InterpOp::PutByte => 4,
-            InterpOp::GetByte => 5,
-            InterpOp::Zero => 6,
-            InterpOp::LinearMul(_) => 7,
-            InterpOp::LinearMulWithSets(_) => 8,
-            InterpOp::Scan(_) => 9,
-            InterpOp::LoopStart { .. } => 10,
-            InterpOp::LoopEnd { .. } => 11,
+            InterpOp::AddAt { .. } => 4,
+            InterpOp::SetAt { .. } => 5,
+            InterpOp::PutByte => 6,
+            InterpOp::GetByte => 7,
+            InterpOp::Zero => 8,
+            InterpOp::LinearMul(_) => 9,
+            InterpOp::LinearMul1 { .. } => 10,
+            InterpOp::LinearMul2 { .. } => 11,
+            InterpOp::LinearMulWithSets(_) => 12,
+            InterpOp::Scan(_) => 13,
+            InterpOp::LoopStart { .. } => 14,
+            InterpOp::LoopEnd { .. } => 15,
         }
     }
 }
 
 /// Number of distinct [`InterpOp`] tags. Sizes the dispatch table.
-pub(crate) const INTERP_OP_TAG_COUNT: usize = 12;
+pub(crate) const INTERP_OP_TAG_COUNT: usize = 16;
 
 /// Human-readable tag names, indexed by [`InterpOp::tag`].
 pub(crate) const INTERP_OP_TAG_NAMES: [&str; INTERP_OP_TAG_COUNT] = [
@@ -122,10 +139,14 @@ pub(crate) const INTERP_OP_TAG_NAMES: [&str; INTERP_OP_TAG_COUNT] = [
     "Add",
     "MoveAdd",
     "ZeroMove",
+    "AddAt",
+    "SetAt",
     "PutByte",
     "GetByte",
     "Zero",
     "LinearMul",
+    "LinearMul1",
+    "LinearMul2",
     "LinearMulWithSets",
     "Scan",
     "LoopStart",

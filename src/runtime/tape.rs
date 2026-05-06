@@ -204,6 +204,85 @@ impl Tape {
         self.ensure_range(self.ptr);
     }
 
+    /// Move in `dir` (`-1` or `1`) until the current cell is zero.
+    ///
+    /// Semantics match repeated single-cell [`move_ptr`](Self::move_ptr)
+    /// calls, but the common in-bounds case searches the backing slice and
+    /// performs one pointer/stat update for the whole run.
+    pub(crate) fn scan_zero(&mut self, dir: i8) {
+        debug_assert!(dir == -1 || dir == 1, "scan_zero dir must be +/-1");
+        while self.current() != 0 {
+            let next_zero = if dir > 0 {
+                self.scan_right_zero()
+            } else {
+                self.scan_left_zero()
+            };
+
+            match next_zero {
+                Some(target) => {
+                    self.move_ptr(target - self.ptr);
+                    break;
+                }
+                None => {
+                    // The first cell beyond the allocated side is implicitly
+                    // zero after growth, so stepping one past the side ends
+                    // the scan with the same observable state as the old loop.
+                    let target = if dir > 0 {
+                        self.right.len() as isize
+                    } else {
+                        -(self.left.len() as isize) - 1
+                    };
+                    self.move_ptr(target - self.ptr);
+                    break;
+                }
+            }
+        }
+    }
+
+    fn scan_right_zero(&self) -> Option<isize> {
+        if self.ptr >= 0 {
+            let start = self.ptr as usize + 1;
+            self.right
+                .get(start..)
+                .and_then(|slice| slice.iter().position(|&b| b == 0))
+                .map(|rel| (start + rel) as isize)
+        } else {
+            let mut idx = (-self.ptr - 1) as usize;
+            while idx > 0 {
+                idx -= 1;
+                if self.left[idx] == 0 {
+                    return Some(-(idx as isize) - 1);
+                }
+            }
+            self.right
+                .iter()
+                .position(|&b| b == 0)
+                .map(|idx| idx as isize)
+        }
+    }
+
+    fn scan_left_zero(&self) -> Option<isize> {
+        if self.ptr < 0 {
+            let start = (-self.ptr) as usize;
+            self.left
+                .get(start..)
+                .and_then(|slice| slice.iter().position(|&b| b == 0))
+                .map(|rel| -((start + rel) as isize) - 1)
+        } else {
+            let mut idx = self.ptr as usize;
+            while idx > 0 {
+                idx -= 1;
+                if self.right[idx] == 0 {
+                    return Some(idx as isize);
+                }
+            }
+            self.left
+                .iter()
+                .position(|&b| b == 0)
+                .map(|idx| -(idx as isize) - 1)
+        }
+    }
+
     /// Minimum byte capacity (page-rounded) a flat buffer needs to hold
     /// the tape's currently visited span. Used by the tiered-JIT
     /// persistent-scratch path to size its mmap'd buffer.
@@ -440,5 +519,56 @@ mod tests {
         assert!(t.stats().final_len >= 21);
         assert_eq!(t.stats().ptr_max, 20);
         assert_eq!(t.ptr(), 0);
+    }
+
+    #[test]
+    fn scan_zero_moves_right_to_existing_zero() {
+        let mut t = Tape::new(8);
+        t.set_current(1);
+        t.set_at(1, 2);
+        t.set_at(2, 3);
+        t.scan_zero(1);
+        assert_eq!(t.ptr(), 3);
+        assert_eq!(t.current(), 0);
+        assert_eq!(t.stats().move_right_units, 3);
+        assert_eq!(t.stats().ptr_max, 3);
+    }
+
+    #[test]
+    fn scan_zero_moves_left_to_existing_zero() {
+        let mut t = Tape::new(8);
+        t.move_ptr(3);
+        t.set_current(1);
+        t.set_at(-1, 2);
+        t.set_at(-2, 3);
+        t.scan_zero(-1);
+        assert_eq!(t.ptr(), 0);
+        assert_eq!(t.current(), 0);
+        assert_eq!(t.stats().move_left_units, 3);
+    }
+
+    #[test]
+    fn scan_zero_right_grows_to_implicit_zero() {
+        let mut t = Tape::new(3);
+        t.set_current(1);
+        t.set_at(1, 1);
+        t.set_at(2, 1);
+        t.scan_zero(1);
+        assert_eq!(t.ptr(), 3);
+        assert_eq!(t.current(), 0);
+        assert!(t.stats().final_len >= 4);
+        assert_eq!(t.stats().move_right_units, 3);
+    }
+
+    #[test]
+    fn scan_zero_crosses_from_left_to_right_side() {
+        let mut t = Tape::new(4);
+        t.set_current(7);
+        t.move_ptr(-2);
+        t.set_current(1);
+        t.set_at(1, 2);
+        t.scan_zero(1);
+        assert_eq!(t.ptr(), 1);
+        assert_eq!(t.current(), 0);
     }
 }
