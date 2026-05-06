@@ -1,19 +1,19 @@
 //! Bidirectional tape storage shared by interpreter and backend.
 //!
-//! The `Tape` backs both positive and negative cell indices by splitting
-//! storage into two `Vec<u8>` halves. Each half grows via geometric
-//! doubling on out-of-range pointer movement — when the pointer escapes
-//! the currently allocated side, the side is resized to
-//! `max(needed, old_len * 2)` (with a small lower bound on the left side
-//! whose initial length is zero). Doubling amortises allocation cost to
-//! O(1) per cell touched and keeps cadence independent of the pointer's
-//! step size, while exactly-needed resizing would degrade to O(n) for
-//! single-step walks past the boundary. All storage lives in safe
-//! `Vec<u8>`; `#![forbid(unsafe_code)]` rules out `mmap`.
+//! The `Tape` stores all cells in one contiguous `Vec<u8>`, plus an
+//! `origin` index that marks which slot corresponds to logical cell 0.
+//! That keeps the interpreter's hot cell ops on a single slice instead of
+//! branching across split left/right buffers. Growth still uses geometric
+//! doubling: extending to the right is a plain `Vec::resize`, while the
+//! colder left-growth path recentres the whole buffer with extra headroom.
+//! All storage lives in safe `Vec<u8>`; `#![forbid(unsafe_code)]` rules out
+//! `mmap`.
 //!
 //! `TapeStats` captures runtime usage (pointer range, growth, total
 //! movement) so `--interp-debug` can summarize behaviour after a program
-//! finishes.
+//! finishes. The plain interpreter fast path keeps this accounting off by
+//! default; callers opt in only when they actually need the summary or the
+//! tiered-JIT's flat-tape bridge.
 
 /// Statistics collected while a [`Tape`] is in use (pointer range, growth, move totals).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,30 +45,41 @@ impl TapeStats {
 
 /// The memory tape for runtime.
 ///
-/// Supports bidirectional growth: indices ≥ 0 are stored in `right`; indices < 0
-/// are stored in `left` where `left[0]` = cell −1, `left[1]` = cell −2, etc.
-/// Both sides grow automatically on demand, so the tape never returns an error on
-/// pointer movement.
+/// Supports bidirectional growth: logical cell `0` lives at `cells[origin]`,
+/// cells to the right occupy larger indices, and negative logical cells occupy
+/// smaller indices. The current pointer is stored as an absolute index into the
+/// same buffer, so current-cell reads/writes avoid per-access sign mapping.
 ///
 /// Cells [−65536, −1] are reserved as the GUI screen framebuffer when the
 /// interpreter runs in GUI mode (256×256 pixels, RGB332 encoding).
 #[derive(Debug, Clone)]
 pub(crate) struct Tape {
-    right: Vec<u8>, // cells[0], cells[1], ...
-    left: Vec<u8>,  // cells[-1], cells[-2], ... (left[i] = cell[-(i+1)])
-    ptr: isize,
-    stats: TapeStats,
+    cells: Vec<u8>,
+    origin: usize,
+    ptr_abs: usize,
+    ptr_logical: isize,
+    stats: Option<TapeStats>,
 }
 
 impl Tape {
     /// Create a fresh tape with `initial_len` cells on the right side (minimum 1).
     pub(crate) fn new(initial_len: usize) -> Self {
+        Self::new_with_stats(initial_len, true)
+    }
+
+    /// Create a fresh tape without collecting movement / growth statistics.
+    pub(crate) fn new_untracked(initial_len: usize) -> Self {
+        Self::new_with_stats(initial_len, false)
+    }
+
+    fn new_with_stats(initial_len: usize, track_stats: bool) -> Self {
         let len = initial_len.max(1);
         Self {
-            right: vec![0; len],
-            left: Vec::new(),
-            ptr: 0,
-            stats: TapeStats {
+            cells: vec![0; len],
+            origin: 0,
+            ptr_abs: 0,
+            ptr_logical: 0,
+            stats: track_stats.then_some(TapeStats {
                 initial_len: len,
                 final_len: len,
                 ptr_min: 0,
@@ -76,56 +87,59 @@ impl Tape {
                 right_grew_bytes: 0,
                 move_left_units: 0,
                 move_right_units: 0,
-            },
+            }),
         }
     }
 
     /// Snapshot of tape usage statistics.
     pub(crate) fn stats(&self) -> &TapeStats {
-        &self.stats
+        self.stats
+            .as_ref()
+            .expect("tape statistics are disabled for this tape")
+    }
+
+    /// Turn on tape statistics for future operations.
+    pub(crate) fn enable_stats(&mut self) {
+        if self.stats.is_some() {
+            return;
+        }
+        let initial_len = self.right_len();
+        let final_len = self.cells.len();
+        let ptr = self.ptr_logical;
+        self.stats = Some(TapeStats {
+            initial_len,
+            final_len,
+            ptr_min: ptr,
+            ptr_max: ptr,
+            right_grew_bytes: 0,
+            move_left_units: 0,
+            move_right_units: 0,
+        });
     }
 
     /// Returns the current tape pointer index (may be negative).
+    #[inline(always)]
     pub(crate) fn ptr(&self) -> isize {
-        self.ptr
-    }
-
-    #[inline]
-    fn cell(&self) -> &u8 {
-        if self.ptr >= 0 {
-            &self.right[self.ptr as usize]
-        } else {
-            &self.left[(-self.ptr - 1) as usize]
-        }
-    }
-
-    #[inline]
-    fn cell_mut(&mut self) -> &mut u8 {
-        if self.ptr >= 0 {
-            &mut self.right[self.ptr as usize]
-        } else {
-            &mut self.left[(-self.ptr - 1) as usize]
-        }
+        self.ptr_logical
     }
 
     /// Returns the value of the current cell.
+    #[inline(always)]
     pub(crate) fn current(&self) -> u8 {
-        *self.cell()
+        self.cells[self.ptr_abs]
     }
 
     /// Sets the value of the current cell.
+    #[inline(always)]
     pub(crate) fn set_current(&mut self, value: u8) {
-        *self.cell_mut() = value;
+        self.cells[self.ptr_abs] = value;
     }
 
     /// Applies wrapping addition or subtraction to the current cell.
+    #[inline(always)]
     pub(crate) fn add_current(&mut self, delta: i32) {
-        let c = self.cell_mut();
-        *c = if delta >= 0 {
-            c.wrapping_add(delta as u8)
-        } else {
-            c.wrapping_sub((-delta) as u8)
-        };
+        let cell = &mut self.cells[self.ptr_abs];
+        *cell = cell.wrapping_add(delta as u8);
     }
 
     /// Wrapping-add `delta` to the cell at `self.ptr + off`, growing the
@@ -136,72 +150,108 @@ impl Tape {
     /// pointer.  `ptr_min` / `ptr_max` / `right_grew_bytes` / `final_len`
     /// are updated so the tape-usage summary still reflects the cell
     /// the op actually read or wrote.
+    #[inline(always)]
     pub(crate) fn add_at(&mut self, off: isize, delta: i32) {
-        let target = self.ptr + off;
-        self.ensure_range(target);
-        let cell = if target >= 0 {
-            &mut self.right[target as usize]
-        } else {
-            &mut self.left[(-target - 1) as usize]
-        };
-        *cell = if delta >= 0 {
-            cell.wrapping_add(delta as u8)
-        } else {
-            cell.wrapping_sub((-delta) as u8)
-        };
+        let target = self.offset_index(off);
+        let cell = &mut self.cells[target];
+        *cell = cell.wrapping_add(delta as u8);
     }
 
     /// Set the cell at `self.ptr + off` to `val`, growing the tape on
     /// demand.  Like [`add_at`](Self::add_at), does not move `self.ptr`
     /// and does not register move-unit stats.
+    #[inline(always)]
     pub(crate) fn set_at(&mut self, off: isize, val: u8) {
-        let target = self.ptr + off;
-        self.ensure_range(target);
-        let cell = if target >= 0 {
-            &mut self.right[target as usize]
-        } else {
-            &mut self.left[(-target - 1) as usize]
-        };
-        *cell = val;
+        let target = self.offset_index(off);
+        self.cells[target] = val;
     }
 
-    /// Shared tape-growth helper for `move_ptr` / `add_at`.  Grows the
-    /// appropriate side geometrically (with the left-side-8 floor) and
-    /// updates `ptr_min` / `ptr_max` / `right_grew_bytes` / `final_len`.
-    fn ensure_range(&mut self, target: isize) {
-        self.stats.ptr_min = self.stats.ptr_min.min(target);
-        self.stats.ptr_max = self.stats.ptr_max.max(target);
+    #[inline(always)]
+    fn right_len(&self) -> usize {
+        self.cells.len() - self.origin
+    }
 
+    #[inline]
+    fn track_target(&mut self, target: isize) {
+        if let Some(stats) = self.stats.as_mut() {
+            stats.ptr_min = stats.ptr_min.min(target);
+            stats.ptr_max = stats.ptr_max.max(target);
+        }
+    }
+
+    #[inline(always)]
+    fn offset_index(&mut self, off: isize) -> usize {
+        let target_logical = self.ptr_logical + off;
+        if self.stats.is_some() {
+            self.track_target(target_logical);
+        }
+        if let Some(target_abs) = self.ptr_abs.checked_add_signed(off) {
+            if target_abs < self.cells.len() {
+                return target_abs;
+            }
+        }
+        self.grow_for_target(target_logical)
+    }
+
+    #[cold]
+    fn grow_for_target(&mut self, target: isize) -> usize {
         if target >= 0 {
             let needed = target as usize + 1;
-            if needed > self.right.len() {
-                let old_len = self.right.len();
+            let old_len = self.right_len();
+            if needed > old_len {
                 let new_len = needed.max(old_len.saturating_mul(2));
-                self.right.resize(new_len, 0);
-                self.stats.right_grew_bytes += new_len - old_len;
+                self.cells.resize(self.origin + new_len, 0);
+                if let Some(stats) = self.stats.as_mut() {
+                    stats.right_grew_bytes += new_len - old_len;
+                }
             }
         } else {
             let needed = (-target) as usize;
-            if needed > self.left.len() {
-                let old_len = self.left.len();
+            let old_len = self.origin;
+            if needed > old_len {
                 let new_len = needed.max(old_len.saturating_mul(2)).max(8);
-                self.left.resize(new_len, 0);
+                let shift = new_len - old_len;
+                let old_cells = self.cells.len();
+                let right_len = self.right_len();
+                let mut cells = vec![0; new_len + right_len];
+                cells[shift..shift + old_cells].copy_from_slice(&self.cells);
+                self.cells = cells;
+                self.origin = new_len;
+                self.ptr_abs += shift;
             }
         }
 
-        self.stats.final_len = self.right.len() + self.left.len();
+        if let Some(stats) = self.stats.as_mut() {
+            stats.final_len = self.cells.len();
+        }
+        self.origin
+            .checked_add_signed(target)
+            .expect("target should be mapped after growth")
     }
 
     /// Moves the pointer by `delta`. Grows the tape automatically in both directions.
+    #[inline(always)]
     pub(crate) fn move_ptr(&mut self, delta: isize) {
-        match delta.cmp(&0) {
-            std::cmp::Ordering::Less => self.stats.move_left_units += (-delta) as u64,
-            std::cmp::Ordering::Greater => self.stats.move_right_units += delta as u64,
-            std::cmp::Ordering::Equal => {}
+        let target_logical = self.ptr_logical + delta;
+        if let Some(stats) = self.stats.as_mut() {
+            match delta.cmp(&0) {
+                std::cmp::Ordering::Less => stats.move_left_units += (-delta) as u64,
+                std::cmp::Ordering::Greater => stats.move_right_units += delta as u64,
+                std::cmp::Ordering::Equal => {}
+            }
+            stats.ptr_min = stats.ptr_min.min(target_logical);
+            stats.ptr_max = stats.ptr_max.max(target_logical);
         }
 
-        self.ptr += delta;
-        self.ensure_range(self.ptr);
+        if let Some(target_abs) = self.ptr_abs.checked_add_signed(delta) {
+            if target_abs < self.cells.len() {
+                self.ptr_abs = target_abs;
+                self.ptr_logical = target_logical;
+                return;
+            }
+        }
+        self.ptr_abs = self.grow_for_target(target_logical);
+        self.ptr_logical = target_logical;
     }
 
     /// Minimum byte capacity (page-rounded) a flat buffer needs to hold
@@ -209,8 +259,12 @@ impl Tape {
     /// persistent-scratch path to size its mmap'd buffer.
     #[cfg(target_os = "linux")]
     pub(crate) fn flat_required_bytes(&self) -> usize {
-        let lo = self.stats.ptr_min;
-        let hi = self.stats.ptr_max;
+        let stats = self
+            .stats
+            .as_ref()
+            .expect("flat-tape snapshot requires tape statistics");
+        let lo = stats.ptr_min;
+        let hi = stats.ptr_max;
         let span = (hi - lo) as usize + 1;
         span.next_multiple_of(4096)
     }
@@ -225,8 +279,12 @@ impl Tape {
     #[cfg(target_os = "linux")]
     #[allow(dead_code)] // reason: kept as the simpler one-shot API; the tiered JIT now uses snapshot_flat_into
     pub(crate) fn snapshot_flat(&self, min_size: usize) -> (Vec<u8>, usize) {
-        let lo = self.stats.ptr_min;
-        let hi = self.stats.ptr_max;
+        let stats = self
+            .stats
+            .as_ref()
+            .expect("flat-tape snapshot requires tape statistics");
+        let lo = stats.ptr_min;
+        let hi = stats.ptr_max;
         let span = (hi - lo) as usize + 1;
         let size = span.max(min_size).next_multiple_of(4096);
         let mut flat = vec![0u8; size];
@@ -245,25 +303,21 @@ impl Tape {
     /// dispatch.
     #[cfg(target_os = "linux")]
     pub(crate) fn snapshot_flat_into(&self, flat: &mut [u8]) -> usize {
-        let lo = self.stats.ptr_min;
+        let stats = self
+            .stats
+            .as_ref()
+            .expect("flat-tape snapshot requires tape statistics");
+        let lo = stats.ptr_min;
+        let span = stats.visited_span();
+        let start = self
+            .origin
+            .checked_add_signed(lo)
+            .expect("visited span should stay mapped");
 
-        // Caller may reuse a buffer larger than what's needed; zero it.
-        for byte in flat.iter_mut() {
-            *byte = 0;
-        }
+        flat.fill(0);
+        flat[..span].copy_from_slice(&self.cells[start..start + span]);
 
-        let right_start = (-lo) as usize;
-        let right_copy = self.right.len().min(flat.len() - right_start);
-        flat[right_start..right_start + right_copy].copy_from_slice(&self.right[..right_copy]);
-
-        for (i, &val) in self.left.iter().enumerate() {
-            let idx = (-lo) as usize - (i + 1);
-            if idx < flat.len() {
-                flat[idx] = val;
-            }
-        }
-
-        (self.ptr - lo) as usize
+        self.ptr_abs - start
     }
 
     /// Restore tape contents from a flat buffer produced by JIT execution.
@@ -272,21 +326,20 @@ impl Tape {
     /// the flat buffer.
     #[cfg(target_os = "linux")]
     pub(crate) fn restore_from_flat(&mut self, flat: &[u8], data_ptr_offset: usize) {
-        let lo = self.stats.ptr_min;
+        let stats = self
+            .stats
+            .as_ref()
+            .expect("flat-tape restore requires tape statistics");
+        let lo = stats.ptr_min;
+        let span = stats.visited_span();
+        let start = self
+            .origin
+            .checked_add_signed(lo)
+            .expect("visited span should stay mapped");
 
-        let right_start = (-lo) as usize;
-        let right_copy = self.right.len().min(flat.len() - right_start);
-        self.right[..right_copy].copy_from_slice(&flat[right_start..right_start + right_copy]);
-
-        for (i, val) in self.left.iter_mut().enumerate() {
-            let idx = (-lo) as usize - (i + 1);
-            if idx < flat.len() {
-                *val = flat[idx];
-            }
-        }
-
-        self.ptr = lo + data_ptr_offset as isize;
-        self.ensure_range(self.ptr);
+        self.cells[start..start + span].copy_from_slice(&flat[..span]);
+        self.ptr_abs = start + data_ptr_offset;
+        self.ptr_logical = lo + data_ptr_offset as isize;
     }
 }
 
@@ -441,4 +494,21 @@ mod tests {
         assert_eq!(t.stats().ptr_max, 20);
         assert_eq!(t.ptr(), 0);
     }
+
+    #[test]
+    fn untracked_tape_still_moves_and_grows() {
+        let mut t = Tape::new_untracked(4);
+        t.move_ptr(10);
+        t.add_at(-13, 1);
+        assert_eq!(t.ptr(), 10);
+        t.move_ptr(-13);
+        assert_eq!(t.current(), 1);
+        t.enable_stats();
+        let s = t.stats();
+        assert_eq!(s.initial_len, 11);
+        assert_eq!(s.final_len, 19);
+        assert_eq!(s.ptr_min, -3);
+        assert_eq!(s.ptr_max, -3);
+    }
+
 }

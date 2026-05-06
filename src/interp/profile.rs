@@ -1,9 +1,10 @@
 //! Loop trip-count profiling for the interpreter.
 //!
-//! When enabled, the interpreter increments a counter every time a `LoopEnd`
-//! back-edge fires (i.e. `*p != 0` at `]`). After execution, the profile
-//! reports which loops exceeded a configurable "hot" threshold — these are
-//! candidates for JIT compilation in the F1b tiered-JIT pipeline.
+//! When enabled, the interpreter increments a counter every time a loop body
+//! executes. For generic loops this still happens on the `LoopEnd` back-edge;
+//! for specialized `LoopBlock` bytecode the fast-path body records one count
+//! per iteration directly. After execution, the profile reports which loop
+//! entry PCs exceeded a configurable hot threshold.
 //!
 //! The profiler is zero-cost when disabled: the interpreter simply doesn't
 //! allocate or update the counters.
@@ -27,10 +28,10 @@ impl LoopProfile {
         }
     }
 
-    /// Record one back-edge execution for the loop whose `LoopStart` is at
+    /// Record one loop-body execution for the loop whose entry opcode is at
     /// `start_pc`.
     #[inline]
-    pub(crate) fn record_back_edge(&mut self, start_pc: u32) {
+    pub(crate) fn record_loop_iter(&mut self, start_pc: u32) {
         self.counts[start_pc as usize] += 1;
     }
 
@@ -72,9 +73,9 @@ mod tests {
     #[test]
     fn record_increments_correct_slot() {
         let mut p = LoopProfile::new(5, 10);
-        p.record_back_edge(2);
-        p.record_back_edge(2);
-        p.record_back_edge(4);
+        p.record_loop_iter(2);
+        p.record_loop_iter(2);
+        p.record_loop_iter(4);
         assert_eq!(p.trip_count(0), 0);
         assert_eq!(p.trip_count(2), 2);
         assert_eq!(p.trip_count(4), 1);
@@ -84,10 +85,10 @@ mod tests {
     fn hot_loops_filters_by_threshold() {
         let mut p = LoopProfile::new(4, 3);
         for _ in 0..5 {
-            p.record_back_edge(1);
+            p.record_loop_iter(1);
         }
         for _ in 0..2 {
-            p.record_back_edge(3);
+            p.record_loop_iter(3);
         }
         let hot: Vec<_> = p.hot_loops().collect();
         assert_eq!(hot, vec![(1, 5)]);
@@ -96,9 +97,9 @@ mod tests {
     #[test]
     fn threshold_is_inclusive() {
         let mut p = LoopProfile::new(2, 3);
-        p.record_back_edge(0);
-        p.record_back_edge(0);
-        p.record_back_edge(0);
+        p.record_loop_iter(0);
+        p.record_loop_iter(0);
+        p.record_loop_iter(0);
         let hot: Vec<_> = p.hot_loops().collect();
         assert_eq!(hot, vec![(0, 3)]);
     }

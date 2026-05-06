@@ -40,6 +40,7 @@ fn lower_ops_to_lir(ops: &[InterpOp], lir: &mut Vec<LirInst>, labels: &mut Label
     let mut i = 0;
     while i < ops.len() {
         match &ops[i] {
+            InterpOp::NoOp => {}
             InterpOp::Move(d) => {
                 lir.push(LirInst::PtrAdd(*d as isize));
             }
@@ -53,6 +54,21 @@ fn lower_ops_to_lir(ops: &[InterpOp], lir: &mut Vec<LirInst>, labels: &mut Label
             InterpOp::ZeroMove(d) => {
                 lir.push(LirInst::CellSet(0));
                 lir.push(LirInst::PtrAdd(*d as isize));
+            }
+            InterpOp::AddAt { off, delta } => {
+                lir.push(LirInst::CellAddAt {
+                    off: *off as isize,
+                    delta: *delta,
+                });
+            }
+            InterpOp::SetAt { off, val } => {
+                lir.push(LirInst::CellSetAt {
+                    off: *off as isize,
+                    val: *val,
+                });
+            }
+            InterpOp::Set(val) => {
+                lir.push(LirInst::CellSet(*val));
             }
             InterpOp::PutByte => lir.push(LirInst::PutByte),
             InterpOp::GetByte => lir.push(LirInst::GetByte),
@@ -76,6 +92,11 @@ fn lower_ops_to_lir(ops: &[InterpOp], lir: &mut Vec<LirInst>, labels: &mut Label
             }
             InterpOp::Scan(dir) => {
                 lir.push(LirInst::Scan(*dir as isize));
+            }
+            InterpOp::LoopBlock(_) => {
+                // LoopBlock is interpreter-only. It is never produced inside
+                // a JIT-eligible body because the loop-block pass consumes
+                // whole loops before tiered JIT sees them.
             }
             InterpOp::LoopStart { .. } => {
                 let nl = labels.fresh();
@@ -195,6 +216,7 @@ pub(crate) fn analyse_eligibility(body: &[InterpOp]) -> Option<LoopReach> {
 
     for op in body {
         match op {
+            InterpOp::NoOp => {}
             InterpOp::Move(d) => {
                 ptr = ptr.checked_add(*d)?;
                 record(&mut min_off, &mut max_off, ptr);
@@ -210,6 +232,13 @@ pub(crate) fn analyse_eligibility(body: &[InterpOp]) -> Option<LoopReach> {
                 record(&mut min_off, &mut max_off, ptr);
             }
             InterpOp::Add(_) | InterpOp::Zero => {
+                record(&mut min_off, &mut max_off, ptr);
+            }
+            InterpOp::AddAt { off, .. } | InterpOp::SetAt { off, .. } => {
+                let abs = ptr.checked_add(*off)?;
+                record(&mut min_off, &mut max_off, abs);
+            }
+            InterpOp::Set(_) => {
                 record(&mut min_off, &mut max_off, ptr);
             }
             InterpOp::LinearMul(plan) => {
@@ -237,6 +266,7 @@ pub(crate) fn analyse_eligibility(body: &[InterpOp]) -> Option<LoopReach> {
             InterpOp::PutByte
             | InterpOp::GetByte
             | InterpOp::Scan(_)
+            | InterpOp::LoopBlock(_)
             | InterpOp::LoopStart { .. }
             | InterpOp::LoopEnd { .. } => return None,
         }

@@ -71,6 +71,9 @@ fn run_interpret(config: &DriverConfig, hir: &HirProgram) -> Result<()> {
         BufferedStdIo::new(),
         NullHost::new(),
     );
+    if config.interp_debug {
+        interp.tape.enable_stats();
+    }
     interp.run(hir)?;
     log_info(format!(
         "interpreter finished (hir_insts={})",
@@ -217,6 +220,9 @@ fn run_tiered(config: &DriverConfig, hir: &HirProgram) -> Result<()> {
         BufferedStdIo::new(),
         NullHost::new(),
     );
+    if config.interp_debug {
+        interp.tape.enable_stats();
+    }
     interp.enable_tiered_jit(threshold);
     interp.run(hir)?;
     log_info(format!(

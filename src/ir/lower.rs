@@ -21,10 +21,10 @@ fn lower_to_hir_block(ast: &[AstNode]) -> Vec<HirInst> {
 
     for node in ast {
         match node {
-            AstNode::MoveRight => out.push(HirInst::Move(1)),
-            AstNode::MoveLeft => out.push(HirInst::Move(-1)),
-            AstNode::Inc => out.push(HirInst::Add(1)),
-            AstNode::Dec => out.push(HirInst::Add(-1)),
+            AstNode::Move(0) => {}
+            AstNode::Move(n) => out.push(HirInst::Move(*n)),
+            AstNode::Add(0) => {}
+            AstNode::Add(n) => out.push(HirInst::Add(*n)),
             AstNode::Output => out.push(HirInst::PutByte),
             AstNode::Input => out.push(HirInst::GetByte),
             AstNode::Loop(body) => {
@@ -34,6 +34,44 @@ fn lower_to_hir_block(ast: &[AstNode]) -> Vec<HirInst> {
     }
 
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lowers_compressed_nodes_directly() {
+        let hir = lower_to_hir(&[
+            AstNode::Move(3),
+            AstNode::Add(-2),
+            AstNode::Output,
+            AstNode::Loop(vec![AstNode::Move(-1), AstNode::Add(4)]),
+        ]);
+
+        assert_eq!(
+            hir,
+            HirProgram {
+                insts: vec![
+                    HirInst::Move(3),
+                    HirInst::Add(-2),
+                    HirInst::PutByte,
+                    HirInst::Loop(vec![HirInst::Move(-1), HirInst::Add(4)]),
+                ],
+            }
+        );
+    }
+
+    #[test]
+    fn skips_zero_net_compressed_nodes() {
+        let hir = lower_to_hir(&[AstNode::Move(0), AstNode::Add(0), AstNode::Input]);
+        assert_eq!(
+            hir,
+            HirProgram {
+                insts: vec![HirInst::GetByte],
+            }
+        );
+    }
 }
 
 /// Lower HIR into the backend-facing low-level IR with explicit loop labels and jumps.

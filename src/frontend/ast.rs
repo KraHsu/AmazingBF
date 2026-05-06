@@ -7,14 +7,10 @@
 /// Single Brainfuck AST node produced by `frontend::parser`.
 #[derive(Debug, Clone)]
 pub(crate) enum AstNode {
-    /// >
-    MoveRight,
-    /// <
-    MoveLeft,
-    /// +
-    Inc,
-    /// -
-    Dec,
+    /// Net pointer shift from one or more consecutive `>` / `<`.
+    Move(isize),
+    /// Net cell delta from one or more consecutive `+` / `-`.
+    Add(i32),
     /// .
     Output,
     /// ,

@@ -21,7 +21,7 @@
 //! bytecode lowering pass.
 
 use crate::interp::bytecode::{
-    INTERP_OP_TAG_COUNT, InterpOp, LinearMulPlan, LinearMulWithSetsPlan,
+    INTERP_OP_TAG_COUNT, InterpOp, LinearMulPlan, LinearMulWithSetsPlan, LoopBlockPlan,
 };
 use crate::interp::engine::{Interpreter, RuntimeError};
 use crate::runtime::host::HostRuntime;
@@ -30,6 +30,14 @@ use crate::runtime::io::RuntimeIo;
 /// Handler fn pointer type: executes one op and returns the next pc.
 pub(crate) type Handler<I, H> =
     fn(&mut Interpreter<I, H>, &InterpOp, usize) -> Result<usize, RuntimeError>;
+
+fn handle_noop<I: RuntimeIo, H: HostRuntime>(
+    _interp: &mut Interpreter<I, H>,
+    _op: &InterpOp,
+    pc: usize,
+) -> Result<usize, RuntimeError> {
+    Ok(pc + 1)
+}
 
 /// `(v * f)` reduced to a signed `i32` delta mod 256 (Brainfuck tape). Kept
 /// in sync with the identical helper that used to live in `engine.rs`; the
@@ -92,6 +100,45 @@ fn handle_zero_move<I: RuntimeIo, H: HostRuntime>(
         Ok(pc + 1)
     } else {
         unreachable!("dispatch invariant: handle_zero_move only for ZeroMove")
+    }
+}
+
+fn handle_add_at<I: RuntimeIo, H: HostRuntime>(
+    interp: &mut Interpreter<I, H>,
+    op: &InterpOp,
+    pc: usize,
+) -> Result<usize, RuntimeError> {
+    if let InterpOp::AddAt { off, delta } = op {
+        interp.tape.add_at(*off as isize, *delta);
+        Ok(pc + 1)
+    } else {
+        unreachable!("dispatch invariant: handle_add_at only for AddAt")
+    }
+}
+
+fn handle_set_at<I: RuntimeIo, H: HostRuntime>(
+    interp: &mut Interpreter<I, H>,
+    op: &InterpOp,
+    pc: usize,
+) -> Result<usize, RuntimeError> {
+    if let InterpOp::SetAt { off, val } = op {
+        interp.tape.set_at(*off as isize, *val);
+        Ok(pc + 1)
+    } else {
+        unreachable!("dispatch invariant: handle_set_at only for SetAt")
+    }
+}
+
+fn handle_set<I: RuntimeIo, H: HostRuntime>(
+    interp: &mut Interpreter<I, H>,
+    op: &InterpOp,
+    pc: usize,
+) -> Result<usize, RuntimeError> {
+    if let InterpOp::Set(val) = op {
+        interp.tape.set_current(*val);
+        Ok(pc + 1)
+    } else {
+        unreachable!("dispatch invariant: handle_set only for Set")
     }
 }
 
@@ -214,6 +261,76 @@ fn handle_scan<I: RuntimeIo, H: HostRuntime>(
     }
 }
 
+fn handle_loop_block<I: RuntimeIo, H: HostRuntime>(
+    interp: &mut Interpreter<I, H>,
+    op: &InterpOp,
+    _pc: usize,
+) -> Result<usize, RuntimeError> {
+    if let InterpOp::LoopBlock(plan) = op {
+        exec_loop_block(interp, plan);
+        Ok(plan.after_pc as usize)
+    } else {
+        unreachable!("dispatch invariant: handle_loop_block only for LoopBlock")
+    }
+}
+
+#[inline]
+fn exec_loop_block<I: RuntimeIo, H: HostRuntime>(
+    interp: &mut Interpreter<I, H>,
+    plan: &LoopBlockPlan,
+) {
+    let loop_pc = plan.after_pc - (plan.ops.len() as u32) - 1;
+    while interp.tape.current() != 0 {
+        if let Some(ref mut profile) = interp.profile {
+            profile.record_loop_iter(loop_pc);
+        }
+        for op in plan.ops.iter() {
+            exec_loop_block_op(interp, op);
+        }
+    }
+}
+
+#[inline]
+fn exec_loop_block_op<I: RuntimeIo, H: HostRuntime>(
+    interp: &mut Interpreter<I, H>,
+    op: &InterpOp,
+) {
+    match op {
+        InterpOp::NoOp => {}
+        InterpOp::Move(d) => interp.tape.move_ptr(*d as isize),
+        InterpOp::Add(k) => interp.tape.add_current(*k),
+        InterpOp::MoveAdd { d, k } => {
+            interp.tape.move_ptr(*d as isize);
+            interp.tape.add_current(*k);
+        }
+        InterpOp::ZeroMove(d) => {
+            interp.tape.set_current(0);
+            interp.tape.move_ptr(*d as isize);
+        }
+        InterpOp::AddAt { off, delta } => interp.tape.add_at(*off as isize, *delta),
+        InterpOp::SetAt { off, val } => interp.tape.set_at(*off as isize, *val),
+        InterpOp::Set(val) => interp.tape.set_current(*val),
+        InterpOp::Zero => interp.tape.set_current(0),
+        InterpOp::LinearMul(plan) => exec_linear_mul(interp, plan),
+        InterpOp::LinearMulWithSets(plan) => exec_linear_mul_with_sets(interp, plan),
+        InterpOp::Scan(dir) => {
+            let step = *dir as isize;
+            while interp.tape.current() != 0 {
+                interp.tape.move_ptr(step);
+            }
+        }
+        InterpOp::LoopBlock(plan) => exec_loop_block(interp, plan),
+        // LoopBlock lowering rejects these variants; keep a debug assertion
+        // here so future bytecode changes fail loudly during development.
+        InterpOp::PutByte
+        | InterpOp::GetByte
+        | InterpOp::LoopStart { .. }
+        | InterpOp::LoopEnd { .. } => {
+            debug_assert!(false, "invalid op inside LoopBlock: {op:?}");
+        }
+    }
+}
+
 fn handle_loop_start<I: RuntimeIo, H: HostRuntime>(
     interp: &mut Interpreter<I, H>,
     op: &InterpOp,
@@ -262,7 +379,7 @@ fn handle_loop_end<I: RuntimeIo, H: HostRuntime>(
                     }
                     JitState::Cold => {
                         if let Some(ref mut profile) = interp.profile {
-                            profile.record_back_edge(*start_pc);
+                            profile.record_loop_iter(*start_pc);
                             if profile.trip_count(*start_pc) >= profile.threshold() {
                                 compile_jit_slot(interp, *start_pc);
                                 if matches!(interp.jit_cache[idx], JitState::Ready { .. }) {
@@ -278,7 +395,7 @@ fn handle_loop_end<I: RuntimeIo, H: HostRuntime>(
             // Non-JIT path: still record trip counts for profile-only
             // consumers (e.g. the `loop_profile` measurement bench).
             if let Some(ref mut profile) = interp.profile {
-                profile.record_back_edge(*start_pc);
+                profile.record_loop_iter(*start_pc);
             }
 
             Ok(*start_pc as usize + 1)
@@ -453,17 +570,22 @@ fn dispatch_jit<I: RuntimeIo, H: HostRuntime>(
 pub(crate) fn dispatch_table<I: RuntimeIo, H: HostRuntime>() -> [Handler<I, H>; INTERP_OP_TAG_COUNT]
 {
     [
-        handle_move::<I, H>,                 // 0: Move
-        handle_add::<I, H>,                  // 1: Add
-        handle_move_add::<I, H>,             // 2: MoveAdd
-        handle_zero_move::<I, H>,            // 3: ZeroMove
-        handle_put_byte::<I, H>,             // 4: PutByte
-        handle_get_byte::<I, H>,             // 5: GetByte
-        handle_zero::<I, H>,                 // 6: Zero
-        handle_linear_mul::<I, H>,           // 7: LinearMul
-        handle_linear_mul_with_sets::<I, H>, // 8: LinearMulWithSets
-        handle_scan::<I, H>,                 // 9: Scan
-        handle_loop_start::<I, H>,           // 10: LoopStart
-        handle_loop_end::<I, H>,             // 11: LoopEnd
+        handle_noop::<I, H>,                 // 0: NoOp
+        handle_move::<I, H>,                 // 1: Move
+        handle_add::<I, H>,                  // 2: Add
+        handle_move_add::<I, H>,             // 3: MoveAdd
+        handle_zero_move::<I, H>,            // 4: ZeroMove
+        handle_add_at::<I, H>,               // 5: AddAt
+        handle_set_at::<I, H>,               // 6: SetAt
+        handle_set::<I, H>,                  // 7: Set
+        handle_put_byte::<I, H>,             // 8: PutByte
+        handle_get_byte::<I, H>,             // 9: GetByte
+        handle_zero::<I, H>,                 // 10: Zero
+        handle_linear_mul::<I, H>,           // 11: LinearMul
+        handle_linear_mul_with_sets::<I, H>, // 12: LinearMulWithSets
+        handle_scan::<I, H>,                 // 13: Scan
+        handle_loop_block::<I, H>,           // 14: LoopBlock
+        handle_loop_start::<I, H>,           // 15: LoopStart
+        handle_loop_end::<I, H>,             // 16: LoopEnd
     ]
 }

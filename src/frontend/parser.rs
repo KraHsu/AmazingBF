@@ -59,10 +59,20 @@ fn parse_block(
 
     while *pos < tokens.len() {
         match tokens[*pos] {
-            Token::MoveRight => nodes.push(AstNode::MoveRight),
-            Token::MoveLeft => nodes.push(AstNode::MoveLeft),
-            Token::Inc => nodes.push(AstNode::Inc),
-            Token::Dec => nodes.push(AstNode::Dec),
+            Token::MoveRight | Token::MoveLeft => {
+                let delta = parse_move_run(tokens, pos);
+                if delta != 0 {
+                    nodes.push(AstNode::Move(delta));
+                }
+                continue;
+            }
+            Token::Inc | Token::Dec => {
+                let delta = parse_add_run(tokens, pos);
+                if delta != 0 {
+                    nodes.push(AstNode::Add(delta));
+                }
+                continue;
+            }
             Token::Output => nodes.push(AstNode::Output),
             Token::Input => nodes.push(AstNode::Input),
 
@@ -90,5 +100,108 @@ fn parse_block(
         Err(ParseError::UnclosedLoop { pos: *pos })
     } else {
         Ok(nodes)
+    }
+}
+
+fn parse_move_run(tokens: &[Token], pos: &mut usize) -> isize {
+    let mut delta = 0isize;
+    while *pos < tokens.len() {
+        match tokens[*pos] {
+            Token::MoveRight => delta += 1,
+            Token::MoveLeft => delta -= 1,
+            _ => break,
+        }
+        *pos += 1;
+    }
+    delta
+}
+
+fn parse_add_run(tokens: &[Token], pos: &mut usize) -> i32 {
+    let mut delta = 0i32;
+    while *pos < tokens.len() {
+        match tokens[*pos] {
+            Token::Inc => delta += 1,
+            Token::Dec => delta -= 1,
+            _ => break,
+        }
+        *pos += 1;
+    }
+    delta
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse_tokens(tokens: &[Token]) -> Vec<AstNode> {
+        parse(tokens).expect("parse should succeed")
+    }
+
+    #[test]
+    fn compresses_add_runs_and_drops_zero_net_result() {
+        let tokens = [Token::Inc, Token::Inc, Token::Dec, Token::Dec, Token::Inc];
+        assert!(matches!(
+            parse_tokens(&tokens).as_slice(),
+            [AstNode::Add(1)]
+        ));
+    }
+
+    #[test]
+    fn compresses_move_runs_and_drops_zero_net_result() {
+        let tokens = [
+            Token::MoveRight,
+            Token::MoveRight,
+            Token::MoveLeft,
+            Token::MoveLeft,
+            Token::MoveRight,
+            Token::MoveRight,
+        ];
+        assert!(matches!(
+            parse_tokens(&tokens).as_slice(),
+            [AstNode::Move(2)]
+        ));
+    }
+
+    #[test]
+    fn does_not_merge_across_io_barriers() {
+        let tokens = [Token::Inc, Token::Inc, Token::Output, Token::Inc];
+        let ast = parse_tokens(&tokens);
+        assert!(matches!(
+            ast.as_slice(),
+            [AstNode::Add(2), AstNode::Output, AstNode::Add(1)]
+        ));
+    }
+
+    #[test]
+    fn compresses_inside_loops() {
+        let tokens = [
+            Token::LoopStart,
+            Token::Dec,
+            Token::MoveRight,
+            Token::Inc,
+            Token::MoveLeft,
+            Token::LoopEnd,
+        ];
+        let ast = parse_tokens(&tokens);
+        assert!(matches!(
+            ast.as_slice(),
+            [AstNode::Loop(body)]
+                if matches!(
+                    body.as_slice(),
+                    [AstNode::Add(-1), AstNode::Move(1), AstNode::Add(1), AstNode::Move(-1)]
+                )
+        ));
+    }
+
+    #[test]
+    fn unexpected_loop_end_reports_same_token_index() {
+        let err = parse(&[Token::Inc, Token::LoopEnd]).expect_err("should fail");
+        assert!(matches!(err, ParseError::UnexpectedLoopEnd { pos: 1 }));
+    }
+
+    #[test]
+    fn unclosed_loop_reports_end_position() {
+        let err = parse(&[Token::LoopStart, Token::Inc]).expect_err("should fail");
+        assert!(matches!(err, ParseError::UnclosedLoop { pos: 2 }));
     }
 }

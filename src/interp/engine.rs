@@ -135,7 +135,7 @@ impl<I: RuntimeIo, H: HostRuntime> Interpreter<I, H> {
     /// Create an interpreter with an `tape_len`-byte data tape and the supplied I/O and host runtime.
     pub(crate) fn new(tape_len: usize, io: I, host: H) -> Self {
         Self {
-            tape: Tape::new(tape_len),
+            tape: Tape::new_untracked(tape_len),
             io,
             host,
             profile: None,
@@ -163,6 +163,7 @@ impl<I: RuntimeIo, H: HostRuntime> Interpreter<I, H> {
     pub(crate) fn enable_tiered_jit(&mut self, threshold: u64) {
         self.profile = Some(LoopProfile::new(0, threshold));
         self.jit_enabled = true;
+        self.tape.enable_stats();
     }
 
     /// Execute a HIR program to completion, reporting the first I/O or host error encountered.
